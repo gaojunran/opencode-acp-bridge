@@ -56,6 +56,16 @@ Unverified-but-in-openapi fields are marked; when in doubt, read
 `tests/fixtures/openapi-2021.json` (the server's own spec dump) — it is authoritative
 for request/response schemas; fixtures are authoritative for real-world shapes.
 
+### Verified response quirks (live probe, 2026-10-02)
+
+- `PATCH /api/session/{id}`, `POST …/model`, `DELETE …/{id}` and `DELETE …/message/{msgID}`
+  return **204 No Content** — no envelope, no body.
+- `POST …/interrupt` returns a **bare** `{"interrupted": …}` — NOT envelope-wrapped.
+- `GET /api/config` returns a **bare array** — NOT envelope-wrapped.
+- `POST …/compact` and `POST …/fork` **require a JSON object body** (empty body →
+  `400 InvalidRequestError "Expected object"`); use `{}` for compact, `{"before": …}`
+  for fork.
+
 ## SSE event taxonomy (verified on the wire)
 
 Envelope per frame:
