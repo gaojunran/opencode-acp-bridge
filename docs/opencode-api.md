@@ -323,9 +323,14 @@ Heterogeneous array, discriminated by `type`, **newest first**:
 - `filediff.file` is an **absolute** path. `patch` is an SVN-style `Index:` header +
   unified diff (note: trailing `-\n` quirk observed for new files).
 - `title` is a display title for the tool call (use for ACP tool_call title).
-- Multi-file tools (apply_patch) — **unverified** whether multiple `filediff`-like
-  entries or one combined `diff`; verify live and extend `dto::ToolMetadata` if needed.
-- This is 2.0.21 shape; the dev clone's `metadata.files[]` array shape does NOT apply.
+- apply_patch (core 2.0.21, live-verified): **no `filediff`**; emits
+  `metadata.diff` (combined `Index:`-format string) + `metadata.files[]`
+  (`{filePath, relativePath, type, patch, additions, deletions}` per file —
+  the dev-clone array shape DOES appear here, alongside the combined string).
+  `edit`/`write` emit `filediff` instead (edit live-verified, write verified
+  since Wave 0). The bridge's fallback chain (combined string → per-file
+  `Index:` sections) covers it; `files[]` is currently unread — same data as
+  the combined string.
 
 ## Turn flow for the bridge (prompt)
 
@@ -347,8 +352,8 @@ Verified against a live aft-enabled server (fixtures:
 
 | shape | aft | core (2.0.21) | bridge handling |
 |---|---|---|---|
-| `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit | present | primary diff source (unchanged) |
-| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | present | fallback chain (unchanged) — multi-file `Index:` sections split |
+| `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit | present for edit/write (live-verified) | primary diff source (unchanged) |
+| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | **same — apply_patch has no `filediff` on core either** (live-verified; not an aft divergence) | fallback chain (unchanged) — multi-file `Index:` sections split |
 | `tool.success.content[]` file part `{"type":"file","uri":"data:…;base64,…","mime":"image/png"}` | image reads | absent | mapped to ACP `ImageContent` (`data` = payload after the data-URI prefix, `mime_type` = `mime`, `uri` preserved). Only `image/*` mimes are mapped — the only verified scenario; non-image / non-data-URI file parts are skipped, never guessed |
 | `tool.called.input` | model's raw args (canonicalization happens on a copy) | same | unchanged |
 

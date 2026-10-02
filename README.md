@@ -88,15 +88,17 @@ With the [`@cortexkit/aft-opencode`](https://www.npmjs.com/package/@cortexkit/af
 plugin active, seven built-in tools (read/edit/write/apply_patch/bash/grep/glob)
 are replaced by same-name registrations. The SSE event stream keeps the core
 shape — tool names, event taxonomy, and envelopes are unchanged — so most of
-the bridge works unmodified. What differs, and how it is handled (all rows
-wire-verified against a live aft v0.58.0 environment; captures in
-`tests/fixtures/aft-*.sse`):
+the bridge works unmodified. The diff plane is identical to core in both
+dialects (`edit`/`write` → `filediff`; `apply_patch` → `diff` + `files[]`, no
+`filediff` — core 2.0.21 live-verified too), so the only aft-specific wire
+delta is the image file part below. What was verified against a live aft
+v0.58.0 environment (captures in `tests/fixtures/aft-*.sse`):
 
 | aft behavior | Wire effect | Bridge handling |
 | --- | --- | --- |
 | Same-name tool replacement | Stream undeformed: same tool names, same event types | No change needed — all existing mappings apply |
 | `edit` / `write` results | `metadata.filediff` identical in shape to core | Diff blocks via the primary `filediff` path (unchanged) |
-| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` | Diff blocks via the existing diff-string fallback chain |
+| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` — **same shape as core, not aft-specific** | Diff blocks via the existing diff-string fallback chain |
 | `read` on an image | Content part `{type:"file", uri:"data:<mime>;base64,…", mime:"image/png"}` | Mapped to an ACP image content block (base64 payload + `mime_type`, original `uri` preserved) — previously dropped as unknown |
 | Tool input args | Model's raw parameters (aft canonicalizes on a copy) | Permission `toolCall` construction works unchanged |
 | Non-image or non-data-URI file parts | Not observed on the wire | Skipped — never guessed (`#[serde(other)]` sink) |
