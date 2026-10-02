@@ -66,21 +66,24 @@ async fn run(mode: ConnectMode, no_aft: bool) -> ExitCode {
     };
 
     // Fail fast — and tell the user WHY: a stale service registration is a
-    // different problem from a dead server or wrong password.
+    // different problem from a dead server or wrong password. The stale-file
+    // hint applies only when the connection actually came from the service
+    // file (cfg.source names the real origin), not from env or an explicit URL.
     if let Err(e) = probe_server(&client, &cfg.base_url).await {
         eprintln!("error: {e}");
-        match (&e, &mode) {
-            (ProbeError::Unreachable { .. }, ConnectMode::ServiceFile) => {
+        match &e {
+            ProbeError::Unreachable { .. } if cfg.from_service_file() => {
                 eprintln!("{SERVICE_FILE_STALE_HINT}");
             }
-            (ProbeError::Unreachable { .. }, _) => {
-                eprintln!("is the server running and reachable? Alternatively use bare --attach \
-                           (service file) or set OPENCODE_URL.");
+            ProbeError::Unreachable { .. } => {
+                eprintln!("is the server running and reachable? Without --attach the default reads \
+                           ~/.config/opencode/service.json; alternatively pass --attach <url> or \
+                           set OPENCODE_URL.");
             }
-            (ProbeError::Auth { .. }, ConnectMode::ServiceFile) => {
+            ProbeError::Auth { .. } if cfg.from_service_file() => {
                 eprintln!("{SERVICE_FILE_STALE_HINT}");
             }
-            (ProbeError::Auth { .. }, _) => {
+            ProbeError::Auth { .. } => {
                 eprintln!("check OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD.");
             }
             _ => {}

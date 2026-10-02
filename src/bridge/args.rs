@@ -25,18 +25,20 @@ OPTIONS:
     --version        Print the version and exit.
     --help           Print this help and exit.
 
-Without --attach, the OPENCODE_URL env var is used (password from the same
-env vars as above). If nothing is configured, the program exits with
-instructions for all three connection modes.";
+Without --attach, the connection is read from ~/.config/opencode/service.json;
+if that file does not exist, the OPENCODE_URL env var is used instead (password
+from the same env vars as above). If nothing is configured, the program exits
+with instructions for all three connection modes.";
 
 /// The three connection modes, shown when nothing is configured.
 pub const CONNECTION_EXAMPLES: &str = "\
-  1) explicit URL + password env:
+  1) service registration file (default, no flags):
+       opencode-acp-bridge
+     — reads ~/.config/opencode/service.json ({\"port\", \"password\", \"hostname\"});
+       falls back to OPENCODE_URL (see 3) when the file is absent
+  2) explicit URL + password env:
        OPENCODE_PASSWORD=<password> opencode-acp-bridge --attach http://127.0.0.1:44041
-  2) service registration file (bare --attach):
-       opencode-acp-bridge --attach
-     — reads ~/.config/opencode/service.json ({\"port\", \"password\", \"hostname\"})
-  3) environment variables:
+  3) environment variables (used when the service file is absent):
        OPENCODE_URL=http://127.0.0.1:44041 OPENCODE_PASSWORD=<password> opencode-acp-bridge";
 
 /// Which connection source to use (decided by the flags alone).
@@ -46,8 +48,9 @@ pub enum ConnectMode {
     ExplicitUrl(String),
     /// Bare `--attach`: read `~/.config/opencode/service.json`.
     ServiceFile,
-    /// No `--attach`: `OPENCODE_URL` (+ password env).
-    Env,
+    /// No `--attach` (the default): try the service file first, then fall
+    /// back to `OPENCODE_URL` (+ password env) when the file is absent.
+    Default,
 }
 
 /// Result of parsing the command line.
@@ -135,7 +138,7 @@ where
     let mode = match attach {
         Some(Some(url)) => ConnectMode::ExplicitUrl(url),
         Some(None) => ConnectMode::ServiceFile,
-        None => ConnectMode::Env,
+        None => ConnectMode::Default,
     };
     ParseOutcome::Run(RunOptions { mode, no_aft })
 }
@@ -180,10 +183,10 @@ mod tests {
     }
 
     #[test]
-    fn no_attach_means_env_mode() {
+    fn no_attach_means_default_mode() {
         assert_eq!(
             parse(&["prog"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Env, no_aft: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false })
         );
     }
 
@@ -192,7 +195,7 @@ mod tests {
         // Bare --no-aft.
         assert_eq!(
             parse(&["prog", "--no-aft"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Env, no_aft: true })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true })
         );
         // With an explicit URL, in either order.
         assert_eq!(
