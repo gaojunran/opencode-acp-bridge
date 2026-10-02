@@ -300,6 +300,15 @@ pub enum ToolState {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolContent {
     Text { text: String },
+    /// A file reference in tool output — produced by the aft tool-call hoist
+    /// (aft v0.58.0) for image reads: `{type: "file", uri: "data:image/png;base64,…",
+    /// mime: "image/png"}`. The uri is a data-URI; the mime drives the ACP
+    /// image mapping (only `image/*` is mapped — the only verified scenario).
+    File {
+        uri: String,
+        #[serde(rename = "mime", default)]
+        mime: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -308,7 +317,7 @@ impl ToolContent {
     pub fn text(&self) -> Option<&str> {
         match self {
             ToolContent::Text { text } => Some(text),
-            ToolContent::Unknown => None,
+            ToolContent::File { .. } | ToolContent::Unknown => None,
         }
     }
 }
@@ -1087,18 +1096,108 @@ mod tests {
         let mut found = false;
         for record in &env.data {
             for part in record.content.iter().flatten() {
-                if let Part::Tool { state, .. } = part {
-                    if let ToolState::Completed { metadata, .. } = state {
-                        let meta = metadata.as_ref().expect("completed tool has metadata");
-                        let fd = meta.filediff.as_ref().expect("filediff present");
-                        assert!(fd.patch.starts_with("Index: "));
-                        assert!(fd.file.starts_with('/'), "file is absolute");
-                        assert!(meta.title.is_some());
-                        found = true;
-                    }
+                if let Part::Tool { state: ToolState::Completed { metadata, .. }, .. } = part {
+                    let meta = metadata.as_ref().expect("completed tool has metadata");
+                    let fd = meta.filediff.as_ref().expect("filediff present");
+                    assert!(fd.patch.starts_with("Index: "));
+                    assert!(fd.file.starts_with('/'), "file is absolute");
+                    assert!(meta.title.is_some());
+                    found = true;
                 }
             }
         }
         assert!(found, "fixture must contain a completed tool part");
+    }
+
+    // ======================= Wave 5: aft hoist dialect =======================
+
+    /// Parse every frame of an aft capture, returning the decoded
+    /// `ToolSuccess` events (in fixture order).
+    fn decode_aft_capture(path: &str) -> Vec<(String, ToolSuccess)> {
+        let raw = aft_fixture(path);
+        let mut successes = Vec::new();
+        let mut decoded_kinds = 0usize;
+        for line in raw.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") || line == "data: " {
+                continue;
+            }
+            let env: EventEnvelope = serde_json::from_str(&line[6..]).expect("envelope parses");
+            let skipped = env.kind.starts_with("rpc.")
+                || matches!(
+                    env.kind.as_str(),
+                    "server.connected"
+                        | "session.inbox.enqueued"
+                        | "session.inbox.delivered"
+                        | "project.updated"
+                        | "session.instructions.updated"
+                        | "session.permissions"
+                        | "session.model.selected"
+                );
+            if skipped {
+                continue;
+            }
+            match decode_event(&env.kind, &env.data) {
+                Some(SessionEvent::ToolSuccess(t)) => successes.push((env.kind.clone(), t)),
+                Some(_) => decoded_kinds += 1,
+                // After the dto.rs additions for Wave 5 there must be NO
+                // frame left that silently falls into `Unknown`.
+                None => panic!("frame kind `{}` must decode to a typed event", env.kind),
+            }
+        }
+        assert!(decoded_kinds > 10, "expected a real turn, got {decoded_kinds} non-tool frames");
+        successes
+    }
+
+    fn aft_fixture(name: &str) -> &'static str {
+        match name {
+            "aft-tool-turn" => include_str!("../tests/fixtures/aft-tool-turn.sse"),
+            "aft-image-read" => include_str!("../tests/fixtures/aft-image-read.sse"),
+            other => panic!("unknown aft fixture {other}"),
+        }
+    }
+
+    /// aft read/edit/apply_patch turn: every success decodes with typed
+    /// content (no `Unknown` escapes); the edit carries BOTH `filediff` and
+    /// `diff`, while apply_patch carries only the `diff` fallback string.
+    #[test]
+    fn decode_aft_tool_turn_capture() {
+        let successes = decode_aft_capture("aft-tool-turn");
+        assert_eq!(successes.len(), 3, "read + edit + apply_patch");
+        // Every content part is typed; none escaped to Unknown.
+        for (_, t) in &successes {
+            if let Some(content) = &t.content {
+                assert!(
+                    content.iter().all(|c| !matches!(c, ToolContent::Unknown)),
+                    "no Unknown escapes in {}",
+                    t.base.id
+                );
+            }
+        }
+        let edit = &successes[1].1;
+        let edit_meta = edit.metadata.as_ref().expect("edit metadata");
+        assert!(edit_meta.filediff.is_some(), "edit carries the structured filediff");
+        assert!(edit_meta.diff.is_some(), "edit carries the diff string too");
+        let patch_meta = successes[2].1.metadata.as_ref().expect("apply_patch metadata");
+        assert!(patch_meta.filediff.is_none(), "apply_patch has no filediff");
+        assert!(patch_meta.diff.is_some(), "apply_patch carries only the diff string");
+    }
+
+    /// aft image read: the `{"type":"file","uri":"data:…;base64,…",
+    /// "mime":"image/png"}` part decodes to the File variant (the aft
+    /// hoist's only wire deviation from core — fields on the wire shape).
+    #[test]
+    fn decode_aft_image_read_capture() {
+        let successes = decode_aft_capture("aft-image-read");
+        assert_eq!(successes.len(), 1);
+        let content = successes[0].1.content.as_ref().expect("read has content");
+        assert_eq!(content.len(), 2, "text + file");
+        assert!(matches!(&content[0], ToolContent::Text { .. }));
+        let ToolContent::File { uri, mime } = &content[1] else {
+            panic!("file part must decode to the File variant, got {:?}", content[1]);
+        };
+        assert!(uri.starts_with("data:image/png;base64,"), "data-URI on the wire");
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(matches!(&content[1], ToolContent::File { .. }));
     }
 }

@@ -91,6 +91,9 @@ pub struct AgentService {
     /// `session/cancel` before abandoning still-open tool calls (official
     /// wind-down, ~5s).
     drain_window: std::time::Duration,
+    /// `--no-aft`: disable the aft hoist adaptations (File/image content
+    /// passthrough). Diff extraction stays (dialect-neutral).
+    no_aft: bool,
 }
 
 struct SessionEntry {
@@ -108,7 +111,16 @@ impl AgentService {
             backend,
             sessions: Mutex::new(HashMap::new()),
             drain_window: std::time::Duration::from_secs(5),
+            no_aft: false,
         }
+    }
+
+    /// Derive a service with `--no-aft`: the aft tool-call hoist adaptations
+    /// (File/image content passthrough) are disabled. Diff extraction stays —
+    /// `filediff`/`diff` are dialect-neutral.
+    pub fn with_no_aft(mut self, no_aft: bool) -> Self {
+        self.no_aft = no_aft;
+        self
     }
 
     /// Override the cancel-drain window (default 5s, official behavior).
@@ -255,7 +267,7 @@ impl AgentService {
                 ));
             }
         };
-        for update in replay::replay_updates(&records) {
+        for update in replay::replay_updates(&records, self.no_aft) {
             cx.send_notification(acp::SessionNotification::new(
                 req.session_id.clone(),
                 update,
@@ -328,7 +340,7 @@ impl AgentService {
             }
         };
 
-        let mut state = updates::MappingState::new();
+        let mut state = updates::MappingState::new().with_no_aft(self.no_aft);
         // Child (subagent) sessions of this session, registered from
         // `session.created {parentID}` — their tool events project into this
         // turn as nested ACP tool calls (`${child.id}:` / `${child.title}:

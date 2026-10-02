@@ -16,7 +16,9 @@ use crate::dto::{MessageRecord, Part, ToolState};
 use super::updates::tool_result_blocks;
 
 /// Build the full ACP transcript for a session's persisted messages.
-pub fn replay_updates(records: &[MessageRecord]) -> Vec<SessionUpdate> {
+/// `no_aft` — see [`MappingState::with_no_aft`]: replays drop File/image
+/// passthrough (diffs stay — dialect-neutral).
+pub fn replay_updates(records: &[MessageRecord], no_aft: bool) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
     for record in records.iter().rev() {
         match record.kind.as_str() {
@@ -29,7 +31,7 @@ pub fn replay_updates(records: &[MessageRecord]) -> Vec<SessionUpdate> {
             }
             "assistant" => {
                 for part in record.content.iter().flatten() {
-                    out.extend(assistant_part(part, &record.id));
+                    out.extend(assistant_part(part, &record.id, no_aft));
                 }
             }
             // Execution bookkeeping records — nothing to show the client.
@@ -42,7 +44,7 @@ pub fn replay_updates(records: &[MessageRecord]) -> Vec<SessionUpdate> {
     out
 }
 
-fn assistant_part(part: &Part, message_id: &str) -> Vec<SessionUpdate> {
+fn assistant_part(part: &Part, message_id: &str, no_aft: bool) -> Vec<SessionUpdate> {
     match part {
         Part::Text { text, .. } => vec![SessionUpdate::AgentMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
@@ -52,7 +54,7 @@ fn assistant_part(part: &Part, message_id: &str) -> Vec<SessionUpdate> {
             ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
                 .message_id(message_id),
         )],
-        Part::Tool { id, name, state, .. } => tool_part(id, name, state),
+        Part::Tool { id, name, state, .. } => tool_part(id, name, state, no_aft),
         Part::Unknown => vec![],
     }
 }
@@ -60,7 +62,7 @@ fn assistant_part(part: &Part, message_id: &str) -> Vec<SessionUpdate> {
 /// A persisted tool part becomes an initial `pending` `ToolCall` (ACP requires
 /// the call to exist before it can be updated) followed by the terminal update
 /// matching the persisted state.
-fn tool_part(id: &str, name: &str, state: &ToolState) -> Vec<SessionUpdate> {
+fn tool_part(id: &str, name: &str, state: &ToolState, no_aft: bool) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
 
     // The opening `ToolCall` — mirrors `session.tool.input.started` in the
@@ -94,9 +96,9 @@ fn tool_part(id: &str, name: &str, state: &ToolState) -> Vec<SessionUpdate> {
         ToolState::Completed { content, metadata, .. } => {
             let mut blocks: Vec<ToolCallContent> = Vec::new();
             if let Some(content) = content {
-                blocks = tool_result_blocks(content, metadata);
+                blocks = tool_result_blocks(content, metadata, no_aft);
             } else if let Some(meta) = metadata {
-                blocks = tool_result_blocks(&[], &Some(meta.clone()));
+                blocks = tool_result_blocks(&[], &Some(meta.clone()), no_aft);
             }
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             if !blocks.is_empty() {
@@ -110,7 +112,7 @@ fn tool_part(id: &str, name: &str, state: &ToolState) -> Vec<SessionUpdate> {
             // output (if any) plus the error text.
             let mut blocks: Vec<ToolCallContent> = Vec::new();
             if let Some(content) = content {
-                blocks = tool_result_blocks(content, metadata);
+                blocks = tool_result_blocks(content, metadata, no_aft);
             }
             if let Some(msg) = &error.message {
                 blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
@@ -171,7 +173,7 @@ mod tests {
 
     #[test]
     fn replay_orders_history_and_maps_transcript() {
-        let updates = replay_updates(&fixture_records());
+        let updates = replay_updates(&fixture_records(), false);
 
         // 1. Chronological order: the OLDEST user message comes first.
         let first = &updates[0];
@@ -226,7 +228,7 @@ mod tests {
         // semantics in the live path).
         let streaming = replay_updates(&[record_with_tool(ToolState::Streaming {
             input: r#"{"x":1}"#.into(),
-        })]);
+        })], false);
         assert_eq!(streaming.len(), 1);
         let SessionUpdate::ToolCall(call) = &streaming[0] else { panic!() };
         assert_eq!(call.raw_input, Some(serde_json::Value::String(r#"{"x":1}"#.into())));
@@ -235,7 +237,7 @@ mod tests {
         let running = replay_updates(&[record_with_tool(ToolState::Running {
             input: serde_json::json!({"x": 1}),
             metadata: None,
-        })]);
+        })], false);
         assert_eq!(running.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &running[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
@@ -252,7 +254,7 @@ mod tests {
             content: None,
             metadata: None,
         })];
-        let updates = replay_updates(&records);
+        let updates = replay_updates(&records, false);
         assert_eq!(updates.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &updates[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::Failed));
@@ -266,7 +268,7 @@ mod tests {
 
     #[test]
     fn reasoning_and_text_parts_share_the_assistant_message_id() {
-        let updates = replay_updates(&fixture_records());
+        let updates = replay_updates(&fixture_records(), false);
         // The write-tool assistant message carries a reasoning part (and no
         // text part in this capture) — the thought chunk must keep the
         // message id so clients can anchor it under the right assistant turn.

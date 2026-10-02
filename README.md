@@ -74,6 +74,7 @@ via env:
 | `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
 | `--attach` | `~/.config/opencode/service.json` (`{port, password, hostname}`; `0.0.0.0` → `127.0.0.1`) | from the file |
 | *(none)* | `OPENCODE_URL` env | same env vars as `--attach <url>` |
+| `--no-aft` | *(any connection mode)* | disables the aft tool-call hoist adaptations (File/image content passthrough in tool results); diff extraction stays enabled |
 
 The server is probed at startup (`GET /api/config`); failures are classified
 (unreachable / credentials rejected / HTTP status) with the connection source

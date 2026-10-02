@@ -19,6 +19,9 @@ OPTIONS:
                      the OPENCODE_PASSWORD or OPENCODE_SERVER_PASSWORD env.
     --attach         Read the connection from ~/.config/opencode/service.json
                      ({port, password, hostname} — written by `opencode serve`).
+    --no-aft         Disable the aft tool-call hoist adaptations (File/image
+                     content passthrough). Diff extraction stays enabled —
+                     filediff/diff are dialect-neutral and work either way.
     --version        Print the version and exit.
     --help           Print this help and exit.
 
@@ -50,8 +53,8 @@ pub enum ConnectMode {
 /// Result of parsing the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
-    /// Serve with this connection mode.
-    Run(ConnectMode),
+    /// Serve with this connection mode and option flags.
+    Run(RunOptions),
     /// `--version` was requested.
     Version,
     /// `--help` was requested.
@@ -60,12 +63,24 @@ pub enum ParseOutcome {
     Error(String),
 }
 
+/// Runtime options extracted from the command line (everything except the
+/// connection mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOptions {
+    /// How to reach the opencode server.
+    pub mode: ConnectMode,
+    /// `--no-aft`: disable the aft hoist adaptations (File/image content
+    /// passthrough in tool results; see `USAGE`).
+    pub no_aft: bool,
+}
+
 /// Parse the argument list (argv[0] included, like `std::env::args()`).
 ///
 /// Rules:
 /// - `--help` / `--version` win immediately (first one seen).
 /// - `--attach <url>`: the next token, when it does not start with `-`, is the
 ///   URL; otherwise (next flag or end of args) `--attach` is treated as bare.
+/// - `--no-aft`: boolean flag, may appear anywhere; rejected when repeated.
 /// - any other token is a usage error; a repeated `--attach` is a usage error.
 pub fn parse_args<I>(args: I) -> ParseOutcome
 where
@@ -77,12 +92,21 @@ where
 
     // None = not seen; Some(Some(url)) = --attach with URL; Some(None) = bare.
     let mut attach: Option<Option<String>> = None;
+    let mut no_aft = false;
 
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--help" => return ParseOutcome::Help,
             "--version" => return ParseOutcome::Version,
+            "--no-aft" => {
+                if no_aft {
+                    return ParseOutcome::Error(
+                        "duplicate --no-aft (run with --help for usage)".to_string(),
+                    );
+                }
+                no_aft = true;
+            }
             "--attach" => {
                 if attach.is_some() {
                     return ParseOutcome::Error(
@@ -113,7 +137,7 @@ where
         Some(None) => ConnectMode::ServiceFile,
         None => ConnectMode::Env,
     };
-    ParseOutcome::Run(mode)
+    ParseOutcome::Run(RunOptions { mode, no_aft })
 }
 
 #[cfg(test)]
@@ -137,13 +161,16 @@ mod tests {
     fn attach_with_url_is_explicit_mode() {
         assert_eq!(
             parse(&["prog", "--attach", "http://127.0.0.1:44041"]),
-            ParseOutcome::Run(ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()))
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false })
         );
     }
 
     #[test]
     fn bare_attach_is_service_file_mode() {
-        assert_eq!(parse(&["prog", "--attach"]), ParseOutcome::Run(ConnectMode::ServiceFile));
+        assert_eq!(
+            parse(&["prog", "--attach"]),
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::ServiceFile, no_aft: false })
+        );
         // Followed by another flag: still the bare form.
         assert_eq!(
             parse(&["prog", "--attach", "--help"]),
@@ -154,7 +181,40 @@ mod tests {
 
     #[test]
     fn no_attach_means_env_mode() {
-        assert_eq!(parse(&["prog"]), ParseOutcome::Run(ConnectMode::Env));
+        assert_eq!(
+            parse(&["prog"]),
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Env, no_aft: false })
+        );
+    }
+
+    #[test]
+    fn no_aft_flag_composes_with_any_attach_form() {
+        // Bare --no-aft.
+        assert_eq!(
+            parse(&["prog", "--no-aft"]),
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Env, no_aft: true })
+        );
+        // With an explicit URL, in either order.
+        assert_eq!(
+            parse(&["prog", "--no-aft", "--attach", "http://127.0.0.1:44041"]),
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
+                no_aft: true,
+            })
+        );
+        assert_eq!(
+            parse(&["prog", "--attach", "--no-aft"]),
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::ServiceFile, no_aft: true }),
+            "bare --attach followed by --no-aft"
+        );
+    }
+
+    #[test]
+    fn duplicate_no_aft_is_rejected() {
+        match parse(&["prog", "--no-aft", "--no-aft"]) {
+            ParseOutcome::Error(msg) => assert!(msg.contains("duplicate"), "got {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]

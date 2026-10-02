@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Cost, SessionInfoUpdate, SessionUpdate, TextContent,
+    ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 
@@ -93,11 +93,22 @@ pub struct MappingState {
     /// the next `step.started`, folded into the PromptResponse `_meta` when
     /// the turn ends before the retry fires.
     retry: Option<serde_json::Value>,
+    /// `--no-aft`: drop the aft hoist adaptations (File/image content
+    /// passthrough). Diff extraction is NOT gated — `filediff`/`diff` are
+    /// dialect-neutral and keep working under both.
+    no_aft: bool,
 }
 
 impl MappingState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builder: `--no-aft` — disable the aft hoist adaptations (File/image
+    /// content passthrough). Diff extraction stays enabled (dialect-neutral).
+    pub fn with_no_aft(mut self, no_aft: bool) -> Self {
+        self.no_aft = no_aft;
+        self
     }
 
     /// The parsed input of a tool call, if seen this turn (`tool.input.ended`
@@ -333,23 +344,11 @@ fn to_tool_updates(
                 }
             }
             if let Some(content) = &t.content {
-                let mut blocks: Vec<ToolCallContent> = Vec::new();
-                for part in content {
-                    match part {
-                        ToolContent::Text { text } => blocks.push(ToolCallContent::from(
-                            ContentBlock::Text(TextContent::new(text.clone())),
-                        )),
-                        ToolContent::Unknown => {}
-                    }
-                }
-                if let Some(meta) = &t.metadata {
-                    blocks.extend(diff::diff_blocks(meta));
-                }
-                fields = fields.content(Some(blocks));
+                fields = fields.content(Some(tool_result_blocks(content, &t.metadata, state.no_aft)));
             } else if let Some(meta) = &t.metadata {
                 // Content-less success (e.g. progress-only tools) may still
                 // carry diffs — never drop the file changes.
-                let blocks = diff::diff_blocks(meta);
+                let blocks = tool_result_blocks(&[], &Some(meta.clone()), state.no_aft);
                 if !blocks.is_empty() {
                     fields = fields.content(Some(blocks));
                 }
@@ -516,15 +515,53 @@ fn tool_update(
 
 /// Shared helper: tool result content → ACP `ToolCallContent` (text blocks
 /// plus #52636 diff blocks). Used by the live path and the replay path.
+/// The aft hoist File part → ACP content block.
+///
+/// Only `image/*` mimes are mapped — the only verified aft scenario (image
+/// reads). Non-image file parts are skipped. The uri must be a data-URI
+/// (`data:<mime>;base64,<payload>`); anything else is unverified wire and is
+/// skipped rather than guessed. `--no-aft` disables the whole mapping.
+fn image_content_block(part: &dto::ToolContent, no_aft: bool) -> Option<ToolCallContent> {
+    if no_aft {
+        return None;
+    }
+    let dto::ToolContent::File { uri, mime } = part else {
+        return None;
+    };
+    let mime_type = mime.as_deref()?;
+    if !mime_type.starts_with("image/") {
+        return None;
+    }
+    let (prefix, payload) = uri.split_once(";base64,")?;
+    if !prefix.starts_with("data:") {
+        return None;
+    }
+    Some(ToolCallContent::from(ContentBlock::Image(
+        ImageContent::new(payload.to_string(), mime_type.to_string()).uri(uri.clone()),
+    )))
+}
+
+/// Map tool output content + metadata to ACP result blocks (shared by the
+/// live tool-success path and the session/load replay path).
+///
+/// - `Text` parts → text blocks (verbatim).
+/// - `File` parts (aft hoist) → image blocks, see [`image_content_block`].
+/// - metadata → diff blocks via the dialect-neutral `filediff`/`diff` chain.
 pub fn tool_result_blocks(
     content: &[ToolContent],
     metadata: &Option<ToolMetadata>,
+    no_aft: bool,
 ) -> Vec<ToolCallContent> {
     let mut blocks: Vec<ToolCallContent> = Vec::new();
     for part in content {
         match part {
             ToolContent::Text { text } => blocks
                 .push(ToolCallContent::from(ContentBlock::Text(TextContent::new(text.clone())))),
+            ToolContent::File { .. } => {
+                if let Some(block) = image_content_block(part, no_aft) {
+                    blocks.push(block);
+                }
+            }
             ToolContent::Unknown => {}
         }
     }
@@ -935,6 +972,118 @@ mod tests {
         assert_eq!(u.tool_call_id.0.as_ref(), "call_c");
         assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
         assert_eq!(u.fields.title, Some("Cancelled".into()));
+    }
+
+    // ======================= Wave 5: aft hoist dialect =======================
+
+    /// Decoded ToolSuccess events of an aft capture, in fixture order.
+    fn aft_successes(path: &str) -> Vec<dto::ToolSuccess> {
+        let raw = aft_fixture(path);
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") || line == "data: " {
+                continue;
+            }
+            let env: dto::EventEnvelope =
+                serde_json::from_str(&line[6..]).expect("envelope parses");
+            if let Some(dto::SessionEvent::ToolSuccess(t)) = dto::decode_event(&env.kind, &env.data)
+            {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    fn aft_fixture(name: &str) -> &'static str {
+        match name {
+            "aft-tool-turn" => include_str!("../../tests/fixtures/aft-tool-turn.sse"),
+            "aft-image-read" => include_str!("../../tests/fixtures/aft-image-read.sse"),
+            other => panic!("unknown aft fixture {other}"),
+        }
+    }
+
+    /// The image read's content maps to [Text, Image] blocks — the Data-URI
+    /// split into the base64 payload + mime, original uri preserved. With
+    /// `--no-aft` the image block is dropped (plain text behavior); the diff
+    /// chain is untouched (not exercised here).
+    #[test]
+    fn aft_image_content_maps_to_image_block_and_no_aft_drops_it() {
+        let successes = aft_successes("aft-image-read");
+        assert_eq!(successes.len(), 1);
+
+        let mut state = MappingState::new();
+        let updates = to_updates(&dto::SessionEvent::ToolSuccess(successes[0].clone()), &mut state);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call update")
+        };
+        let blocks = u.fields.content.as_ref().expect("content present");
+        assert_eq!(blocks.len(), 2, "text + image");
+
+        let acp::ToolCallContent::Content(c) = &blocks[1] else {
+            panic!("image must map to a Content block, got {:?}", blocks[1]);
+        };
+        let acp::ContentBlock::Image(img) = &c.content else {
+            panic!("expected an image block, got {:?}", c.content);
+        };
+        assert_eq!(img.mime_type, "image/png");
+        assert!(img.data.starts_with("iVBORw0KGgo"), "base64 payload after the data-URI prefix");
+        assert!(
+            !img.data.contains("data:"),
+            "the data-URI prefix must be stripped from the payload"
+        );
+        assert_eq!(
+            img.uri.as_deref(),
+            Some(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            )
+        );
+
+        // --no-aft: image passthrough off, text stays.
+        let mut no_aft = MappingState::new().with_no_aft(true);
+        let updates = to_updates(&dto::SessionEvent::ToolSuccess(successes[0].clone()), &mut no_aft);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call update")
+        };
+        let blocks = u.fields.content.as_ref().expect("content present");
+        assert_eq!(blocks.len(), 1, "image dropped under --no-aft");
+        assert!(matches!(&blocks[0], acp::ToolCallContent::Content(c) if matches!(&c.content, acp::ContentBlock::Text(_))));
+    }
+
+    /// aft read/edit/apply_patch turn through the live mapping: the edit's
+    /// filediff (primary) and the apply_patch's `diff` string (fallback) both
+    /// produce Diff blocks — the aft dialect does not change the diff chain.
+    #[test]
+    fn aft_diff_primary_and_fallback_blocks() {
+        let successes = aft_successes("aft-tool-turn");
+        assert_eq!(successes.len(), 3);
+
+        // Success #0 (read) carries no file changes; #1 (edit) uses the
+        // primary filediff; #2 (apply_patch) falls back to the `diff` string.
+        let mut state = MappingState::new();
+        let n_diffs: Vec<usize> = successes
+            .iter()
+            .map(|t| {
+                let updates =
+                    to_updates(&dto::SessionEvent::ToolSuccess(t.clone()), &mut state);
+                let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+                    panic!("expected a tool_call update")
+                };
+                u.fields
+                    .content
+                    .as_ref()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| matches!(b, acp::ToolCallContent::Diff(_)))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(n_diffs[0], 0, "the read carries no file changes");
+        assert_eq!(n_diffs[1], 1, "the edit's filediff maps to one Diff block");
+        assert_eq!(n_diffs[2], 1, "the apply_patch's diff-string fallback maps too");
     }
 
     #[test]

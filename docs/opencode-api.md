@@ -336,6 +336,29 @@ Heterogeneous array, discriminated by `type`, **newest first**:
    `session.execution.failed` → ACP `stop` (reason error, include error message).
 4. `POST …/interrupt` maps to ACP `session/cancel` → stop reason cancelled.
 
+## aft dialect (tool-call hoist, v0.58.0, wire-verified)
+
+The cortexkit/aft plugin replaces the registered tool implementations
+(read/edit/write/apply_patch/bash/grep/glob) with its own — the SSE event
+stream is unchanged, but successful tool calls may carry aft-shaped payloads.
+Verified against a live aft-enabled server (fixtures:
+`tests/fixtures/aft-tool-turn.sse` — read/edit/apply_patch turn;
+`tests/fixtures/aft-image-read.sse` — image read):
+
+| shape | aft | core (2.0.21) | bridge handling |
+|---|---|---|---|
+| `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit | present | primary diff source (unchanged) |
+| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | present | fallback chain (unchanged) — multi-file `Index:` sections split |
+| `tool.success.content[]` file part `{"type":"file","uri":"data:…;base64,…","mime":"image/png"}` | image reads | absent | mapped to ACP `ImageContent` (`data` = payload after the data-URI prefix, `mime_type` = `mime`, `uri` preserved). Only `image/*` mimes are mapped — the only verified scenario; non-image / non-data-URI file parts are skipped, never guessed |
+| `tool.called.input` | model's raw args (canonicalization happens on a copy) | same | unchanged |
+
+The `mime` (not `mimeType`) field and the aft metadata fingerprint (`preview`,
+`filepath`, `isImage`, `isPdf`, `truncated`) are the hoist's wire markers.
+
+`--no-aft` disables the File/image content passthrough (back to plain
+text+diff behavior); the diff extraction chain is NOT gated — `filediff`/`diff`
+are dialect-neutral and keep working under both.
+
 ## Version drift: dev clone vs 2.0.21
 
 | dev clone (post-2.0.21) | 2.0.21 (target) |

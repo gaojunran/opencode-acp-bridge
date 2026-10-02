@@ -34,11 +34,11 @@ async fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::from(2)
         }
-        ParseOutcome::Run(mode) => run(mode).await,
+        ParseOutcome::Run(opts) => run(opts.mode, opts.no_aft).await,
     }
 }
 
-async fn run(mode: ConnectMode) -> ExitCode {
+async fn run(mode: ConnectMode, no_aft: bool) -> ExitCode {
     init_tracing();
 
     let cfg = match resolve_config(&mode, &opencode_acp_bridge::bridge::config::RealEnv) {
@@ -90,7 +90,7 @@ async fn run(mode: ConnectMode) -> ExitCode {
     tracing::info!("probe ok — serving ACP on stdio");
 
     let backend: Arc<dyn OpenCodeBackend> = Arc::new(HttpBackend::new(client));
-    let service = Arc::new(AgentService::new(backend));
+    let service = Arc::new(AgentService::new(backend).with_no_aft(no_aft));
 
     // Runs until the stdio connection closes (stdin EOF → clean exit).
     match service.serve(Stdio::new()).await {
