@@ -97,6 +97,23 @@ in `tests/fixtures/aft-*.sse`). Unlike the official adapter, which builds
 diffs from `input.oldString/newString` (empty under aft's hoist), this bridge
 reads result metadata — the same code path covers both dialects.
 
+## Compared to the official `opencode acp`
+
+Anchored to opencode 2.0.21/2.0.22 — official behavior source-checked,
+bridge behavior live-verified (see Status):
+
+| Area | Official `opencode acp` | This bridge |
+| --- | --- | --- |
+| Diff blocks for file edits ([#52636](https://github.com/anomalyco/opencode/issues/52636)) | Diffs only from the `edit` tool's `input.oldString/newString`; `write` / `apply_patch` / plugin tools produce no diff — the editor silently shows no file changes (unfixed in 2.0.22) | Result-metadata driven chain (`filediff` → `files[]` → `diff` string) — covers every edit path incl. plugin-hoisted tools |
+| Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | Replies hang: the reply must reach the child session that asked (still open in 2.0.22) | Replies routed to the asking session — child asks round-trip (live E2E) |
+| Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | Spawns a private `opencode serve` per editor window: ~255 MB + ~8 s cold start each, sessions invisible across windows | Attaches to one shared server (`--attach` / service.json): ~2 MB bridge process, ms-scale startup, sessions shared |
+| AFT tool hoist | Diff extraction reads tool inputs → empty under the hoist; image reads dropped | Reads result metadata (dialect-neutral) and maps image file parts to ACP image blocks; `--no-aft` opts out |
+| Protocol dialect | v1 + v2 draft negotiation; elicitation forms (2.0.22) | ACP v1 — what Zed negotiates in practice; no elicitation yet |
+
+Not fixable on either side: todo/plan outlines ([#40745](https://github.com/anomalyco/opencode/issues/40745)) — the
+`todowrite` tool was removed from the 2.x core, so there is no wire data to
+map.
+
 ## Status
 
 Working (live-verified against opencode 2.0.21 + a live aft environment):
