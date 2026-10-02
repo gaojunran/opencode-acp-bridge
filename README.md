@@ -20,7 +20,20 @@ opencode PR #52075). This bridge talks to one shared server over the wire:
   `metadata.filediff` — server-side truth, unlike the official input-based
   reconstruction
 
-## Build
+## Install
+
+With [mise](https://mise.jdx.dev):
+
+```sh
+mise use -g github:gaojunran/opencode-acp-bridge
+```
+
+Prebuilt binaries for Linux (gnu/musl, x64/arm64), macOS (x64/arm64) and
+Windows are attached to each [release](https://github.com/gaojunran/opencode-acp-bridge/releases);
+mise puts the binary on its PATH shim
+(`~/.local/share/mise/shims/opencode-acp-bridge` by default).
+
+From source (stable Rust):
 
 ```sh
 cargo build --release
@@ -36,8 +49,8 @@ Add to `~/.config/zed/settings.json` (the agent panel → agent servers):
   "agent_servers": {
     "OpenCode": {
       "command": {
-        // adjust to your build location
-        "path": "~/Playground/opencode-acp-bridge/target/release/opencode-acp-bridge",
+        // adjust to your install location (mise shim shown)
+        "path": "~/.local/share/mise/shims/opencode-acp-bridge",
         "args": ["--attach"]
       }
     }
