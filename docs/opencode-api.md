@@ -208,6 +208,80 @@ extracted via strings 2026-10-02). Its event pump consumes the same
 - child sessions: `session.created` with `parentID` tracked; forwarded only when
   the client advertises `opencode/child-session-updates` in `_meta`
 
+### v2.0.22 deltas vs the 2.0.21 binary above (surveyed 2026-10-02)
+
+The notes above describe the 2.0.21 binary we run; tag v2.0.22
+(`packages/cli/src/acp/`, 15 files) changed behavior:
+
+- **Forms are no longer unconditionally cancelled.** When the client declares
+  `clientCapabilities.elicitation.form` and the form is representable
+  (`metadata.kind` question/websearch.provider; no credential-looking field
+  keys; no external/when/hidden-required-without-default fields; options
+  representable as oneOf), the adapter asks via `client/elicitation.create
+  {mode:"form", requestedSchema}` and answers through `session.form.reply`;
+  non-accept/invalid answers cancel. Non-declaring clients and
+  unrepresentable forms still auto-cancel. → #38121 is addressed at v2.0.22
+  for elicitation-capable clients.
+- **Child sessions are always surfaced.** Capability declared →
+  `opencode/session/child_update` notifications (update or status
+  created/running/completed/failed/interrupted); not declared → child events
+  projected into the parent stream with `_meta["opencode/child-session"]` and
+  `toolCallId = "${child.id}:${toolCallId}"` (title `"${child.title}: …"`).
+  Child permission asks carry the CHILD's sessionID — the reply must be
+  addressed there. → #48232 root cause is client-side correlation (filtering
+  asks to the main session, or matching non-prefixed toolCallIds), not server.
+- **Prompt carries a client-generated `id` + `delivery:"steer"`**; turn
+  admission gates on `session.inbox.delivered` whose `inboxID` matches that
+  id. Permission asks, forms, and child tracking are handled even
+  pre-admission (before the gate). Compaction is a separate submit path
+  (`session.compact` with a client minted message id).
+- **Permission previews are computed live on ask** (reads the file for
+  write/edit, `Patch.derive` for patch hunks; title from input; locations
+  fall back to `resources` minus `*`), not from cached input.
+- **Usage accumulates from `session.step.ended`** and is reported once in the
+  PromptResponse, plus a post-turn `usage_update {used, size, cost}` — size
+  from the model catalog `limit.context`, cost from `session.get`.
+  `session.usage.updated` and `session.renamed` are IGNORED by the official
+  adapter (our incremental mappings are a superset — keep).
+- **Compaction/retry markers**: `session.compaction.*` → session_info_update
+  `_meta["opencode/compaction"] {status,messageId,reason,error?}`;
+  `session.retry.scheduled` → `_meta["opencode/retry"]
+  {attempt,nextRetryAt,error}` (cleared on next step.started; pending retry
+  folds into PromptResponse `_meta`).
+- **Cancel drain**: cancel → interrupt → forward wind-down ≤5 s → fail every
+  still-open tool with error "Cancelled" (abandonTools). `session/close`
+  interrupts even an idle session. Permission/form replies are
+  uninterruptible server-side.
+- **Config-option pushes**: `config_option_update` / `available_commands_update`
+  on catalog reload (`model.updated` / `agent.updated` / `command.updated`,
+  scoped by directory) and on selection changes from other clients
+  (`session.model.selected` / `session.agent.selected`). Set failures reload
+  the catalog once and retry; selection is updated before `switchModel` so the
+  echo diffs to no change.
+- **#52636 still present at v2.0.22**: result `content.diff` is built only
+  from `input.oldString/newString` (edit tool); write/apply_patch produce no
+  diff block; `metadata.filediff` passes through untouched inside
+  `rawOutput.metadata`. Our metadata.filediff-based diff remains the fix and
+  loses no information for official clients.
+- Replay: `message.list` asc `limit:200` cursor-paginated; per-message
+  translation failures are logged and skipped; any attach error detaches
+  cleanly. Output ordering: post-response updates are buffered until the
+  session/load|new|resume response has been written.
+- initialize declares: `protocolVersion: 1`, loadSession, mcp http not sse,
+  prompt embeddedContext+image, sessionCapabilities close/delete/fork/list/
+  resume/additionalDirectories, `_meta` child-session-updates; authMethods
+  `opencode-login` (terminal-auth `_meta` only for declaring clients). No
+  fs.writeTextFile capability.
+
+**Bridge backlog (Wave 4+, priority-ordered)**: 1. prompt `id` + inbox
+admission gate; 2. step.failed/execution.failed terminal + auth-error
+mapping (Wave 3); 3. child sessions + child permission asks; 4. usage
+size/cost from catalog + PromptResponse usage; 5. form elicitation
+(capability-gated); 6. compaction/retry markers; 7. config-option pushes;
+8. cancel drain + abandonTools; 9. error-taxonomy parity; 10. output-ordering
+buffer after session/load response; 11. prompt enrichment (audience
+annotations, images, files, slash-commands).
+
 ## Persisted message records (`GET …/message`)
 
 Heterogeneous array, discriminated by `type`, **newest first**:
