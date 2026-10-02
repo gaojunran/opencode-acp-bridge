@@ -108,6 +108,7 @@ bridge behavior live-verified (see Status):
 | Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | Replies hang: the reply must reach the child session that asked (still open in 2.0.22) | Replies routed to the asking session — child asks round-trip (live E2E) |
 | Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | Spawns a private `opencode serve` per editor window: ~255 MB + ~8 s cold start each, sessions invisible across windows | Attaches to one shared server (`--attach` / service.json): ~2 MB bridge process, ms-scale startup, sessions shared |
 | AFT tool hoist | Diff extraction reads tool inputs → empty under the hoist; image reads dropped | Reads result metadata (dialect-neutral) and maps image file parts to ACP image blocks; `--no-aft` opts out |
+| Stable-v1 session & mode surface | `session/list` / `resume` / `delete`, `set_mode`, `available_commands_update` (present in 2.0.21/2.0.22 source) | Full parity, live-verified on a real 2.0.21 server — plus `current_mode_update` on remote switches and step-started self-heal |
 | Protocol dialect | v1 + v2 draft negotiation; elicitation forms (2.0.22) | ACP v1 — what Zed negotiates in practice; no elicitation yet |
 
 Not fixable on either side: todo/plan outlines ([#40745](https://github.com/anomalyco/opencode/issues/40745)) — the

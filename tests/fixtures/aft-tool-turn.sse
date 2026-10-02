@@ -16,7 +16,7 @@ data: {"id":"evt_0fbd2fb9a001j9p7EPxtNohOIc","created":1790931303322,"type":"ses
 
 data: {"id":"evt_0fbd2fc000013xmrBC1y5UT3nO","created":1790931303424,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/aft-fixture-project"},"data":{"sessionID":"ses_f042d122bffecGfrQxvlaTgCPf","assistantMessageID":"msg_0fbd2f406001PAWAXzMcBWcxUb","ordinal":0,"delta":"tmp/opencode/aft-probe/edit-target.txt\n2. Use edit tool to append \""}}
 
-data: {"id":"evt_0fbd2fc71001WWr7OTSiO8hoZm","created":1790931303537,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/aft-fixture-project"},"data":{"sessionID":"ses_f042d122bffecGfrQxvlaTgCPf","assistantMessageID":"msg_0fbd2f406001PAWAXzMcBWcxUb","ordinal":0,"delta":"line4\" at the end of that file\n3. Use apply_patch to add a file /data/home/neb"}}
+data: {"id":"evt_0fbd2fc71001WWr7OTSiO8hoZm","created":1790931303537,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/aft-fixture-project"},"data":{"sessionID":"ses_f042d122bffecGfrQxvlaTgCPf","assistantMessageID":"msg_0fbd2f406001PAWAXzMcBWcxUb","ordinal":0,"delta":"line4\" at the end of that file\n3. Use apply_patch to add a file /home/dev"}}
 
 data: {"id":"evt_0fbd2fce4001JaQww2LcvcVbgA","created":1790931303652,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/aft-fixture-project"},"data":{"sessionID":"ses_f042d122bffecGfrQxvlaTgCPf","assistantMessageID":"msg_0fbd2f406001PAWAXzMcBWcxUb","ordinal":0,"delta":"ula/Playground/.aft-probe/added.txt with content \"patched ok\"\n4. Reply DONE only"}}
 
