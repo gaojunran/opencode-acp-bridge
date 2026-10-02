@@ -85,31 +85,17 @@ error.
 ## AFT compatibility (tool-call hoist)
 
 With the [`@cortexkit/aft-opencode`](https://www.npmjs.com/package/@cortexkit/aft-opencode)
-plugin active, seven built-in tools (read/edit/write/apply_patch/bash/grep/glob)
-are replaced by same-name registrations. The SSE event stream keeps the core
-shape — tool names, event taxonomy, and envelopes are unchanged — so most of
-the bridge works unmodified. The diff plane is identical to core in both
-dialects (`edit`/`write` → `filediff`; `apply_patch` → `diff` + `files[]`, no
-`filediff` — core 2.0.21 live-verified too), so the only aft-specific wire
-delta is the image file part below. What was verified against a live aft
-v0.58.0 environment (captures in `tests/fixtures/aft-*.sse`):
-
-| aft behavior | Wire effect | Bridge handling |
-| --- | --- | --- |
-| Same-name tool replacement | Stream undeformed: same tool names, same event types | No change needed — all existing mappings apply |
-| `edit` / `write` results | `metadata.filediff` identical in shape to core | Diff blocks via the primary `filediff` path (unchanged) |
-| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` — **same shape as core, not aft-specific** | Diff blocks from `metadata.files[]` (structured: `filePath` authoritative, entry-level failure isolation); the `diff` string is the level-③ fallback only |
-| `read` on an image | Content part `{type:"file", uri:"data:<mime>;base64,…", mime:"image/png"}` | Mapped to an ACP image content block (base64 payload + `mime_type`, original `uri` preserved) — previously dropped as unknown |
-| Tool input args | Model's raw parameters (aft canonicalizes on a copy) | Permission `toolCall` construction works unchanged |
-| Non-image or non-data-URI file parts | Not observed on the wire | Skipped — never guessed (`#[serde(other)]` sink) |
-| `--no-aft` flag | — | Disables the file/image passthrough only; diff extraction stays on (dialect-neutral) |
-
-Note the contrast with the official adapter: it builds diff blocks from the
-edit tool's `input.oldString/newString`, which is empty under aft's hoist —
-this bridge reads result metadata instead, so the same code path covers both
-dialects. Image delivery itself does not depend on the relay: the image block
-is emitted with the tool result; whether the *turn* then completes depends on
-the model provider accepting image input.
+plugin active, the built-in tools are replaced by same-name registrations, but
+the SSE stream keeps the core shape (tool names, event taxonomy, envelopes),
+so the bridge works unmodified — the diff plane is identical to core
+(`edit`/`write` → `filediff`; `apply_patch` → `files[]`). The only
+aft-specific delta: reading an image yields a `file` part (data-URI), which
+is mapped to an ACP image content block instead of being dropped. `--no-aft`
+disables just that image/file passthrough; diff extraction stays on
+(dialect-neutral). Verified against a live aft v0.58.0 environment (captures
+in `tests/fixtures/aft-*.sse`). Unlike the official adapter, which builds
+diffs from `input.oldString/newString` (empty under aft's hoist), this bridge
+reads result metadata — the same code path covers both dialects.
 
 ## Status
 
