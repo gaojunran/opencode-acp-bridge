@@ -481,3 +481,195 @@ async fn wave3_permission_loop_e2e() {
         updates.len()
     );
 }
+// ---------------------------------------------------------------------------
+// Wave 4: child-session projection (#48232)
+// ---------------------------------------------------------------------------
+
+const SUBAGENT_PROMPT: &str = "Use the subagent tool with agent \"explorer\" and description \
+     \"Find markdown files in project\" to find all markdown files in this project directory. \
+     Then reply with a one-line summary of what the subagent found.";
+
+#[tokio::test]
+#[ignore = "requires BRIDGE_IT=1, the scratch server, and the subagent tool (OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS)"]
+async fn wave4_child_projection_e2e() {
+    if !it_enabled() {
+        eprintln!("skipped: BRIDGE_IT=1 not set");
+        return;
+    }
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+
+    // Idempotent fixture content: give the explorer child something to find.
+    std::fs::write(format!("{FIXTURE_DIR}/notes-a.md"), "# Notes A\nwave4 fixture\n")
+        .expect("write notes-a.md");
+    std::fs::write(format!("{FIXTURE_DIR}/notes-b.md"), "# Notes B\nwave4 fixture\n")
+        .expect("write notes-b.md");
+
+    let client = OpencodeClient::new(SCRATCH, SCRATCH_PASSWORD).expect("valid scratch URL");
+    client
+        .config()
+        .await
+        .unwrap_or_else(|e| panic!("scratch server {SCRATCH} unreachable: {e}"));
+
+    let http_backend = Arc::new(HttpBackend::new(client.clone()));
+    let svc = Arc::new(AgentService::new(
+        http_backend.clone() as Arc<dyn OpenCodeBackend>,
+    ));
+    let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+    let agent_task = tokio::spawn({
+        let svc = Arc::clone(&svc);
+        async move {
+            let _ = svc.serve(agent_side).await;
+        }
+    });
+
+    let all_updates = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+    let sid_seen = Arc::new(Mutex::new(String::new()));
+
+    let outcome: Result<(), AcpError> = Client
+        .builder()
+        .name("bridge-it-wave4")
+        // A child bash ask (fixture rule bash=ask) must not hang the turn:
+        // auto-allow once. The ask→reply routing to the child sessionID is
+        // unit-tested; here it only must not deadlock the projection.
+        .on_receive_request(
+            async move |req: acp::RequestPermissionRequest,
+                        responder: Responder<acp::RequestPermissionResponse>,
+                        _cx: ConnectionTo<Agent>| {
+                let _ = req;
+                responder.respond(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        "once",
+                    )),
+                ))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let all_updates = Arc::clone(&all_updates);
+                async move |notif: SessionNotification, _cx| {
+                    all_updates.lock().expect("updates lock").push(notif);
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_side, {
+            let client = client.clone();
+            let sid_seen = Arc::clone(&sid_seen);
+            let all_updates = Arc::clone(&all_updates);
+            async move |cx| {
+                let _init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(FIXTURE_DIR))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+                *sid_seen.lock().expect("sid lock") = sid.0.as_ref().to_string();
+
+                client
+                    .set_model(
+                        &sid.0,
+                        &ModelRef {
+                            id: MODEL_ID.into(),
+                            providerID: MODEL_PROVIDER.into(),
+                            variant: None,
+                        },
+                    )
+                    .await
+                    .expect("set_model on scratch");
+
+                let prompt = cx.send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new(SUBAGENT_PROMPT))],
+                ));
+                let resp = match tokio::time::timeout(
+                    Duration::from_secs(180),
+                    prompt.block_task(),
+                )
+                .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        eprintln!(
+                            "DIAG after 180s: updates received: {}",
+                            all_updates.lock().expect("updates lock").len()
+                        );
+                        panic!("live subagent turn did not finish within 180s");
+                    }
+                };
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+                client.delete_session(sid.0.as_ref()).await.expect("delete_session cleanup");
+                Ok(())
+            }
+        })
+        .await;
+
+    agent_task.abort();
+    outcome.expect("wave4 client run ok");
+
+    let sid = sid_seen.lock().expect("sid lock").clone();
+    let updates = all_updates.lock().expect("updates lock");
+    assert!(!updates.is_empty(), "no session updates collected");
+
+    // 1. Every notification is addressed to the PARENT session — child
+    //    events ride the parent's ACP session (#48232 projection).
+    for n in updates.iter() {
+        assert_eq!(
+            n.session_id.0.as_ref(),
+            sid.as_str(),
+            "update addressed to the parent session, got {:?}",
+            n.update
+        );
+    }
+
+    // 2. The parent spawned a subagent: an unprefixed tool call titled
+    //    "subagent".
+    assert!(
+        updates.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::ToolCallUpdate(u)
+                if !u.tool_call_id.0.contains(':')
+                    && u.fields.title.as_deref() == Some("subagent")
+        )),
+        "the subagent spawn is a normal parent tool call ({} updates)",
+        updates.len()
+    );
+
+    // 3. Child tool events project under the `${child.id}:` namespace, and
+    //    at least one child call completed.
+    let child_calls: Vec<_> = updates
+        .iter()
+        .filter_map(|n| match &n.update {
+            SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.contains(":call_") => Some(u),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !child_calls.is_empty(),
+        "child tool calls projected with prefixed ids ({} updates)",
+        updates.len()
+    );
+    assert!(
+        child_calls
+            .iter()
+            .any(|u| u.fields.status == Some(ToolCallStatus::Completed)),
+        "at least one child tool call completed"
+    );
+
+    eprintln!(
+        "wave4 child projection: {} updates, {} child calls",
+        updates.len(),
+        child_calls.len()
+    );
+}
