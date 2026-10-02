@@ -116,15 +116,97 @@ toolCallID).
 - `project.updated {id, canonical, vcs, time, sandboxes}`
 - `server.connected {}` (first frame after connect)
 
-### Unverified event names (discover live, then update this doc)
+### Permission loop — fully verified on the wire (2026-10-02, dual-subscriber)
 
-- **Permission request event** — fires when a tool needs approval. Discover: on the
-  scratch server, run a prompt that triggers a permission-requiring tool (e.g. bash
-  with a project config permission rule), watch `/api/event`. Expected shape per
-  openapi `Permission.Request`; reply via the session-scoped reply route above.
-- `session.tool.error` / `session.tool.failed` — tool failure event name (persisted
-  `ToolState.Error` exists, live event unobserved). Discover with a failing tool call.
-- `session.deleted` / `session.status` — unobserved.
+Trigger: project config `[permission] bash = "ask"` (v1-compat, maps to action `shell`).
+Prompt "use the bash tool to run: echo hi". Observed on live 2.0.21:
+
+1. **`permission.asked`** — broadcast to **every** `/api/event` subscriber
+   (dual-curl proof: both got the identical frame, 22/22). Also appears in
+   `GET /api/session/{id}/permission` (`data[0]`) while pending. Ask persists
+   ≥10 min without expiring. Frame:
+
+   ```json
+   {"id":"evt_…","created":…,"type":"permission.asked",
+    "location":{"directory":"…"},
+    "data":{"id":"per_…","sessionID":"ses_…","action":"shell",
+            "resources":["echo hi"],"save":["echo *"],"metadata":{},
+            "source":{"type":"tool","messageID":"msg_…","id":"call_…"}}}
+    ```
+
+   - `action` is **`shell`** for bash (not "bash"); `resources` = the command
+     args; `save` = suggested rule pattern for an "always" reply.
+   - `source.tool.id` is the tool-call ID → correlates with the pending
+     `session.tool.called` part; `data.id` is the requestID for the reply route.
+2. **`POST /api/session/{id}/permission/{requestID}/reply {"decision":"once"}`**
+   → `204`. Turn resumes within ~2s.
+3. **`permission.replied {sessionID, requestID, reply}`** echoes on the stream.
+4. Resumed-turn sequence (single-session connected trace): `permission.replied` →
+   `session.tool.progress` → `session.tool.success` (content `[{type:"text",text:"hi\n"}]` —
+   the command really executed) → `session.step.ended` → `session.usage.updated` →
+   `session.step.started` (model wraps up) → reasoning/text deltas →
+   `session.step.ended` → `session.execution.succeeded`.
+
+Failure mode when nobody replies (perm-loop test): the tool call stays at
+`input.ended`, no further frames for the whole ask window; the model eventually
+gets a refusal error and the turn ends `execution.succeeded` with the refusal
+reasoned into the assistant message. No error event for the refused tool.
+
+Bridge mapping → ACP `session/request_permission` (3 options: once / always /
+reject); "always" sends `{"decision":"always"}` — server derives the rule from
+`save`.
+
+### Additional verified events (live turns)
+
+- `session.tool.progress {sessionID, assistantMessageID, id, metadata}` — fires
+  when a tool resumes after permission and during execution.
+- `session.step.started` / `session.step.ended {assistantMessageID, finish?}` —
+  step boundaries; `session.step.streamed` at stream completion.
+- `session.reasoning.started/ended`, `session.text.started/ended` — block
+  boundaries around the delta streams.
+- `session.renamed {sessionID, title}` — auto title generation.
+- `session.model.selected {sessionID, model}` — after set-model.
+- `session.usage.updated {sessionID, tokens}` — per step end.
+- `session.inbox.enqueued/delivered {inboxID, …}` — prompt admission.
+
+### Still unobserved
+
+- `session.tool.failed` — tool failure live event (persisted `ToolState.Error`
+  exists; official ACP code consumes `session.tool.failed {…, error:{type,message}}`).
+- `session.execution.interrupted`, `session.retry.scheduled`, `form.created`,
+  `session.forked/moved/deleted` — present in the official ACP consumer loop
+  (see below) but not yet on our captures.
+
+### Official 2.0.21 ACP adapter — event→ACP mapping (extracted from the binary)
+
+The shipped 2.0.21 binary bundles the complete official ACP adapter (minified;
+extracted via strings 2026-10-02). Its event pump consumes the same
+`GET /api/event` stream — authoritative reference for the bridge:
+
+- `session.text.delta` → `agent_message_chunk` (messageId = `assistantMessageID`)
+- `session.reasoning.delta` → `agent_thought_chunk`, messageId =
+  `` `${assistantMessageID}:reasoning:${ordinal}` ``
+- `session.tool.input.started` → `tool_call` (pending) · `tool.called` →
+  `tool_call_update` (input) · `tool.progress` → in_progress · `tool.success` →
+  completed (content+metadata) · `tool.failed` → failed (`error.message`)
+- `permission.asked` → ACP `requestPermission` (tool preview from cached input);
+  reply → `POST …/permission/{requestID}/reply {"decision":…}`
+- `form.created` → **auto-cancelled** (`session.form.cancel`) — 2.0.21 official
+  bridge cannot answer forms; elicitation support (#38121) is the gap
+- `session.retry.scheduled` → `session_info_update` with retry `_meta`
+- `session.execution.succeeded|interrupted|failed` → stopReason: end_turn /
+  cancelled / error (`provider.auth` → authRequired error)
+- usage: `tokens.{input,output,reasoning,cache.read,cache.write}` →
+  `{inputTokens, outputTokens, totalTokens, thoughtTokens, cachedRead/WriteTokens}`
+- `newSession`: `session.create({location:{directory}})` — **no model passed**
+  (model comes from catalog/config) · `listSessions`: `session.list({directory,
+  order:desc, limit:100, cursor})` · config-option set failures reload the
+  catalog and retry once (model/effort/mode switch race mitigation)
+- turn admission gate: the pump ignores session events until
+  `session.inbox.delivered` whose `inboxID` matches the prompt's inbox entry
+  (guards against picking up earlier turns' events)
+- child sessions: `session.created` with `parentID` tracked; forwarded only when
+  the client advertises `opencode/child-session-updates` in `_meta`
 
 ## Persisted message records (`GET …/message`)
 
