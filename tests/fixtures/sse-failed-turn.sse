@@ -1,0 +1,34 @@
+data: {"id":"evt_0fabd3bde001AWB4RoRHmPmECz","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_0fabd3fdc0013bL2mF5oOCFSoQ","created":1790913101788,"type":"session.inbox.enqueued","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"inboxID":"msg_0fabd3fd7001OyOh8RIbT8cvV7","sessionID":"ses_f05440695ffeHcgDD347wUAISf","item":{"type":"user","payload":{"text":"Run ls -la in the current directory and briefly tell me what you see."},"delivery":"steer"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":1,"version":1}}
+
+data: {"id":"evt_0fabd3fe0001t0yAu5m6PcAgmG","created":1790913101792,"type":"project.updated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"id":"476fbfe6befa9e63ddd7f9ae71655999a0104256","canonical":"/tmp/opencode","vcs":"git","time":{"created":1790912570377,"updated":1790912570377,"active":1790913101791},"sandboxes":[]}}
+
+data: {"id":"evt_0fabd3fe1001PiAASwWwLQvAL9","created":1790913101793,"type":"session.execution.started","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":2,"version":1}}
+
+data: {"id":"evt_0fabd3ff2001gRfSprlVTj8gMi","created":1790913101810,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","delta":{"core/codemode":"0deb41cde0e55c2b1525c7fc698160387e6fb0efb10087da4eb405f8c5465b93","core/mcp-guidance":"695e3cff13f1f110131ba21e76b49d6f4b96a415173ed2472bdab71c28b7180f","core/reference-guidance":"704eaa8c219e2db10ebc6f7d17a8ea41c12f86323aa4722c70c3d31c010633a0","core/skill-guidance":"f7b8ee04ad51c0e0bb9bec3f654ea36397a5acf8ab0e903badb12b0f93a478ae","core/instructions":"9a4c9bcd98c3d2ebcf26bfee6354b7f5a6dc48b8a3e4c36ed4fde7fb7a4dec61","core/date":"152929dbf3b2f78ce2845c96f45e0488a84d629d337990c77aaf906f4643c1e5","core/environment":"56ff7dc8f549c1b224f763e925af89dfd2a77bbc633fc878e61ce06d4c816cd7"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":3,"version":2}}
+
+data: {"id":"evt_0fabd3ff4001wtr9dcvooDonaf","created":1790913101812,"type":"session.inbox.delivered","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","inboxID":"msg_0fabd3fd7001OyOh8RIbT8cvV7"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":4,"version":1}}
+
+data: {"id":"evt_0fabd41970013byfVKRW2b7r7O","created":1790913102231,"type":"session.execution.failed","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","error":{"type":"unknown","message":"缺少 CodeBuddy access token，请运行 opencode auth login 重新登录"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":5,"version":1}}
+
+data: {"id":"evt_0fabd71c8001rR6y7wLO09xXe5","created":1790913114568,"type":"provider.updated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{}}
+
+data: {"id":"evt_0fabd71cd0010E68UWQEX6RVDJ","created":1790913114573,"type":"model.updated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{}}
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+

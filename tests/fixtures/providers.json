@@ -1,0 +1,69 @@
+{
+ "location": {
+  "directory": "/tmp/opencode/acp-fixture-project"
+ },
+ "data": [
+  {
+   "id": "codebuddy",
+   "integrationID": "codebuddy",
+   "name": "CodeBuddy",
+   "activation": "enabled",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "baseURL": "<redacted>",
+    "apiKey": "<redacted>"
+   }
+  },
+  {
+   "id": "cctq",
+   "name": "cctq",
+   "activation": "enabled",
+   "package": "@opencode/ai/providers/openai",
+   "settings": {
+    "apiKey": "<redacted>",
+    "baseURL": "https://relay.example.com/v1",
+    "setCacheKey": true
+   }
+  },
+  {
+   "id": "cctq-cn",
+   "name": "cctq-cn",
+   "activation": "enabled",
+   "package": "@opencode/ai/providers/openai",
+   "settings": {
+    "apiKey": "<redacted>",
+    "baseURL": "https://relay.example.com/v1",
+    "setCacheKey": true
+   }
+  },
+  {
+   "id": "astra",
+   "name": "astra",
+   "activation": "enabled",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "chunkTimeout": 30000,
+    "apiKey": "<redacted>",
+    "baseURL": "<redacted>",
+    "headerTimeout": 30000,
+    "provider": "astra"
+   }
+  },
+  {
+   "id": "venus",
+   "name": "venus",
+   "activation": "enabled",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "chunkTimeout": 30000,
+    "apiKey": "<redacted>",
+    "baseURL": "<redacted>",
+    "headerTimeout": 30000,
+    "provider": "venus"
+   },
+   "headers": {
+    "Venus-Sticky-Routing": "token"
+   }
+  }
+ ]
+}

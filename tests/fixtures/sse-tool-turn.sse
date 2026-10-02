@@ -1,0 +1,102 @@
+data: {"id":"evt_0fac20717001zmp6fAIUpJUpzh","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_0fac20b04001j4KmWr5KfLukOE","created":1790913415940,"type":"session.inbox.enqueued","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"inboxID":"msg_0fac20b030014pCESQLhlYJ42W","sessionID":"ses_f05440695ffeHcgDD347wUAISf","item":{"type":"user","payload":{"text":"Use the write tool to create a file named hello-acp-test.txt with the content: bridge test line. Then reply with just: done."},"delivery":"steer"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":12,"version":1}}
+
+data: {"id":"evt_0fac20b070010vCE1mnRLo3VNq","created":1790913415943,"type":"session.execution.started","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":13,"version":1}}
+
+data: {"id":"evt_0fac20b10001Mz5HK7wMaCFWFh","created":1790913415952,"type":"session.inbox.delivered","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","inboxID":"msg_0fac20b030014pCESQLhlYJ42W"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":14,"version":1}}
+
+data: {"id":"evt_0fac2133a001RyAQ3XvghTXJ3x","created":1790913418042,"type":"session.usage.updated","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","cost":0,"tokens":{"input":20,"output":180,"reasoning":0,"cache":{"read":512,"write":0}}}}
+
+data: {"id":"evt_0fac2133b001Kf7fedLCcaqJDm","created":1790913418043,"type":"session.renamed","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","title":"Current directory listing with ls -la"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":16,"version":1}}
+
+data: {"id":"evt_0fac2161f001tvHoCU69MXbrMk","created":1790913418783,"type":"session.step.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","agent":"orchestrator","model":{"id":"GLM-5.3-astra","providerID":"astra","variant":"default"},"assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","snapshot":"01667473a962417551be84b2010ddd1816cad269","started":1790913416083},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":17,"version":1}}
+
+data: {"id":"evt_0fac21622001jP4WR6UG1XthPM","created":1790913418786,"type":"session.reasoning.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":18,"version":1}}
+
+data: {"id":"evt_0fac21689001XhuDwCYpG4fNQR","created":1790913418889,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":"The"}}
+
+data: {"id":"evt_0fac217dd001gFcYY2HK6vmPUZ","created":1790913419229,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":" user wants me to use"}}
+
+data: {"id":"evt_0fac218b1001yazfhMa0D9d4aV","created":1790913419441,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":" the write tool to create a file named hello-acp-test.txt with the content \""}}
+
+data: {"id":"evt_0fac2193f001SAF3AgpSN5ln63","created":1790913419583,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":"bridge test line\" and reply with just \""}}
+
+data: {"id":"evt_0fac219d3001UxQJB16NJwkr6y","created":1790913419732,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":"done\".\n\nThis is a single"}}
+
+data: {"id":"evt_0fac21a62001QxAr7ednGnhj2S","created":1790913419874,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":" isolated, clear, low-risk action - doing it directly is"}}
+
+data: {"id":"evt_0fac21ac700139so2YLhIZns2O","created":1790913419976,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"delta":" fine."}}
+
+data: {"id":"evt_0fac21ac80012N1Sox3xE1pBpi","created":1790913419976,"type":"session.tool.input.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","id":"call_9663d4974690464f98d40e7c","name":"write"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":19,"version":1}}
+
+data: {"id":"evt_0fac21b8b0019mNRMFf8WU8Dh4","created":1790913420171,"type":"session.reasoning.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","ordinal":0,"text":"The user wants me to use the write tool to create a file named hello-acp-test.txt with the content \"bridge test line\" and reply with just \"done\".\n\nThis is a single isolated, clear, low-risk action - doing it directly is fine.","state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":20,"version":1}}
+
+data: {"id":"evt_0fac21b8e001GYC6ekEXYkQdvc","created":1790913420174,"type":"session.tool.input.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","id":"call_9663d4974690464f98d40e7c","text":"{\"content\": \"bridge test line\", \"path\": \"hello-acp-test.txt\"}"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":21,"version":1}}
+
+data: {"id":"evt_0fac21b8f001b8ZvsrwZh9S6G4","created":1790913420175,"type":"session.tool.called","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","id":"call_9663d4974690464f98d40e7c","input":{"content":"bridge test line","path":"hello-acp-test.txt"},"executed":false},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":22,"version":1}}
+
+data: {"id":"evt_0fac21b91001TRmapsACBVSjso","created":1790913420177,"type":"session.step.streamed","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":23,"version":1}}
+
+data: {"id":"evt_0fac21b97001SKEOd8N2ccN5LT","created":1790913420183,"type":"session.tool.progress","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","id":"call_9663d4974690464f98d40e7c","metadata":{}}}
+
+data: {"id":"evt_0fac22ca0001xlDZXISpnj0ad7","created":1790913424544,"type":"session.tool.success","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","id":"call_9663d4974690464f98d40e7c","content":[{"type":"text","text":"Created new file.\n\nUndo is unavailable for this change because the backup snapshot was skipped (temp_path)."}],"metadata":{"diff":"Index: /tmp/opencode/hello-acp-test.txt\n===================================================================\n--- /tmp/opencode/hello-acp-test.txt\n+++ /tmp/opencode/hello-acp-test.txt\n@@ -1,1 +1,1 @@\n+bridge test line\n-\n","filediff":{"file":"/tmp/opencode/hello-acp-test.txt","patch":"Index: /tmp/opencode/hello-acp-test.txt\n===================================================================\n--- /tmp/opencode/hello-acp-test.txt\n+++ /tmp/opencode/hello-acp-test.txt\n@@ -1,1 +1,1 @@\n+bridge test line\n-\n","additions":1,"deletions":0},"diagnostics":{},"title":"hello-acp-test.txt","truncated":false},"executed":false},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":24,"version":2}}
+
+data: {"id":"evt_0fac22cab001c1aspc8V8kITif","created":1790913424555,"type":"session.step.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac20b1a001EggNXWtAEmLWrL","finish":"tool-calls","rawFinish":"tool_calls","cost":0,"tokens":{"input":7226,"output":75,"reasoning":0,"cache":{"read":24064,"write":0}},"snapshot":"01667473a962417551be84b2010ddd1816cad269","files":[]},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":25,"version":1}}
+
+data: {"id":"evt_0fac22cae001XQghrQWEuwTm5w","created":1790913424558,"type":"session.usage.updated","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","cost":0,"tokens":{"input":7246,"output":255,"reasoning":0,"cache":{"read":24576,"write":0}}}}
+
+data: {"id":"evt_0fac22fe0001sdJJmLOEe0FMDd","created":1790913425376,"type":"session.step.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","agent":"orchestrator","model":{"id":"GLM-5.3-astra","providerID":"astra","variant":"default"},"assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt","snapshot":"01667473a962417551be84b2010ddd1816cad269","started":1790913424611},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":26,"version":1}}
+
+data: {"id":"evt_0fac22fe3001h2o1w6nUv6RKth","created":1790913425379,"type":"session.text.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt","ordinal":0},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":27,"version":1}}
+
+data: {"id":"evt_0fac22fe6001PCJ6bsWX22I3QM","created":1790913425382,"type":"session.text.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt","ordinal":0,"delta":"done"}}
+
+data: {"id":"evt_0fac22fe6002meQt5t1Fwh97h7","created":1790913425382,"type":"session.text.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt","ordinal":0,"text":"done"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":28,"version":1}}
+
+data: {"id":"evt_0fac22fe8001NUgXrYxpKhOrAN","created":1790913425384,"type":"session.step.streamed","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":29,"version":1}}
+
+data: {"id":"evt_0fac22ff2001vBTjc8GOkLf1Vp","created":1790913425394,"type":"session.step.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","assistantMessageID":"msg_0fac22cb7001wso3ZZF1AWkVXt","finish":"stop","rawFinish":"stop","cost":0,"tokens":{"input":32,"output":3,"reasoning":0,"cache":{"read":31360,"write":0}},"snapshot":"01667473a962417551be84b2010ddd1816cad269","files":[]},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":30,"version":1}}
+
+data: {"id":"evt_0fac22ff4001st4IfmmaSAcehu","created":1790913425396,"type":"session.usage.updated","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf","cost":0,"tokens":{"input":7278,"output":258,"reasoning":0,"cache":{"read":55936,"write":0}}}}
+
+data: {"id":"evt_0fac22ff5001D1txRo1M3FqrRs","created":1790913425397,"type":"session.execution.succeeded","data":{"sessionID":"ses_f05440695ffeHcgDD347wUAISf"},"durable":{"aggregateID":"ses_f05440695ffeHcgDD347wUAISf","seq":31,"version":1}}
+
+data: {"id":"evt_0fac231c2001NwkrXbW6LtKe2I","created":1790913425858,"type":"rpc.aft.statusInvalidated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{}}
+
+data: {"id":"evt_0fac231c40012cpF9c2vj5ZZWi","created":1790913425860,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"search","status":"loading"}}
+
+data: {"id":"evt_0fac231c5001UmsSsdvYNAZKzX","created":1790913425861,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"semantic","status":"loading","stage":"initializing_embedding_model"}}
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+data: {"id":"evt_0fac2d0170018cnPpftS0BlB23","created":1790913466391,"type":"rpc.aft.statusInvalidated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{}}
+
+data: {"id":"evt_0fac2d018001rmmFjOi9helx3Y","created":1790913466392,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"search","status":"loading"}}
+
+data: {"id":"evt_0fac2d019001vA9vTwGODbrd0h","created":1790913466393,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"semantic","status":"failed"}}
+
+data: {"id":"evt_0fac2ec7c0018lYfkBvT87Xoz2","created":1790913473660,"type":"rpc.aft.statusInvalidated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{}}
+
+data: {"id":"evt_0fac2ec7d0015Jgwxa7a5OlVKw","created":1790913473661,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"search","status":"ready","completed":97927}}
+
+data: {"id":"evt_0fac2ec7e001Bo2jXWuB8Zt3Up","created":1790913473662,"type":"rpc.aft.indexProgress","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"index":"semantic","status":"failed"}}
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
