@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -15,7 +15,7 @@ use super::args::{CONNECTION_EXAMPLES, ConnectMode};
 
 /// Password env vars, in preference order (all connection modes).
 pub const PASSWORD_ENV_VARS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
-/// URL env var for the no-`--attach` mode.
+/// URL env var for the env fallback (used when no service file is present).
 pub const URL_ENV_VAR: &str = "OPENCODE_URL";
 /// service.json location relative to $HOME.
 pub const SERVICE_FILE_REL: [&str; 3] = [".config", "opencode", "service.json"];
@@ -33,8 +33,22 @@ pub struct ConnectionConfig {
     pub base_url: String,
     /// Basic-auth password (the server's `OPENCODE_PASSWORD`).
     pub password: String,
-    /// Human-readable origin, for logs and error messages.
+    /// Human-readable origin, for logs and error messages. One of:
+    /// - the service file path (connection came from `service.json`),
+    /// - `OPENCODE_URL=<url>` (env fallback),
+    /// - `--attach <url>` (explicit URL).
     pub source: String,
+}
+
+impl ConnectionConfig {
+    /// Whether the connection was read from `~/.config/opencode/service.json`
+    /// (as opposed to `--attach <url>` or the `OPENCODE_URL` env fallback).
+    ///
+    /// The discriminator is [`ConnectionConfig::source`]'s format: the file
+    /// path is the only form that is neither label-prefixed.
+    pub fn from_service_file(&self) -> bool {
+        !self.source.starts_with("OPENCODE_URL=") && !self.source.starts_with("--attach ")
+    }
 }
 
 /// Environment facade: the real process env for production, a map for tests.
@@ -102,8 +116,11 @@ pub enum ConfigError {
 ///
 /// - `--attach <url>`: URL verbatim, password from env (mandatory).
 /// - bare `--attach`: `~/.config/opencode/service.json`; the file carries
-///   port/password/hostname, `0.0.0.0` is mapped to `127.0.0.1`.
-/// - env: `OPENCODE_URL` (mandatory) + password env.
+///   port/password/hostname, `0.0.0.0` is mapped to `127.0.0.1`. A missing
+///   file is an error (strict).
+/// - default (no flags): try the service file; when it is *absent* (not found,
+///   or HOME unset) fall back to `OPENCODE_URL` + password env. A present but
+///   broken file is surfaced as-is — a corrupt registration must not be masked.
 pub fn resolve_config(mode: &ConnectMode, env: &dyn EnvLike) -> Result<ConnectionConfig, ConfigError> {
     match mode {
         ConnectMode::ExplicitUrl(url) => {
@@ -117,45 +134,45 @@ pub fn resolve_config(mode: &ConnectMode, env: &dyn EnvLike) -> Result<Connectio
             })
         }
 
-        ConnectMode::ServiceFile => {
-            let home = env.home_dir().ok_or(ConfigError::MissingHome)?;
-            let path = SERVICE_FILE_REL
-                .iter()
-                .fold(home, |p, part| p.join(part));
-            let file = read_service_file(&path)?;
-            // `opencode serve --hostname 0.0.0.0` registers 0.0.0.0, which is
-            // not connectable from a client — map it to loopback.
-            let hostname = match file.hostname.as_deref() {
-                Some("0.0.0.0") => "127.0.0.1".to_string(),
-                Some(h) => h.to_string(),
-                None => "127.0.0.1".to_string(),
-            };
-            Ok(ConnectionConfig {
-                base_url: format!("http://{hostname}:{}", file.port),
-                password: file.password,
-                source: path.display().to_string(),
-            })
-        }
+        ConnectMode::ServiceFile => match resolve_service_file(env) {
+            ServiceFileOutcome::Resolved(cfg) => Ok(cfg),
+            ServiceFileOutcome::NoHome => Err(ConfigError::MissingHome),
+            ServiceFileOutcome::Missing { path, source } => Err(ConfigError::ServiceFileIo {
+                path: path.display().to_string(),
+                source,
+            }),
+            ServiceFileOutcome::Failed(e) => Err(e),
+        },
 
-        ConnectMode::Env => {
-            let url = env.get(URL_ENV_VAR).ok_or_else(|| ConfigError::NoConfig {
-                examples: CONNECTION_EXAMPLES.to_string(),
-            })?;
-            let password = find_password(env).ok_or_else(|| ConfigError::MissingPassword {
-                mode: format!("OPENCODE_URL={url}"),
-            })?;
-            Ok(ConnectionConfig {
-                base_url: url.clone(),
-                password,
-                source: format!("OPENCODE_URL={url}"),
-            })
-        }
+        ConnectMode::Default => match resolve_service_file(env) {
+            ServiceFileOutcome::Resolved(cfg) => Ok(cfg),
+            // Absent (not found / HOME unset): the env fallback is the point
+            // of the default mode.
+            ServiceFileOutcome::NoHome | ServiceFileOutcome::Missing { .. } => resolve_from_env(env),
+            // Present but broken: surface it — do not mask a corrupt registration.
+            ServiceFileOutcome::Failed(e) => Err(e),
+        },
     }
 }
 
 /// First set password env var wins.
 fn find_password(env: &dyn EnvLike) -> Option<String> {
     PASSWORD_ENV_VARS.iter().find_map(|key| env.get(key))
+}
+
+/// `OPENCODE_URL` (+ password env) — the fallback for the default mode.
+fn resolve_from_env(env: &dyn EnvLike) -> Result<ConnectionConfig, ConfigError> {
+    let url = env.get(URL_ENV_VAR).ok_or_else(|| ConfigError::NoConfig {
+        examples: CONNECTION_EXAMPLES.to_string(),
+    })?;
+    let password = find_password(env).ok_or_else(|| ConfigError::MissingPassword {
+        mode: format!("OPENCODE_URL={url}"),
+    })?;
+    Ok(ConnectionConfig {
+        base_url: url.clone(),
+        password,
+        source: format!("OPENCODE_URL={url}"),
+    })
 }
 
 /// `~/.config/opencode/service.json` — the registration `opencode serve`
@@ -168,21 +185,68 @@ struct ServiceFile {
     hostname: Option<String>,
 }
 
-fn read_service_file(path: &Path) -> Result<ServiceFile, ConfigError> {
+/// What the service-file lookup produced. The `Default` mode falls back to
+/// env on `NoHome`/`Missing`; bare `--attach` surfaces them as errors.
+#[derive(Debug)]
+enum ServiceFileOutcome {
+    /// Read and parsed; ready to use.
+    Resolved(ConnectionConfig),
+    /// HOME is unset, so the path cannot even be located.
+    NoHome,
+    /// The file does not exist (`io::ErrorKind::NotFound`).
+    Missing { path: PathBuf, source: io::Error },
+    /// The file exists but is unreadable or corrupt — must be surfaced.
+    Failed(ConfigError),
+}
+
+/// Read and parse `~/.config/opencode/service.json` under `$HOME`.
+fn resolve_service_file(env: &dyn EnvLike) -> ServiceFileOutcome {
+    let Some(home) = env.home_dir() else {
+        return ServiceFileOutcome::NoHome;
+    };
+    let path = SERVICE_FILE_REL.iter().fold(home, |p, part| p.join(part));
     let path_s = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::ServiceFileIo {
-        path: path_s.clone(),
-        source,
-    })?;
-    serde_json::from_str(&text).map_err(|source| ConfigError::ServiceFileJson {
-        path: path_s.clone(),
-        source,
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return ServiceFileOutcome::Missing { path, source };
+        }
+        Err(source) => {
+            return ServiceFileOutcome::Failed(ConfigError::ServiceFileIo {
+                path: path_s,
+                source,
+            });
+        }
+    };
+    let file: ServiceFile = match serde_json::from_str(&text) {
+        Ok(file) => file,
+        Err(source) => {
+            return ServiceFileOutcome::Failed(ConfigError::ServiceFileJson {
+                path: path_s,
+                source,
+            });
+        }
+    };
+
+    // `opencode serve --hostname 0.0.0.0` registers 0.0.0.0, which is not
+    // connectable from a client — map it to loopback.
+    let hostname = match file.hostname.as_deref() {
+        Some("0.0.0.0") => "127.0.0.1".to_string(),
+        Some(h) => h.to_string(),
+        None => "127.0.0.1".to_string(),
+    };
+    ServiceFileOutcome::Resolved(ConnectionConfig {
+        base_url: format!("http://{hostname}:{}", file.port),
+        password: file.password,
+        source: path_s,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A fresh isolated home dir per test (cargo runs tests in parallel).
     fn temp_home(tag: &str) -> PathBuf {
@@ -230,7 +294,8 @@ mod tests {
     }
 
     #[test]
-    fn env_mode_uses_url_and_password() {
+    fn default_mode_falls_back_to_env_without_home() {
+        // No HOME ⇒ the service file path cannot be located ⇒ env fallback.
         let env = MapEnv::new(
             [
                 ("OPENCODE_URL".to_string(), "http://127.0.0.1:44041".to_string()),
@@ -238,20 +303,94 @@ mod tests {
             ],
             None,
         );
-        let cfg = resolve_config(&ConnectMode::Env, &env).expect("resolves");
+        let cfg = resolve_config(&ConnectMode::Default, &env).expect("resolves");
         assert_eq!(cfg.base_url, "http://127.0.0.1:44041");
         assert_eq!(cfg.password, "pw");
         assert!(cfg.source.contains("OPENCODE_URL"));
+        assert!(!cfg.from_service_file(), "env fallback is not the service file");
     }
 
     #[test]
-    fn env_mode_without_url_shows_all_connection_options() {
+    fn default_mode_without_env_lists_all_options() {
         let env = MapEnv::new([], None);
-        let err = resolve_config(&ConnectMode::Env, &env).expect_err("nothing configured");
+        let err = resolve_config(&ConnectMode::Default, &env).expect_err("nothing configured");
         let msg = err.to_string();
         for needle in ["--attach http://127.0.0.1:44041", "service.json", "OPENCODE_URL"] {
             assert!(msg.contains(needle), "expected '{needle}' in:\n{msg}");
         }
+    }
+
+    #[test]
+    fn default_mode_prefers_service_file_over_env() {
+        // (a) File present wins, even with OPENCODE_URL also set.
+        let home = temp_home("def-file");
+        let path = write_service_file(&home, r#"{"port":47779,"password":"pw","hostname":"0.0.0.0"}"#);
+        let env = MapEnv::new(
+            [("OPENCODE_URL".to_string(), "http://127.0.0.1:44041".to_string())],
+            Some(home.clone()),
+        );
+        let cfg = resolve_config(&ConnectMode::Default, &env).expect("resolves");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:47779", "file wins over env");
+        assert_eq!(cfg.password, "pw");
+        assert_eq!(cfg.source, path.display().to_string(), "source names the actual path");
+        assert!(cfg.from_service_file());
+        std::fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn default_mode_falls_back_to_env_when_file_absent() {
+        // (b) Absent file + OPENCODE_URL ⇒ env fallback.
+        let home = temp_home("def-absent");
+        let env = MapEnv::new(
+            [
+                ("OPENCODE_URL".to_string(), "http://127.0.0.1:44041".to_string()),
+                ("OPENCODE_PASSWORD".to_string(), "pw".to_string()),
+            ],
+            Some(home.clone()),
+        );
+        let cfg = resolve_config(&ConnectMode::Default, &env).expect("resolves");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:44041");
+        assert_eq!(cfg.source, "OPENCODE_URL=http://127.0.0.1:44041");
+        assert!(!cfg.from_service_file(), "env fallback is not the service file");
+        std::fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn default_mode_absent_file_and_no_env_shows_all_connection_options() {
+        // (c) Absent file + no env ⇒ NoConfig listing every option.
+        let home = temp_home("def-nocfg");
+        let env = MapEnv::new([], Some(home.clone()));
+        let err = resolve_config(&ConnectMode::Default, &env).expect_err("nothing configured");
+        let msg = err.to_string();
+        for needle in ["--attach http://127.0.0.1:44041", "service.json", "OPENCODE_URL"] {
+            assert!(msg.contains(needle), "expected '{needle}' in:\n{msg}");
+        }
+        std::fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn default_mode_corrupt_file_is_not_masked() {
+        // (d) Present-but-broken file surfaces, even with env fully set.
+        let home = temp_home("def-bad");
+        write_service_file(&home, "{not json");
+        let env = MapEnv::new(
+            [
+                ("OPENCODE_URL".to_string(), "http://127.0.0.1:44041".to_string()),
+                ("OPENCODE_PASSWORD".to_string(), "pw".to_string()),
+            ],
+            Some(home.clone()),
+        );
+        let err = resolve_config(&ConnectMode::Default, &env).expect_err("bad json must surface");
+        let msg = err.to_string();
+        assert!(msg.contains("service.json"), "{msg}");
+        assert!(msg.contains("not valid JSON"), "{msg}");
+        assert!(!msg.contains("OPENCODE_URL="), "no env fallback for a corrupt file:\n{msg}");
+
+        // Wrong shape (valid JSON, missing port) is equally fatal.
+        write_service_file(&home, r#"{"password":"pw"}"#);
+        let err2 = resolve_config(&ConnectMode::Default, &env).expect_err("bad shape must surface");
+        assert!(err2.to_string().contains("missing field `port`"), "{err2}");
+        std::fs::remove_dir_all(&home).expect("cleanup");
     }
 
     #[test]

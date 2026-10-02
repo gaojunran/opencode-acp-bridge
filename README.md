@@ -1,24 +1,20 @@
 # opencode-acp-bridge
 
-A Rust [ACP](https://agentclientprotocol.com) agent that bridges Zed (or any
-ACP v1 client) to a **shared** opencode server over its HTTP API — instead of
-letting `opencode acp` spawn a full private `opencode serve` for every editor
-window.
+A Rust [ACP](https://agentclientprotocol.com) agent that connects Zed (or any
+ACP v1 client) to one **shared** opencode server over its HTTP API — instead
+of letting each editor window spawn its own private `opencode serve`.
 
 ## Why
 
-`opencode acp` (2.0.x) starts its own `opencode serve --stdio --port 0` child
-per editor window: ~255 MB RSS and ~8 s cold start per window, and the
-sessions of those private servers are invisible to each other (the pain behind
-opencode PR #52075). This bridge talks to one shared server over the wire:
+`opencode acp` (2.0.x) starts a private `opencode serve` for every editor
+window: ~255 MB RSS and ~8 s cold start each, and the sessions of those
+private servers are invisible to each other (the pain behind opencode
+PR #52075). This bridge attaches to a single shared server instead:
 
 - **~10–20 MB** per window instead of ~255 MB (tokio + reqwest, single binary)
 - **millisecond** startup instead of ~8 s
-- every window sees the **same server and the same sessions**
-- fixes opencode #52636 (file edits produce no diff blocks for
-  `write`/`apply_patch`) by deriving diffs from the tool-result
-  `metadata.filediff` — server-side truth, unlike the official input-based
-  reconstruction
+- every window sees the same server and the same sessions
+- correct diff blocks for every file-edit path (fixes opencode #52636)
 
 ## Install
 
@@ -29,20 +25,22 @@ mise use -g github:gaojunran/opencode-acp-bridge
 ```
 
 Prebuilt binaries for Linux (gnu/musl, x64/arm64), macOS (x64/arm64) and
-Windows are attached to each [release](https://github.com/gaojunran/opencode-acp-bridge/releases);
-mise puts the binary on its PATH shim
+Windows are attached to each
+[release](https://github.com/gaojunran/opencode-acp-bridge/releases); mise
+puts the binary on its PATH shim
 (`~/.local/share/mise/shims/opencode-acp-bridge` by default).
 
 From source (stable Rust):
 
 ```sh
 cargo build --release
-# binary: target/release/opencode-acp-bridge
 ```
 
 ## Configure Zed
 
-Add to `~/.config/zed/settings.json` (the agent panel → agent servers):
+Run your shared server once — `opencode serve` writes its address and
+password to `~/.config/opencode/service.json`, and the bridge picks that up
+by default, so no secrets go into the Zed config:
 
 ```jsonc
 {
@@ -50,21 +48,17 @@ Add to `~/.config/zed/settings.json` (the agent panel → agent servers):
     "OpenCode": {
       "command": {
         // adjust to your install location (mise shim shown)
-        "path": "~/.local/share/mise/shims/opencode-acp-bridge",
-        "args": ["--attach"]
+        "path": "~/.local/share/mise/shims/opencode-acp-bridge"
       }
     }
   }
 }
 ```
 
-`--attach` (bare) reads `~/.config/opencode/service.json` — the port/password
-registration a running `opencode serve` writes — so no secrets go into the
-Zed config. Zed starts one bridge process per project window; all of them
-connect to the same server.
+Zed starts one bridge process per project window; all of them connect to the
+same server.
 
-To pin a specific server instead, use the explicit form and pass the password
-via env:
+To pin a specific server instead, pass the URL and password explicitly:
 
 ```jsonc
 {
@@ -80,86 +74,64 @@ via env:
 }
 ```
 
-## Connection modes
+## Connection
 
 | Invocation | Server URL | Password |
 | --- | --- | --- |
+| *(none — default)* | `~/.config/opencode/service.json` (`{port, password, hostname}`, `0.0.0.0` → `127.0.0.1`); if the file is absent, the `OPENCODE_URL` env var | from the file, or `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
 | `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
-| `--attach` | `~/.config/opencode/service.json` (`{port, password, hostname}`; `0.0.0.0` → `127.0.0.1`) | from the file |
-| *(none)* | `OPENCODE_URL` env | same env vars as `--attach <url>` |
-| `--no-aft` | *(any connection mode)* | disables the aft tool-call hoist adaptations (File/image content passthrough in tool results); diff extraction stays enabled |
+| `--attach` | `~/.config/opencode/service.json` — like the default, without the env fallback | from the file |
+| `--no-aft` | *(composes with any connection mode)* | disables the aft tool-call hoist adaptations: File/image content passthrough in tool results; diff extraction stays enabled |
 
-The server is probed at startup (`GET /api/config`); failures are classified
-(unreachable / credentials rejected / HTTP status) with the connection source
-named in the message. Logs go to stderr — Zed collects them in its per-agent
-debug log. Exit codes: `0` normal, `1` probe/resolution failure, `2` usage
-error.
+The server is probed at startup (`GET /api/config`) and failures are
+classified — unreachable, credentials rejected, HTTP status — with the
+connection source named in the message, so a stale service registration reads
+differently from a dead server. Logs go to stderr (Zed collects them in its
+per-agent debug log). Exit codes: `0` normal, `1` connection failure, `2`
+usage error.
 
-## AFT compatibility (tool-call hoist)
+## Features
 
-With the [`@cortexkit/aft-opencode`](https://www.npmjs.com/package/@cortexkit/aft-opencode)
-plugin active, the built-in tools are replaced by same-name registrations, but
-the SSE stream keeps the core shape (tool names, event taxonomy, envelopes),
-so the bridge works unmodified — the diff plane is identical to core
-(`edit`/`write` → `filediff`; `apply_patch` → `files[]`). The only
-aft-specific delta: reading an image yields a `file` part (data-URI), which
-is mapped to an ACP image content block instead of being dropped. `--no-aft`
-disables just that image/file passthrough; diff extraction stays on
-(dialect-neutral). Verified against a live aft v0.58.0 environment (captures
-in `tests/fixtures/aft-*.sse`). Unlike the official adapter, which builds
-diffs from `input.oldString/newString` (empty under aft's hoist), this bridge
-reads result metadata — the same code path covers both dialects.
+- **Sessions, shared everywhere** — create, resume with full history replay,
+  list, delete; every window sees the same sessions on the same server
+- **Streaming turns** — text, reasoning, and tool-call events; cancel maps to
+  interrupt with a bounded drain of in-flight tools
+- **Diff blocks on every edit path** — `edit`, `write`, `apply_patch`, and
+  plugin-hoisted tools alike, derived from server-side result metadata
+  (`filediff` / `files[]`) instead of reconstructed tool inputs
+- **Permissions routed to the editor** — asks surface as ACP
+  `requestPermission`, including asks originating from subagent child
+  sessions
+- **Modes** — opencode agents (build/plan/…) exposed as ACP modes, switchable
+  live, with remote switches reflected
+- **Slash commands** pushed to the editor as they become available
+- **aft plugin compatible** — image reads map to ACP image content blocks;
+  `--no-aft` opts out of the hoist adaptations
 
 ## Compared to the official `opencode acp`
 
-Anchored to opencode 2.0.21/2.0.22 — official behavior source-checked,
-bridge behavior live-verified (see Status):
+Anchored to opencode 2.0.21/2.0.22 — official behavior source-checked, bridge
+behavior verified against a real server:
 
 | Area | Official `opencode acp` | This bridge |
 | --- | --- | --- |
-| Diff blocks for file edits ([#52636](https://github.com/anomalyco/opencode/issues/52636)) | Diffs only from the `edit` tool's `input.oldString/newString`; `write` / `apply_patch` / plugin tools produce no diff — the editor silently shows no file changes (unfixed in 2.0.22) | Result-metadata driven chain (`filediff` → `files[]` → `diff` string) — covers every edit path incl. plugin-hoisted tools |
-| Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | Replies hang: the reply must reach the child session that asked (still open in 2.0.22) | Replies routed to the asking session — child asks round-trip (live E2E) |
-| Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | Spawns a private `opencode serve` per editor window: ~255 MB + ~8 s cold start each, sessions invisible across windows | Attaches to one shared server (`--attach` / service.json): ~2 MB bridge process, ms-scale startup, sessions shared |
-| AFT tool hoist | Diff extraction reads tool inputs → empty under the hoist; image reads dropped | Reads result metadata (dialect-neutral) and maps image file parts to ACP image blocks; `--no-aft` opts out |
-| Stable-v1 session & mode surface | `session/list` / `resume` / `delete`, `set_mode`, `available_commands_update` (present in 2.0.21/2.0.22 source) | Full parity, live-verified on a real 2.0.21 server — plus `current_mode_update` on remote switches and step-started self-heal |
-| Protocol dialect | v1 + v2 draft negotiation; elicitation forms (2.0.22) | ACP v1 — what Zed negotiates in practice; no elicitation yet |
+| Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | private `opencode serve` per window — ~255 MB + ~8 s each, sessions invisible across windows | one shared server — ~10–20 MB bridge process, ms-scale startup, sessions shared |
+| Diff blocks for file edits ([#52636](https://github.com/anomalyco/opencode/issues/52636)) | only from the `edit` tool's inputs; `write` / `apply_patch` / plugin tools produce none | result-metadata driven, covers every edit path incl. plugin tools |
+| Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | replies hang — they never reach the child session that asked | routed to the asking session, round-trip verified |
+| Session & mode surface | `session/list` / `resume` / `delete`, `set_mode`, command pushes (present in source) | full parity, plus `current_mode_update` on remote switches |
 
-Not fixable on either side: todo/plan outlines ([#40745](https://github.com/anomalyco/opencode/issues/40745)) — the
-`todowrite` tool was removed from the 2.x core, so there is no wire data to
-map.
+Not mappable on either side: todo/plan outlines
+([#40745](https://github.com/anomalyco/opencode/issues/40745)) — the
+`todowrite` tool was removed from the 2.x core, so there is no wire data.
 
-## Status
+## Development
 
-Working (live-verified against opencode 2.0.21 + a live aft environment):
+The opencode 2.0.21 wire contract (REST + SSE envelopes, event taxonomy,
+permission loop) is captured in `docs/opencode-api.md` — live-verified, and
+the authority when touching `src/dto.rs` or the mapping layer. `cargo test`
+runs the unit suite; end-to-end tests against a live server are gated behind
+`BRIDGE_IT=1`.
 
-- session/new + load with full history replay (before the response, per ACP
-  contract)
-- prompt → streaming text/reasoning/tool events, turn end via
-  `session.execution.*`
-- tool-call state machine incl. diff content blocks (#52636 fix)
-- cancel → `interrupt` (with bounded drain of in-flight tools)
-- permission loop: `permission.asked` → ACP `requestPermission` → reply
-  routing (incl. child sessions)
-- child-session projection (#48232): child tool events forwarded under
-  `${child.id}:`-prefixed toolCallIds
-- structured turn failures surfaced as ACP errors with the provider message
-- aft dialect: image passthrough + `--no-aft` opt-out (see above)
-- session management: `session/list` (paginated, per-cwd), `session/resume`
-  (zero replay), `session/delete`, advertised via `sessionCapabilities`
-- slash commands pushed via `available_commands_update` after each session
-  lifecycle response
-- modes: opencode agent catalog (primary/all, non-hidden) exposed as ACP
-  modes; `set_mode` → session agent switch; `current_mode_update` on own,
-  remote, and step-started self-heal paths
+## License
 
-Not yet (see `docs/opencode-api.md`): form elicitation, retry/compaction
-`session_info` markers and catalog-reload pushes are structure-ready but have
-no wire event on 2.0.21 to trigger them live.
-
-## Wire contract
-
-`docs/opencode-api.md` is the live-verified contract against opencode 2.0.21
-(REST + SSE envelopes, event taxonomy, permission loop, the official ACP
-adapter's mapping extracted from the shipped binary, and the v2.0.22 source
-deltas). Trust that file over assumptions when touching `src/dto.rs` or the
-mapping layer.
+[MIT](LICENSE)
