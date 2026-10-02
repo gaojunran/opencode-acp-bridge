@@ -987,7 +987,7 @@ mod tests {
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
                         .await?;
-                    assert_eq!(init.agent_capabilities.load_session, true);
+                    assert!(init.agent_capabilities.load_session);
                     assert_eq!(init.agent_info.as_ref().map(|i| i.name.as_str()), Some("opencode-acp-bridge"));
 
                     // 2. newSession
