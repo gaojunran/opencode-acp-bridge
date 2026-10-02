@@ -181,9 +181,9 @@ async fn lane_c_duplex_e2e() {
     for n in live {
         match &n.update {
             SessionUpdate::ToolCallUpdate(u) => {
-                if u.fields.status == Some(ToolCallStatus::Completed) {
-                    if let Some(content) = &u.fields.content {
-                        if content.iter().any(|block| {
+                if u.fields.status == Some(ToolCallStatus::Completed)
+                    && let Some(content) = &u.fields.content
+                        && content.iter().any(|block| {
                             matches!(
                                 block,
                                 ToolCallContent::Diff(d)
@@ -192,8 +192,6 @@ async fn lane_c_duplex_e2e() {
                         }) {
                             saw_completed_diff = true;
                         }
-                    }
-                }
             }
             SessionUpdate::AgentMessageChunk(_) => saw_agent_chunk = true,
             _ => {}
@@ -672,4 +670,274 @@ async fn wave4_child_projection_e2e() {
         updates.len(),
         child_calls.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 5: aft dialect — live validation against an aft-active server
+// ---------------------------------------------------------------------------
+
+/// 1×1 PNG (70 bytes): the smallest file that makes aft's hoisted `read`
+/// emit a data-URI file part.
+const PIXEL_PNG: [u8; 70] = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+    0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15,
+    0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+/// Live aft-server coordinates come from the environment (never hardcode a
+/// personal path or a live password in the repo):
+/// `AFT_SERVER_URL`, `AFT_SERVER_PASSWORD`, `AFT_SERVER_DIR` (an aft-active
+/// project directory on that server).
+fn aft_server_env() -> Option<(String, String, String)> {
+    let url = std::env::var("AFT_SERVER_URL").ok()?;
+    let password = std::env::var("AFT_SERVER_PASSWORD").ok()?;
+    let dir = std::env::var("AFT_SERVER_DIR").ok()?;
+    Some((url, password, dir))
+}
+
+/// How the image-read turn ended. On this deployment the relay rejects
+/// image input ("Model only supports text input; ... 'image_url'"), so a
+/// turn that reads an image cannot reach EndTurn — the mapping under test
+/// (file part → ACP image block) is delivered before the turn fails. A
+/// vision-capable relay would end the turn normally; both are acceptable.
+enum TurnOutcome {
+    Ended(StopReason),
+    Failed(String),
+}
+
+/// One image-read turn through the given service; returns the collected
+/// session notifications and how the turn ended.
+async fn run_image_read_turn(
+    svc: Arc<AgentService>,
+    client: OpencodeClient,
+    dir: &str,
+) -> (Vec<SessionNotification>, TurnOutcome) {
+    let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+    let agent_task = tokio::spawn({
+        let svc = Arc::clone(&svc);
+        async move {
+            let _ = svc.serve(agent_side).await;
+        }
+    });
+
+    let all_updates = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+    let outcome_seen: Arc<Mutex<Option<TurnOutcome>>> = Arc::new(Mutex::new(None));
+
+    let prompt_text = format!(
+        "Use the read tool on {dir}/.aft-e2e/pixel.png. Do not use any other tools. \
+         Then reply DONE with a one-sentence description of the image."
+    );
+
+    let outcome: Result<(), AcpError> = Client
+        .builder()
+        .name("bridge-it-wave5")
+        .on_receive_request(
+            async move |req: acp::RequestPermissionRequest,
+                        responder: Responder<acp::RequestPermissionResponse>,
+                        _cx: ConnectionTo<Agent>| {
+                let _ = req;
+                responder.respond(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        "once",
+                    )),
+                ))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let all_updates = Arc::clone(&all_updates);
+                async move |notif: SessionNotification, _cx| {
+                    all_updates.lock().expect("updates lock").push(notif);
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_side, {
+            let client = client.clone();
+            let prompt_text = prompt_text.clone();
+            let outcome_seen = Arc::clone(&outcome_seen);
+            async move |cx| {
+                let _init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(dir.to_string()))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+
+                client
+                    .set_model(
+                        &sid.0,
+                        &ModelRef {
+                            id: MODEL_ID.into(),
+                            providerID: MODEL_PROVIDER.into(),
+                            variant: None,
+                        },
+                    )
+                    .await
+                    .expect("set_model on the aft server");
+
+                let prompt = cx.send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new(prompt_text))],
+                ));
+                let resp =
+                    match tokio::time::timeout(Duration::from_secs(180), prompt.block_task()).await
+                    {
+                        Ok(r) => r,
+                        Err(_) => panic!("live image-read turn did not finish within 180s"),
+                    };
+                let seen = match resp {
+                    Ok(r) => TurnOutcome::Ended(r.stop_reason),
+                    Err(e) => TurnOutcome::Failed(format!("{e}")),
+                };
+                *outcome_seen.lock().expect("outcome lock") = Some(seen);
+
+                client.delete_session(sid.0.as_ref()).await.expect("delete_session cleanup");
+                Ok(())
+            }
+        })
+        .await;
+
+    agent_task.abort();
+    outcome.expect("wave5 client run ok");
+    let updates = all_updates.lock().expect("updates lock").clone();
+    assert!(!updates.is_empty(), "no session updates collected");
+    let seen = outcome_seen
+        .lock()
+        .expect("outcome lock")
+        .take()
+        .expect("turn outcome recorded");
+    (updates, seen)
+}
+
+#[tokio::test]
+#[ignore = "requires BRIDGE_IT=1 plus AFT_SERVER_URL/AFT_SERVER_PASSWORD/AFT_SERVER_DIR (aft-active opencode)"]
+async fn wave5_aft_image_passthrough_e2e() {
+    if !it_enabled() {
+        eprintln!("skipped: BRIDGE_IT=1 not set");
+        return;
+    }
+    let Some((url, password, dir)) = aft_server_env() else {
+        eprintln!("skipped: AFT_SERVER_* not set (aft-active server required)");
+        return;
+    };
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+
+    let png_dir = format!("{dir}/.aft-e2e");
+    std::fs::create_dir_all(&png_dir).expect("create .aft-e2e");
+    std::fs::write(format!("{png_dir}/pixel.png"), PIXEL_PNG).expect("write pixel.png");
+
+    let client = OpencodeClient::new(&url, &password).expect("valid aft server URL");
+    client
+        .config()
+        .await
+        .unwrap_or_else(|e| panic!("aft server {url} unreachable: {e}"));
+
+    // ---- phase 1: aft adaptation ON — the image reaches the ACP client ----
+    let http_backend = Arc::new(HttpBackend::new(client.clone()));
+    let svc = Arc::new(AgentService::new(
+        http_backend.clone() as Arc<dyn OpenCodeBackend>,
+    ));
+    let (updates, outcome) = run_image_read_turn(Arc::clone(&svc), client.clone(), &dir).await;
+    match &outcome {
+        TurnOutcome::Ended(reason) => assert_eq!(*reason, StopReason::EndTurn),
+        // This relay rejects image input, so the turn fails AFTER the image
+        // block was delivered — the only acceptable failure mode here.
+        TurnOutcome::Failed(err) => assert!(
+            err.contains("text input") || err.contains("image_url"),
+            "unexpected turn failure: {err}"
+        ),
+    }
+
+    let has_image = |updates: &[SessionNotification]| {
+        updates.iter().any(|n| {
+            let SessionUpdate::ToolCallUpdate(u) = &n.update else {
+                return false;
+            };
+            u.fields.status == Some(ToolCallStatus::Completed)
+                && u.fields
+                    .content
+                    .as_ref()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            matches!(
+                                b,
+                                acp::ToolCallContent::Content(c)
+                                    if matches!(c.content, acp::ContentBlock::Image(_))
+                            )
+                        })
+                    })
+        })
+    };
+    let census = |updates: &[SessionNotification]| {
+        updates
+            .iter()
+            .filter_map(|n| {
+                let SessionUpdate::ToolCallUpdate(u) = &n.update else {
+                    return None;
+                };
+                let blocks = u
+                    .fields
+                    .content
+                    .as_ref()
+                    .map(|bs| {
+                        bs.iter()
+                            .map(|b| match b {
+                                acp::ToolCallContent::Content(c) => match c.content {
+                                    acp::ContentBlock::Image(_) => "image",
+                                    acp::ContentBlock::Text(_) => "text",
+                                    _ => "other-content",
+                                },
+                                _ => "non-content",
+                            })
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    })
+                    .unwrap_or_default();
+                Some(format!(
+                    "[{}] {} content=[{}]",
+                    u.tool_call_id.0,
+                    u.fields.title.as_deref().unwrap_or("?"),
+                    blocks
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        has_image(&updates),
+        "aft image read must map to an ACP image block ({} updates); tool calls seen:\n  {}",
+        updates.len(),
+        census(&updates).join("\n  ")
+    );
+
+    // ---- phase 2: --no-aft — the image block is dropped ----
+    let svc = Arc::new(
+        AgentService::new(http_backend.clone() as Arc<dyn OpenCodeBackend>).with_no_aft(true),
+    );
+    let (updates, outcome) = run_image_read_turn(svc, client.clone(), &dir).await;
+    match &outcome {
+        TurnOutcome::Ended(reason) => assert_eq!(*reason, StopReason::EndTurn),
+        TurnOutcome::Failed(err) => assert!(
+            err.contains("text input") || err.contains("image_url"),
+            "unexpected turn failure: {err}"
+        ),
+    }
+    assert!(
+        !has_image(&updates),
+        "--no-aft must drop the image passthrough ({} updates)",
+        updates.len()
+    );
+
+    std::fs::remove_dir_all(&png_dir).expect("remove .aft-e2e");
 }
