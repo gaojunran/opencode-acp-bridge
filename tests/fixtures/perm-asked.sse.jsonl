@@ -1,0 +1,54 @@
+data: {"id":"evt_0fb5c78ae0019UVeT0KiWORBdB","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_0fb5c7c9f001zUt26ZtuIsI0DJ","created":1790923537567,"type":"session.created","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","slug":"calm-circuit","version":"2.0.21","projectID":"476fbfe6befa9e63ddd7f9ae71655999a0104256","location":{"directory":"/tmp/opencode/acp-fixture-project"},"subpath":"acp-fixture-project"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":0,"version":1}}
+
+data: {"id":"evt_0fb5c7ca6001bvEi3Ca4O0MaQq","created":1790923537574,"type":"project.updated","data":{"id":"476fbfe6befa9e63ddd7f9ae71655999a0104256","canonical":"/tmp/opencode","vcs":"git","time":{"created":1790912570377,"updated":1790912570377,"active":1790923537574},"sandboxes":[]}}
+
+data: {"id":"evt_0fb5c7cae0016X09tncHXXvx7g","created":1790923537582,"type":"session.model.selected","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","model":{"id":"GLM-5.3-astra","providerID":"astra"}},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":1,"version":1}}
+
+data: {"id":"evt_0fb5c7cb800124kJZKVys8tl86","created":1790923537592,"type":"session.inbox.enqueued","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"inboxID":"msg_0fb5c7cb6001odYYh1qUyOAIUc","sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","item":{"type":"user","payload":{"text":"Use the bash tool now to run: echo hi"},"delivery":"steer"}},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":2,"version":1}}
+
+data: {"id":"evt_0fb5c7cbb0011CDzJUBUbm6Pyt","created":1790923537595,"type":"session.execution.started","data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":3,"version":1}}
+
+data: {"id":"evt_0fb5c7cc5001R279ht5wOrqW44","created":1790923537605,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","delta":{"core/codemode":"0deb41cde0e55c2b1525c7fc698160387e6fb0efb10087da4eb405f8c5465b93","core/mcp-guidance":"695e3cff13f1f110131ba21e76b49d6f4b96a415173ed2472bdab71c28b7180f","core/reference-guidance":"704eaa8c219e2db10ebc6f7d17a8ea41c12f86323aa4722c70c3d31c010633a0","core/skill-guidance":"f7b8ee04ad51c0e0bb9bec3f654ea36397a5acf8ab0e903badb12b0f93a478ae","core/instructions":"9a4c9bcd98c3d2ebcf26bfee6354b7f5a6dc48b8a3e4c36ed4fde7fb7a4dec61","core/date":"152929dbf3b2f78ce2845c96f45e0488a84d629d337990c77aaf906f4643c1e5","core/environment":"56ff7dc8f549c1b224f763e925af89dfd2a77bbc633fc878e61ce06d4c816cd7"}},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":4,"version":2}}
+
+data: {"id":"evt_0fb5c7cc60010eyqTavSJBhmFe","created":1790923537606,"type":"session.inbox.delivered","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","inboxID":"msg_0fb5c7cb6001odYYh1qUyOAIUc"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":5,"version":1}}
+
+data: {"id":"evt_0fb5c898e001uR5JLTOWYram4Z","created":1790923540878,"type":"session.usage.updated","data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","cost":0,"tokens":{"input":14,"output":150,"reasoning":0,"cache":{"read":512,"write":0}}}}
+
+data: {"id":"evt_0fb5c898f001Rja3o9WP2lvhdt","created":1790923540879,"type":"session.renamed","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","title":"Running echo hi command"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":7,"version":1}}
+
+data: {"id":"evt_0fb5ca0f5001uapqnmr8I0lkC1","created":1790923546869,"type":"session.step.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","agent":"orchestrator","model":{"id":"GLM-5.3-astra","providerID":"astra","variant":"default"},"assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","snapshot":"a73ee7f9c6b89c86e18c73c7c7c7af40e11179f5","started":1790923537700},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":8,"version":1}}
+
+data: {"id":"evt_0fb5ca0f7001IlkI0YavUYbolf","created":1790923546871,"type":"session.reasoning.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":9,"version":1}}
+
+data: {"id":"evt_0fb5ca15d001nQb1tjb1skczj2","created":1790923546973,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"delta":"The user asked"}}
+
+data: {"id":"evt_0fb5ca1e1001lFUnor2IrJmjaI","created":1790923547105,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"delta":" me to run `echo hi` using the bash tool. This"}}
+
+data: {"id":"evt_0fb5ca257001Eej3Ap1YOST2U1","created":1790923547223,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"delta":" is a simple, isolated, low-risk action — delegation overhead exceeds doing it myself. Let me run"}}
+
+data: {"id":"evt_0fb5ca294001ZUqK2r8Qm4ZOJt","created":1790923547284,"type":"session.reasoning.delta","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"delta":" it."}}
+
+data: {"id":"evt_0fb5ca294002pZmOsnxM9VPYLy","created":1790923547284,"type":"session.tool.input.started","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","id":"call_42b2e3814e6a4745a9d2aa1e","name":"bash"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":10,"version":1}}
+
+data: {"id":"evt_0fb5ca327001tyxD9J9LszQZhy","created":1790923547431,"type":"session.reasoning.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","ordinal":0,"text":"The user asked me to run `echo hi` using the bash tool. This is a simple, isolated, low-risk action — delegation overhead exceeds doing it myself. Let me run it.","state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":11,"version":1}}
+
+data: {"id":"evt_0fb5ca32a001MzjrdATNsjoCyA","created":1790923547434,"type":"session.tool.input.ended","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","id":"call_42b2e3814e6a4745a9d2aa1e","text":"{\"command\": \"echo hi\", \"description\": \"Print hi to stdout\"}"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":12,"version":1}}
+
+data: {"id":"evt_0fb5ca32b0010coS3uYaQCflYv","created":1790923547435,"type":"session.tool.called","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","id":"call_42b2e3814e6a4745a9d2aa1e","input":{"command":"echo hi","description":"Print hi to stdout"},"executed":false},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":13,"version":1}}
+
+data: {"id":"evt_0fb5ca32c001hUNoLD6SDD7gRK","created":1790923547436,"type":"session.step.streamed","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","assistantMessageID":"msg_0fb5c7cd1001p2J0goKASIUB6G"},"durable":{"aggregateID":"ses_f04a38368fferK6gTrN2B0ESs6","seq":14,"version":1}}
+
+data: {"id":"evt_0fb5ca336002c4U8AIayi5IPu9","created":1790923547446,"type":"permission.asked","location":{"directory":"/tmp/opencode/acp-fixture-project"},"data":{"id":"per_0fb5ca336001m94Lbqk9xdVFcC","sessionID":"ses_f04a38368fferK6gTrN2B0ESs6","action":"shell","resources":["echo hi"],"save":["echo *"],"metadata":{},"source":{"type":"tool","messageID":"msg_0fb5c7cd1001p2J0goKASIUB6G","id":"call_42b2e3814e6a4745a9d2aa1e"}}}
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+

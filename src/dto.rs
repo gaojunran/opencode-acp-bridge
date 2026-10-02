@@ -180,7 +180,7 @@ pub struct InboxPayload {
 // ============================================================
 
 /// POST /api/session/{id}/permission/{requestID}/reply body (openapi enum).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionReply {
     Once,
@@ -565,17 +565,70 @@ pub struct SessionCreated {
     pub subpath: Option<Value>,
 }
 
+/// The `source` of a permission prompt: the tool call that triggered it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionSource {
+    /// Present in the wire frames (`"type": "tool"`); modeled loosely in
+    /// case other source kinds appear later.
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub messageID: Option<String>,
+    pub id: String,
+}
+
+/// Payload of a `permission.asked` SSE event (wire shape captured in
+/// tests/fixtures/perm-asked.sse.jsonl): `data.id` is the requestID that the
+/// permission reply must target, `resources` are the human-readable
+/// descriptions of what the tool wanted to run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionAsked {
+    /// The permission request ID (`per_...`).
+    pub id: String,
+    pub sessionID: String,
+    /// The permission action kind (`"shell"` for bash tool calls).
+    pub action: String,
+    /// Descriptions of the requested operation (e.g. the shell command).
+    pub resources: Vec<String>,
+    #[serde(default)]
+    pub save: Option<Vec<String>>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub source: Option<PermissionSource>,
+}
+
+/// Payload of a `permission.replied` SSE event — the server echoing the
+/// reply back. The bridge ignores these (it already knows the outcome it
+/// forwarded); the type exists so the event decodes and is skipped
+/// explicitly instead of falling through silently.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionReplied {
+    pub sessionID: String,
+    pub requestID: String,
+    #[serde(default)]
+    pub reply: Option<String>,
+}
+
 /// Typed decoding of the event kinds the bridge maps to ACP updates.
 ///
-/// `permission` variants are deliberately absent: the permission-request
-/// event type name is UNVERIFIED (no permission prompt fired during capture).
-/// Discover it live (see docs/opencode-api.md), then add a variant here.
+/// The `permission.*` pair is verified on the wire (both fixtures in
+/// tests/fixtures/): `permission.asked` drives the ACP permission flow in
+/// `acp::agent`, `permission.replied` is the server echo of the bridge's own
+/// reply and is deliberately ignored by the mapping layer.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     // turn lifecycle
     ExecutionStarted(SessionRef),
     ExecutionSucceeded(SessionRef),
     ExecutionFailed(ExecutionFailed),
+    /// Cancellation path (official `session.execution.interrupted`); mapped
+    /// to stopReason cancelled.
+    ExecutionInterrupted(SessionRef),
+    // permissions
+    PermissionAsked(PermissionAsked),
+    /// Server echo of a reply the bridge itself sent — ignored, decoded only.
+    PermissionReplied(PermissionReplied),
     // steps
     StepStarted(StepStarted),
     StepStreamed(MessageRef),
@@ -612,6 +665,9 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.execution.started" => parse(data).map(SessionEvent::ExecutionStarted),
         "session.execution.succeeded" => parse(data).map(SessionEvent::ExecutionSucceeded),
         "session.execution.failed" => parse(data).map(SessionEvent::ExecutionFailed),
+        "session.execution.interrupted" => parse(data).map(SessionEvent::ExecutionInterrupted),
+        "permission.asked" => parse(data).map(SessionEvent::PermissionAsked),
+        "permission.replied" => parse(data).map(SessionEvent::PermissionReplied),
         "session.step.started" => parse(data).map(SessionEvent::StepStarted),
         "session.step.streamed" => parse(data).map(SessionEvent::StepStreamed),
         "session.step.ended" => parse(data).map(SessionEvent::StepEnded),
@@ -671,6 +727,107 @@ mod tests {
         }
         assert!(decoded > 20, "expected a real turn, got {decoded} relevant frames");
         assert!(envelopes > decoded, "fixture should contain skipped kinds too");
+    }
+
+    /// Wave 3: the captured permission-ask turn must decode end-to-end, and
+    /// the ask frame must expose the exact fields the ACP mapping needs
+    /// (requestID `data.id`, tool-call source, shell action + command).
+    #[test]
+    fn decode_permission_asked_capture() {
+        let raw = include_str!("../tests/fixtures/perm-asked.sse.jsonl");
+        let mut envelopes = 0;
+        let mut decoded = 0;
+        let mut asked: Option<PermissionAsked> = None;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line == ": heartbeat" {
+                continue;
+            }
+            let env: EventEnvelope = serde_json::from_str(
+                line.strip_prefix("data: ").expect("data: prefix"),
+            )
+            .expect("envelope parses");
+            envelopes += 1;
+            let skipped = env.kind.starts_with("rpc.")
+                || matches!(
+                    env.kind.as_str(),
+                    "server.connected"
+                        | "session.inbox.enqueued"
+                        | "session.inbox.delivered"
+                        | "project.updated"
+                        | "session.instructions.updated"
+                        | "session.model.selected"
+                );
+            if skipped {
+                continue;
+            }
+            let event = decode_event(&env.kind, &env.data)
+                .unwrap_or_else(|| panic!("frame kind `{}` must decode to a typed event", env.kind));
+            if let SessionEvent::PermissionAsked(pa) = event {
+                asked = Some(pa);
+            }
+            decoded += 1;
+        }
+        let asked = asked.expect("fixture contains one permission.asked frame");
+        assert!(asked.id.starts_with("per_"));
+        assert!(asked.sessionID.starts_with("ses_"));
+        assert_eq!(asked.action, "shell");
+        assert_eq!(asked.resources, vec!["echo hi"]);
+        assert_eq!(asked.save.as_deref(), Some(&["echo *".to_string()][..]));
+        assert_eq!(asked.metadata.as_ref(), Some(&serde_json::Map::new()));
+        let source = asked.source.expect("source present");
+        assert_eq!(source.kind.as_deref(), Some("tool"));
+        assert!(source.messageID.as_deref().unwrap_or("").starts_with("msg_"));
+        assert!(source.id.starts_with("call_"));
+        assert!(decoded > 5, "expected a real turn, got {decoded} relevant frames");
+        assert!(envelopes > decoded, "fixture should contain skipped kinds too");
+    }
+
+    /// Wave 3: the post-reply resume capture decodes fully, including the
+    /// `permission.replied` echo (which the bridge ignores) and the turn's
+    /// terminal `session.execution.succeeded`.
+    #[test]
+    fn decode_permission_replied_resume_capture() {
+        let raw = include_str!("../tests/fixtures/perm-replied-resume.sse.jsonl");
+        let mut decoded = 0;
+        let mut saw_replied = false;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line == ": heartbeat" {
+                continue;
+            }
+            let env: EventEnvelope = serde_json::from_str(
+                line.strip_prefix("data: ").expect("data: prefix"),
+            )
+            .expect("envelope parses");
+            match env.kind.as_str() {
+                "server.connected" | "project.updated" => continue,
+                "permission.replied" => {
+                    if let SessionEvent::PermissionReplied(replied) =
+                        decode_event(&env.kind, &env.data).expect("replied decodes")
+                    {
+                        assert!(replied.sessionID.starts_with("ses_"));
+                        assert!(replied.requestID.starts_with("per_"));
+                        assert_eq!(replied.reply.as_deref(), Some("once"));
+                        saw_replied = true;
+                    }
+                }
+                _ => {
+                    assert!(
+                        decode_event(&env.kind, &env.data).is_some(),
+                        "frame kind `{}` must decode to a typed event",
+                        env.kind
+                    );
+                }
+            }
+            decoded += 1;
+        }
+        assert!(saw_replied, "fixture must contain the permission.replied echo");
+        assert!(decoded > 10, "expected the resumed turn, got {decoded} relevant frames");
+        assert!(
+            raw.contains("session.execution.succeeded"),
+            "fixture resumes to a successful turn end"
+        );
     }
 
     /// The persisted tool part must expose the diff-fix data source.

@@ -32,11 +32,22 @@ use super::diff;
 pub struct MappingState {
     /// opencode tool call id → display title (from `session.tool.input.started`).
     tool_titles: HashMap<String, String>,
+    /// opencode tool call id → parsed tool input, for the ACP permission
+    /// prompt (Wave 3: `state.input` of the pending tool call). Populated
+    /// best-effort from `session.tool.input.ended` (raw JSON text) and
+    /// authoritatively from `session.tool.called` (parsed input object).
+    pub(crate) tool_inputs: HashMap<String, serde_json::Value>,
 }
 
 impl MappingState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The parsed input of a tool call, if seen this turn (`tool.input.ended`
+    /// / `tool.called`). Used to build the permission prompt's `state.input`.
+    pub fn tool_input(&self, tool_call_id: &str) -> Option<&serde_json::Value> {
+        self.tool_inputs.get(tool_call_id)
     }
 }
 
@@ -69,11 +80,18 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
         dto::SessionEvent::ToolInputEnded(t) => {
             // `text` is the raw JSON input string — pass it through verbatim
             // (the pending call's streaming input, as a JSON string value).
+            // Also cache the parsed input for the permission prompt.
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                state
+                    .tool_inputs
+                    .insert(t.base.id.clone(), parsed);
+            }
             vec![tool_update(&t.base.id, ToolCallUpdateFields::new()
                 .raw_input(serde_json::Value::String(t.text.clone())))]
         }
         dto::SessionEvent::ToolCalled(t) => {
             // Parsed input now available → mark in progress.
+            state.tool_inputs.insert(t.base.id.clone(), t.input.clone());
             vec![tool_update(&t.base.id, ToolCallUpdateFields::new()
                 .status(ToolCallStatus::InProgress)
                 .raw_input(t.input.clone()))]
@@ -145,18 +163,43 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
 pub enum TurnEnd {
     /// `session.execution.succeeded` → respond `StopReason::EndTurn`.
     EndTurn,
-    /// `session.execution.failed` → respond with a JSON-RPC error carrying the
-    /// opencode error message (there is no `Error` stop reason in v1).
+    /// `session.execution.interrupted` → respond `StopReason::Cancelled`.
+    Cancelled,
+    /// `length` failure (output token limit) → respond `StopReason::MaxTokens`.
+    MaxTokens,
+    /// `content-filter` failure → respond `StopReason::Refusal`.
+    Refusal,
+    /// `provider.auth` failure → respond with the ACP authentication-required
+    /// error (JSON-RPC -32000), carrying the opencode message.
+    AuthRequired { message: Option<String> },
+    /// Any other `session.execution.failed` → respond with a JSON-RPC error
+    /// carrying the opencode error message (there is no `Error` stop reason
+    /// in v1).
     Error { message: Option<String> },
+}
+
+/// Official 2.0.21 adapter mapping of an execution-failure error to the ACP
+/// turn outcome, extracted from the shipped binary + the dev-clone acp
+/// package (`packages/opencode/src/acp/event.ts` response conversion):
+/// `provider.auth` → authentication-required error · `content-filter` →
+/// refusal · `aborted` → cancelled · `length` → max_tokens · anything else →
+/// error stop with the safe message.
+fn failure_outcome(error: &dto::StructuredError) -> TurnEnd {
+    match error.kind.as_deref() {
+        Some("provider.auth") => TurnEnd::AuthRequired { message: error.message.clone() },
+        Some("content-filter") => TurnEnd::Refusal,
+        Some("aborted") => TurnEnd::Cancelled,
+        Some("length") => TurnEnd::MaxTokens,
+        _ => TurnEnd::Error { message: error.message.clone() },
+    }
 }
 
 /// Map a turn-completion event to the agent-layer stop outcome.
 pub fn stop_update(event: &dto::SessionEvent) -> Option<TurnEnd> {
     match event {
         dto::SessionEvent::ExecutionSucceeded(_) => Some(TurnEnd::EndTurn),
-        dto::SessionEvent::ExecutionFailed(f) => Some(TurnEnd::Error {
-            message: f.error.message.clone(),
-        }),
+        dto::SessionEvent::ExecutionInterrupted(_) => Some(TurnEnd::Cancelled),
+        dto::SessionEvent::ExecutionFailed(f) => Some(failure_outcome(&f.error)),
         _ => None,
     }
 }
@@ -167,7 +210,10 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
     match event {
         dto::SessionEvent::ExecutionStarted(r) => Some(&r.sessionID),
         dto::SessionEvent::ExecutionSucceeded(r) => Some(&r.sessionID),
+        dto::SessionEvent::ExecutionInterrupted(r) => Some(&r.sessionID),
         dto::SessionEvent::ExecutionFailed(f) => Some(&f.session.sessionID),
+        dto::SessionEvent::PermissionAsked(p) => Some(&p.sessionID),
+        dto::SessionEvent::PermissionReplied(p) => Some(&p.sessionID),
         dto::SessionEvent::StepStarted(s) => Some(&s.session.sessionID),
         dto::SessionEvent::StepStreamed(m) => Some(&m.sessionID),
         dto::SessionEvent::StepEnded(s) => Some(&s.session.sessionID),
@@ -375,6 +421,141 @@ mod tests {
             Some(TurnEnd::Error { message }) => assert_eq!(message.as_deref(), Some("boom")),
             other => panic!("expected Error outcome, got {other:?}"),
         }
+    }
+
+    /// Wave 3: the official failure-kind → stop outcome table.
+    #[test]
+    fn failure_kind_mapping_table() {
+        type Case = (&'static str, fn(&TurnEnd) -> bool, Option<&'static str>);
+
+        fn failed(kind: &str) -> dto::SessionEvent {
+            dto::SessionEvent::ExecutionFailed(dto::ExecutionFailed {
+                session: dto::SessionRef { sessionID: "ses_x".into() },
+                error: dto::StructuredError {
+                    kind: Some(kind.into()),
+                    message: Some(format!("{kind} boom")),
+                },
+            })
+        }
+        // (kind, expected TurnEnd variant, message check)
+        let cases: Vec<Case> = vec![
+            ("provider.auth", |t| matches!(t, TurnEnd::AuthRequired { .. }), None),
+            ("content-filter", |t| matches!(t, TurnEnd::Refusal), None),
+            ("aborted", |t| matches!(t, TurnEnd::Cancelled), None),
+            ("length", |t| matches!(t, TurnEnd::MaxTokens), None),
+            ("internal", |t| matches!(t, TurnEnd::Error { .. }), Some("internal boom")),
+            ("provider.rate_limited", |t| matches!(t, TurnEnd::Error { .. }), None),
+            ("", |t| matches!(t, TurnEnd::Error { .. }), None),
+        ];
+        for (kind, check, message) in cases {
+            match stop_update(&failed(kind)) {
+                Some(outcome) => {
+                    assert!(check(&outcome), "kind `{kind}`: unexpected outcome {outcome:?}");
+                    if let Some(expected) = message {
+                        let TurnEnd::Error { message } = &outcome else {
+                            panic!("kind `{kind}`: expected Error with message");
+                        };
+                        assert_eq!(message.as_deref(), Some(expected));
+                    }
+                }
+                None => panic!("kind `{kind}`: stop_update returned None"),
+            }
+        }
+    }
+
+    /// Wave 3: `session.execution.interrupted` → stopReason cancelled.
+    #[test]
+    fn execution_interrupted_maps_to_cancelled() {
+        let ev = dto::SessionEvent::ExecutionInterrupted(dto::SessionRef {
+            sessionID: "ses_x".into(),
+        });
+        match stop_update(&ev) {
+            Some(TurnEnd::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        // not a stop signal for other events
+        assert!(stop_update(&dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+            sessionID: "ses_x".into()
+        }))
+        .is_none());
+    }
+
+    /// Wave 3: permission events belong to a session (so the agent filter can
+    /// route them) but map to no ACP session updates — the ask drives the
+    /// permission REQUEST in the agent layer, the replied echo is ignored.
+    #[test]
+    fn permission_events_route_to_session_but_no_updates() {
+        let mut state = MappingState::new();
+        let asked = dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+            id: "per_x".into(),
+            sessionID: "ses_x".into(),
+            action: "shell".into(),
+            resources: vec!["echo hi".into()],
+            save: None,
+            metadata: None,
+            source: None,
+        });
+        let replied = dto::SessionEvent::PermissionReplied(dto::PermissionReplied {
+            sessionID: "ses_x".into(),
+            requestID: "per_x".into(),
+            reply: Some("once".into()),
+        });
+        for ev in [&asked, &replied] {
+            assert_eq!(
+                event_session_id(ev),
+                Some("ses_x"),
+                "permission events filter by session"
+            );
+            assert!(to_updates(ev, &mut state).is_empty(), "no ACP update counterpart");
+        }
+    }
+
+    /// Wave 3: the tool-input cache feeds the permission prompt's `state.input`.
+    #[test]
+    fn tool_input_cache_covers_ended_and_called() {
+        let mut state = MappingState::new();
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: dto::ToolRef {
+                sessionID: "ses_x".into(),
+                assistantMessageID: "msg_x".into(),
+                id: "call_x".into(),
+            },
+            text: r#"{"command": "echo hi"}"#.into(),
+        });
+        let _ = to_updates(&ended, &mut state);
+        assert_eq!(
+            state.tool_input("call_x"),
+            Some(&serde_json::json!({ "command": "echo hi" })),
+            "input.ended parses the raw JSON into the cache"
+        );
+        // tool.called overwrites with the authoritative parsed input.
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: dto::ToolRef {
+                sessionID: "ses_x".into(),
+                assistantMessageID: "msg_x".into(),
+                id: "call_x".into(),
+            },
+            input: serde_json::json!({ "command": "echo hi", "confirmed": true }),
+            executed: None,
+        });
+        let _ = to_updates(&called, &mut state);
+        assert_eq!(
+            state.tool_input("call_x"),
+            Some(&serde_json::json!({ "command": "echo hi", "confirmed": true })),
+            "tool.called is authoritative"
+        );
+        assert_eq!(state.tool_input("call_missing"), None);
+        // Unparseable ended-input leaves the cache untouched.
+        let junk = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: dto::ToolRef {
+                sessionID: "ses_x".into(),
+                assistantMessageID: "msg_x".into(),
+                id: "call_junk".into(),
+            },
+            text: "{ not json".into(),
+        });
+        let _ = to_updates(&junk, &mut state);
+        assert_eq!(state.tool_input("call_junk"), None);
     }
 
     #[test]

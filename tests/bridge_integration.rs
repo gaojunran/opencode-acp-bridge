@@ -19,7 +19,11 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallContent, ToolCallStatus,
 };
-use agent_client_protocol::{Client, Error as AcpError, on_receive_notification};
+use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, Error as AcpError, Responder, on_receive_notification,
+    on_receive_request,
+};
 use opencode_acp_bridge::acp::agent::{AgentService, OpenCodeBackend};
 use opencode_acp_bridge::bridge::backend::HttpBackend;
 use opencode_acp_bridge::dto::ModelRef;
@@ -285,4 +289,195 @@ async fn binary_stdio_smoke() {
         .expect("bridge exits after stdin EOF (30s)")
         .expect("wait for the bridge");
     assert!(status.success(), "clean exit after stdin EOF: {status:?}");
+}
+
+// ============================================================
+// Wave 3 E2E: live permission loop — the fixture project's
+// `[permission] bash = "ask"` rule routes bash asks to the ACP
+// client, whose reply unblocks the turn (contract verified in
+// docs/opencode-api.md "Permission loop").
+// ============================================================
+
+const FIXTURE_DIR: &str = "/tmp/opencode/acp-fixture-project";
+const PERM_PROMPT: &str = "Use the bash tool now to run: echo perm-e2e-ok";
+
+#[tokio::test]
+#[ignore = "requires BRIDGE_IT=1, the scratch server, and the fixture project's ask rule"]
+async fn wave3_permission_loop_e2e() {
+    if !it_enabled() {
+        eprintln!("skipped: BRIDGE_IT=1 not set");
+        return;
+    }
+
+    // Make the bridge's tracing visible for live diagnosis (main() wires
+    // this in production; the in-process harness needs it here).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+
+    let client = OpencodeClient::new(SCRATCH, SCRATCH_PASSWORD).expect("valid scratch URL");
+    client
+        .config()
+        .await
+        .unwrap_or_else(|e| panic!("scratch server {SCRATCH} unreachable (restart per docs/opencode-api.md recipe): {e}"));
+
+    let http_backend = Arc::new(HttpBackend::new(client.clone()));
+    let svc = Arc::new(AgentService::new(
+        http_backend.clone() as Arc<dyn OpenCodeBackend>
+    ));
+    let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+    let agent_task = tokio::spawn({
+        let svc = Arc::clone(&svc);
+        async move { let _ = svc.serve(agent_side).await; }
+    });
+
+    let all_updates = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+    let seen_asks = Arc::new(Mutex::new(Vec::new()));
+    let sid_seen = Arc::new(Mutex::new(String::new()));
+
+    let outcome: Result<(), AcpError> = Client
+        .builder()
+        .name("bridge-it-wave3")
+        .on_receive_request(
+            {
+                let seen_asks = Arc::clone(&seen_asks);
+                async move |req: acp::RequestPermissionRequest,
+                            responder: Responder<acp::RequestPermissionResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    seen_asks.lock().expect("asks lock").push(req);
+                    // Reply "once" — official routing: selected once → allow once.
+                    responder.respond(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new("once")),
+                    ))
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let all_updates = Arc::clone(&all_updates);
+                async move |notif: SessionNotification, _cx| {
+                    all_updates.lock().expect("updates lock").push(notif);
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_side, {
+            let client = client.clone();
+            let sid_seen = Arc::clone(&sid_seen);
+            let all_updates = Arc::clone(&all_updates);
+            let seen_asks = Arc::clone(&seen_asks);
+            async move |cx| {
+                let _init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(FIXTURE_DIR))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+                *sid_seen.lock().expect("sid lock") = sid.0.as_ref().to_string();
+
+                client
+                    .set_model(
+                        &sid.0,
+                        &ModelRef {
+                            id: MODEL_ID.into(),
+                            providerID: MODEL_PROVIDER.into(),
+                            variant: None,
+                        },
+                    )
+                    .await
+                    .expect("set_model on scratch");
+
+                // The turn pauses on the bash ask; the "once" reply from the
+                // request handler above unblocks it.
+                let prompt = cx.send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new(PERM_PROMPT))],
+                ));
+                let resp = match tokio::time::timeout(
+                    Duration::from_secs(180),
+                    prompt.block_task(),
+                )
+                .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        eprintln!(
+                            "DIAG after 180s: updates received: {}, asks seen by client: {}",
+                            all_updates.lock().expect("updates lock").len(),
+                            seen_asks.lock().expect("asks lock").len()
+                        );
+                        panic!("live permission turn did not finish within 180s");
+                    }
+                };
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+                client.delete_session(sid.0.as_ref()).await.expect("delete_session cleanup");
+                Ok(())
+            }
+        })
+        .await;
+
+    agent_task.abort();
+    outcome.expect("wave3 client run ok");
+
+    // ---- the ask reached the client with the official shape ----
+    let asks = seen_asks.lock().expect("asks lock");
+    assert_eq!(asks.len(), 1, "exactly one permission ask, got {}", asks.len());
+    let ask = &asks[0];
+    assert_eq!(
+        ask.session_id.0.as_ref(),
+        sid_seen.lock().expect("sid lock").as_str(),
+        "the ask targets the opencode session"
+    );
+    let options = &ask.options;
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[0].option_id.0.as_ref(), "once");
+    assert_eq!(options[1].option_id.0.as_ref(), "always");
+    assert_eq!(options[2].option_id.0.as_ref(), "reject");
+
+    let tc = &ask.tool_call;
+    assert!(
+        tc.tool_call_id.0.starts_with("call_"),
+        "toolCallId is the triggering tool call, got {}",
+        tc.tool_call_id.0
+    );
+    assert!(
+        tc.fields
+            .title
+            .as_deref()
+            .is_some_and(|t| t.contains("echo perm-e2e-ok")),
+        "title carries the command: {:?}",
+        tc.fields.title
+    );
+    assert_eq!(tc.fields.status, Some(acp::ToolCallStatus::Pending));
+    let raw = tc
+        .fields
+        .raw_input
+        .as_ref()
+        .expect("input merged from the cached tool input");
+    assert!(
+        serde_json::to_string(raw).expect("serialize input").contains("echo perm-e2e-ok"),
+        "cached bash input reaches the client: {raw}"
+    );
+
+    // ---- the reply really unblocked the turn: the asked tool completed ----
+    let updates = all_updates.lock().expect("updates lock");
+    assert!(
+        updates.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::ToolCallUpdate(u)
+                if u.fields.status == Some(ToolCallStatus::Completed)
+                    && u.tool_call_id == tc.tool_call_id
+        )),
+        "the asked tool call completed after the once-reply ({} updates)",
+        updates.len()
+    );
 }

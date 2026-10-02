@@ -101,4 +101,19 @@ impl OpenCodeBackend for HttpBackend {
             Ok(stream)
         })
     }
+
+    fn permission_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: crate::dto::PermissionReply,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let session_id = session_id.to_string();
+        let request_id = request_id.to_string();
+        let req = crate::dto::PermissionReplyRequest { decision, message: None };
+        Box::pin(async move {
+            self.client.permission_reply(&session_id, &request_id, &req).await?;
+            Ok(())
+        })
+    }
 }

@@ -56,6 +56,16 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
 
     /// The session-tagged event stream (see trait docs for the contract).
     fn event_stream(&self, session_id: &str) -> BoxFuture<'_, Result<EventStream, anyhow::Error>>;
+
+    /// Answer an opencode permission prompt (Wave 3). Called once the ACP
+    /// client has decided on a `session/request_permission`; the decision is
+    /// forwarded verbatim to the server's reply endpoint.
+    fn permission_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: dto::PermissionReply,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 }
 
 /// The ACP agent service: state + handler wiring.
@@ -67,6 +77,10 @@ pub struct AgentService {
 struct SessionEntry {
     /// Set by `session/cancel`; polled by the turn loop between events.
     cancel: AtomicBool,
+    /// The working directory of the ACP session (`newSession.cwd` /
+    /// `loadSession.cwd`), used as the tool-call location on permission
+    /// prompts (mirrors the official adapter's `cwd` for shell tools).
+    cwd: String,
 }
 
 impl AgentService {
@@ -186,7 +200,10 @@ impl AgentService {
         };
         self.sessions.lock().expect("sessions lock").insert(
             acp::SessionId::from(session_id.clone()),
-            Arc::new(SessionEntry { cancel: AtomicBool::new(false) }),
+            Arc::new(SessionEntry {
+                cancel: AtomicBool::new(false),
+                cwd: cwd.clone(),
+            }),
         );
         tracing::info!(session_id, "ACP newSession -> opencode session");
         responder.respond(acp::NewSessionResponse::new(session_id))
@@ -217,7 +234,10 @@ impl AgentService {
         // Refresh state so a subsequent prompt on this session works.
         self.sessions.lock().expect("sessions lock").insert(
             req.session_id.clone(),
-            Arc::new(SessionEntry { cancel: AtomicBool::new(false) }),
+            Arc::new(SessionEntry {
+                cancel: AtomicBool::new(false),
+                cwd: req.cwd.to_string_lossy().to_string(),
+            }),
         );
         responder.respond(acp::LoadSessionResponse::new())
     }
@@ -287,11 +307,22 @@ impl AgentService {
                 }
             }
 
+            tracing::debug!(session = %req.session_id, event = ?event, "sse event");
+
             // session/cancel won? End the turn (the interrupt call itself was
             // already made by the cancel handler).
             if entry.cancel.load(Ordering::Acquire) {
                 tracing::info!(session = %req.session_id, "turn cancelled via session/cancel");
                 return responder.respond(acp::PromptResponse::new(acp::StopReason::Cancelled));
+            }
+
+            // ---------- permission bridging (Wave 3) ----------
+            // `permission.asked` is a turn-level signal, not an update: ask
+            // the ACP client and forward the decision before the turn can
+            // resume. The server holds the execution until we reply.
+            if let dto::SessionEvent::PermissionAsked(asked) = &event {
+                self.forward_permission(asked, &mut state, &entry.cwd, &cx).await;
+                continue;
             }
 
             match updates::stop_update(&event) {
@@ -300,6 +331,39 @@ impl AgentService {
                     return responder.respond(acp::PromptResponse::new(
                         acp::StopReason::EndTurn,
                     ));
+                }
+                Some(updates::TurnEnd::Cancelled) => {
+                    // `session.execution.interrupted` (official cancellation
+                    // path) or an `aborted`-kind failure.
+                    tracing::info!(session = %req.session_id, "turn cancelled (interrupted)");
+                    return responder.respond(acp::PromptResponse::new(
+                        acp::StopReason::Cancelled,
+                    ));
+                }
+                Some(updates::TurnEnd::MaxTokens) => {
+                    // `length` failure — official mapping to max_tokens.
+                    tracing::info!(session = %req.session_id, "turn ended (max_tokens)");
+                    return responder.respond(acp::PromptResponse::new(
+                        acp::StopReason::MaxTokens,
+                    ));
+                }
+                Some(updates::TurnEnd::Refusal) => {
+                    // `content-filter` failure — official mapping to refusal.
+                    tracing::info!(session = %req.session_id, "turn ended (refusal)");
+                    return responder.respond(acp::PromptResponse::new(
+                        acp::StopReason::Refusal,
+                    ));
+                }
+                Some(updates::TurnEnd::AuthRequired { message }) => {
+                    // `provider.auth` failure — the ACP JSON-RPC contract has
+                    // an exact code for this (authRequired, -32000); attach
+                    // the opencode message as data.
+                    let mut err = AcpError::auth_required();
+                    if let Some(msg) = message {
+                        err = err.data(serde_json::json!({ "message": msg }));
+                    }
+                    tracing::info!(session = %req.session_id, "turn failed (auth required)");
+                    return responder.respond_with_error(err);
                 }
                 Some(updates::TurnEnd::Error { message }) => {
                     // ACP v1 has no error stop reason — fail the request.
@@ -326,6 +390,127 @@ impl AgentService {
         responder.respond_with_internal_error(
             "event stream ended before the execution completed".to_string(),
         )
+    }
+
+    /// Wave 3 permission bridging: turn a `permission.asked` event into an
+    /// ACP `session/request_permission`, then route the client's decision
+    /// back to opencode via [`OpenCodeBackend::permission_reply`].
+    ///
+    /// Wire contract (verified): `data.id` is the requestID the reply must
+    /// target, `source.id` is the tool-call id, `action` is the permission
+    /// kind (`"shell"`), `resources` are human-readable descriptions.
+    ///
+    /// Outcome routing per the official adapter (`packages/cli/src/acp/
+    /// permission.ts`): `once` → allow_once "Allow once", `always` →
+    /// allow_always "Always allow", `reject` → reject_once "Reject"; any
+    /// other outcome (dismissed, cancelled, transport error) rejects — the
+    /// "race cancel → reject" rule, and the server reply is uninterruptible.
+    async fn forward_permission(
+        self: &Arc<Self>,
+        asked: &dto::PermissionAsked,
+        state: &mut updates::MappingState,
+        cwd: &str,
+        cx: &ConnectionTo<Client>,
+    ) {
+        // Tool-call identity: `source.id` (the call_* id of the triggering
+        // tool call); fall back to the permission request id.
+        let tool_call_id = asked
+            .source
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| asked.id.clone());
+        // Title: "<action>: <first resource>" — e.g. "shell: echo hi".
+        let title = match asked.resources.first() {
+            Some(resource) => format!("{}: {}", asked.action, resource),
+            None => asked.action.clone(),
+        };
+        // state.input = metadata merged over the cached tool input (tool
+        // input cached from tool.input.ended / tool.called by the mapping).
+        let mut input = serde_json::Map::new();
+        if let Some(meta) = &asked.metadata {
+            input.extend(meta.clone());
+        }
+        if let Some(serde_json::Value::Object(cached_obj)) = state.tool_input(&tool_call_id) {
+            input.extend(cached_obj.clone());
+        }
+        let update = acp::ToolCallUpdate::new(
+            tool_call_id,
+            acp::ToolCallUpdateFields::new()
+                .title(title)
+                .status(acp::ToolCallStatus::Pending)
+                .raw_input(serde_json::Value::Object(input))
+                .locations(vec![acp::ToolCallLocation::new(cwd)]),
+        );
+        let request = acp::RequestPermissionRequest::new(
+            acp::SessionId::from(asked.sessionID.clone()),
+            update,
+            Vec::from([
+                acp::PermissionOption::new(
+                    "once",
+                    "Allow once",
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                acp::PermissionOption::new(
+                    "always",
+                    "Always allow",
+                    acp::PermissionOptionKind::AllowAlways,
+                ),
+                acp::PermissionOption::new("reject", "Reject", acp::PermissionOptionKind::RejectOnce),
+            ]),
+        );
+
+        // Block on the client's answer. A client that cancels the prompt turn
+        // MUST answer the pending request with `Cancelled`; a dead connection
+        // surfaces as a transport error. Both reject — official "race cancel
+        // → reject" semantics. The opencode reply is then sent unconditionally.
+        let decision = match cx.send_request(request).block_task().await {
+            Ok(resp) => match &resp.outcome {
+                acp::RequestPermissionOutcome::Selected(sel) => {
+                    match sel.option_id.0.as_ref() {
+                        "once" => dto::PermissionReply::Once,
+                        "always" => dto::PermissionReply::Always,
+                        other => {
+                            tracing::warn!(
+                                option = other,
+                                session = %asked.sessionID,
+                                "unknown permission option id — rejecting"
+                            );
+                            dto::PermissionReply::Reject
+                        }
+                    }
+                }
+                acp::RequestPermissionOutcome::Cancelled => dto::PermissionReply::Reject,
+                // The protocol's outcome enum is non-exhaustive: unknown
+                // outcomes reject too (safe default).
+                _ => dto::PermissionReply::Reject,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session = %asked.sessionID,
+                    "permission request to ACP client failed — rejecting"
+                );
+                dto::PermissionReply::Reject
+            }
+        };
+        tracing::info!(
+            session = %asked.sessionID,
+            request = %asked.id,
+            ?decision,
+            "permission decision forwarded to opencode"
+        );
+        if let Err(e) = self
+            .backend
+            .permission_reply(&asked.sessionID, &asked.id, decision)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                session = %asked.sessionID,
+                request = %asked.id,
+                "permission reply to opencode failed"
+            );
+        }
     }
 
     async fn cancel(
@@ -370,6 +555,9 @@ mod tests {
         messages_out: Mutex<Option<Vec<dto::MessageRecord>>>,
         interrupted: AtomicBool,
         interrupt_seen: Mutex<Option<oneshot::Sender<()>>>,
+        /// Recorded (session_id, request_id, decision) of permission replies.
+        permission_replies: Mutex<Vec<(String, String, dto::PermissionReply)>>,
+        permission_seen: Mutex<Option<oneshot::Sender<()>>>,
     }
 
     impl MockBackend {
@@ -381,6 +569,8 @@ mod tests {
                 messages_out: Mutex::new(None),
                 interrupted: AtomicBool::new(false),
                 interrupt_seen: Mutex::new(None),
+                permission_replies: Mutex::new(Vec::new()),
+                permission_seen: Mutex::new(None),
             })
         }
 
@@ -398,6 +588,16 @@ mod tests {
             let (tx, rx) = oneshot::channel();
             *self.interrupt_seen.lock().expect("interrupt lock") = Some(tx);
             rx
+        }
+
+        fn install_permission_seen(&self) -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.permission_seen.lock().expect("permission lock") = Some(tx);
+            rx
+        }
+
+        fn recorded_replies(&self) -> Vec<(String, String, dto::PermissionReply)> {
+            self.permission_replies.lock().expect("permission lock").clone()
         }
     }
 
@@ -442,6 +642,25 @@ mod tests {
                     |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
                 ));
                 Ok(stream)
+            })
+        }
+
+        fn permission_reply(
+            &self,
+            session_id: &str,
+            request_id: &str,
+            decision: dto::PermissionReply,
+        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.permission_replies
+                .lock()
+                .expect("permission lock")
+                .push((session_id.to_string(), request_id.to_string(), decision));
+            let seen = self.permission_seen.lock().expect("permission lock").take();
+            Box::pin(async move {
+                if let Some(tx) = seen {
+                    let _ = tx.send(());
+                }
+                Ok(())
             })
         }
     }
@@ -719,6 +938,496 @@ mod tests {
                     .expect_err("relative cwd must be rejected");
                 assert_eq!(resp.code, agent_client_protocol::ErrorCode::InvalidParams);
                 Ok(())
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+    }
+
+    // ======================= Wave 3: permission bridging =======================
+
+    /// One fixture-faithful `permission.asked` frame.
+    fn asked_frame(id: &str, call_id: &str, resource: &str) -> dto::SessionEvent {
+        dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+            id: id.into(),
+            sessionID: "ses_mock_1".into(),
+            action: "shell".into(),
+            resources: vec![resource.into()],
+            save: None,
+            metadata: None,
+            source: Some(dto::PermissionSource {
+                kind: Some("tool".into()),
+                messageID: Some("msg_mock_1".into()),
+                id: call_id.into(),
+            }),
+        })
+    }
+
+    /// What the client should answer to each incoming `requestPermission`.
+    #[derive(Clone)]
+    enum ClientReply {
+        /// Respond with this outcome.
+        Outcome(acp::RequestPermissionOutcome),
+        /// Handler failure — simulates a dismissed/failed client request.
+        HandlerError,
+    }
+
+
+    #[tokio::test]
+    async fn permission_asked_forwards_decisions() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            ClientReply::Outcome(acp::RequestPermissionOutcome::Selected(
+                acp::SelectedPermissionOutcome::new("once"),
+            )),
+            ClientReply::Outcome(acp::RequestPermissionOutcome::Selected(
+                acp::SelectedPermissionOutcome::new("always"),
+            )),
+        ])));
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let reply_seen = backend.install_permission_seen();
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    let responses = Arc::clone(&responses);
+                    async move |req: acp::RequestPermissionRequest,
+                                responder: Responder<acp::RequestPermissionResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        match responses.lock().expect("responses lock").pop_front() {
+                            Some(ClientReply::Outcome(outcome)) => {
+                                responder.respond(acp::RequestPermissionResponse::new(outcome))
+                            }
+                            Some(ClientReply::HandlerError) => Err(AcpError::internal_error()),
+                            None => panic!("permission request with no queued client reply"),
+                        }
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp/opencode/acp-fixture-project"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    // Tool input streams, then two asks; the first reuses the
+                    // cached input, the second carries only metadata.
+                    backend.push(dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_mock_1".into(),
+                            id: "call_42b2e3814e6a4745a9d2aa1e".into(),
+                        },
+                        text: r#"{"command": "echo hi"}"#.into(),
+                    }));
+                    backend.push(asked_frame(
+                        "per_0fb5ca336001m94Lbqk9xdVFcC",
+                        "call_42b2e3814e6a4745a9d2aa1e",
+                        "echo hi",
+                    ));
+                    backend.push(dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+                        id: "per_2".into(),
+                        sessionID: "ses_mock_1".into(),
+                        action: "shell".into(),
+                        resources: vec!["echo bye".into()],
+                        save: None,
+                        metadata: Some(serde_json::json!({"confirm": true}).as_object().unwrap().clone()),
+                        source: Some(dto::PermissionSource {
+                            kind: Some("tool".into()),
+                            messageID: Some("msg_mock_1".into()),
+                            id: "call_2".into(),
+                        }),
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("run echo"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // Reply routing table: once → Once · always → Always, targeting the
+        // exact requestIDs of the asks.
+        assert_eq!(
+            backend.recorded_replies(),
+            vec![
+                ("ses_mock_1".to_string(), "per_0fb5ca336001m94Lbqk9xdVFcC".to_string(), dto::PermissionReply::Once),
+                ("ses_mock_1".to_string(), "per_2".to_string(), dto::PermissionReply::Always),
+            ]
+        );
+
+        // The reply forwarding completed before the turn could resume.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_seen)
+            .await
+            .expect("permission replies must reach the backend");
+
+        // Option set construction (official pattern): 3 options, stable ids.
+        let requests = seen_requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2, "one requestPermission per ask");
+        let options = &requests[0].options;
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].option_id.0.as_ref(), "once");
+        assert_eq!(options[0].name, "Allow once");
+        assert_eq!(options[0].kind, acp::PermissionOptionKind::AllowOnce);
+        assert_eq!(options[1].option_id.0.as_ref(), "always");
+        assert_eq!(options[1].name, "Always allow");
+        assert_eq!(options[1].kind, acp::PermissionOptionKind::AllowAlways);
+        assert_eq!(options[2].option_id.0.as_ref(), "reject");
+        assert_eq!(options[2].name, "Reject");
+        assert_eq!(options[2].kind, acp::PermissionOptionKind::RejectOnce);
+
+        // Tool-call construction: id from source.id, title "shell: <cmd>",
+        // state.input = metadata + cached tool input, cwd in locations.
+        let tc = &requests[0].tool_call;
+        assert_eq!(tc.tool_call_id.0.as_ref(), "call_42b2e3814e6a4745a9d2aa1e");
+        assert_eq!(tc.fields.title.as_deref(), Some("shell: echo hi"));
+        assert_eq!(tc.fields.status, Some(acp::ToolCallStatus::Pending));
+        assert_eq!(tc.fields.raw_input, Some(serde_json::json!({ "command": "echo hi" })));
+        let locations = tc.fields.locations.as_ref().expect("locations set");
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path.to_string_lossy(), "/tmp/opencode/acp-fixture-project");
+        // Second ask: metadata-only input (no cached input for call_2).
+        let tc2 = &requests[1].tool_call;
+        assert_eq!(tc2.tool_call_id.0.as_ref(), "call_2");
+        assert_eq!(tc2.fields.title.as_deref(), Some("shell: echo bye"));
+        assert_eq!(
+            tc2.fields.raw_input,
+            Some(serde_json::json!({ "confirm": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_cancelled_or_dismissed_rejects() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            // Client cancelled the prompt turn → the request answers Cancelled.
+            ClientReply::Outcome(acp::RequestPermissionOutcome::Cancelled),
+            // Client-side failure (dismissed transport/UI error) → Err.
+            ClientReply::HandlerError,
+        ])));
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    let responses = Arc::clone(&responses);
+                    async move |req: acp::RequestPermissionRequest,
+                                responder: Responder<acp::RequestPermissionResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        match responses.lock().expect("responses lock").pop_front() {
+                            Some(ClientReply::Outcome(outcome)) => {
+                                responder.respond(acp::RequestPermissionResponse::new(outcome))
+                            }
+                            Some(ClientReply::HandlerError) => Err(AcpError::internal_error()),
+                            None => panic!("permission request with no queued client reply"),
+                        }
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    backend.push(asked_frame("per_c1", "call_c1", "rm -rf /"));
+                    backend.push(asked_frame("per_c2", "call_c2", "sudo rm -rf /"));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("run commands"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // Official semantics: cancelled AND dismissed both reject; the server
+        // reply is uninterruptible.
+        assert_eq!(
+            backend.recorded_replies(),
+            vec![
+                ("ses_mock_1".to_string(), "per_c1".to_string(), dto::PermissionReply::Reject),
+                ("ses_mock_1".to_string(), "per_c2".to_string(), dto::PermissionReply::Reject),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_replied_echo_is_ignored() {
+        // The server echoes our own replies as `permission.replied`; the turn
+        // must not treat it as anything (no requestPermission to the client).
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    let responses = Arc::clone(&responses);
+                    async move |req: acp::RequestPermissionRequest,
+                                responder: Responder<acp::RequestPermissionResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        match responses.lock().expect("responses lock").pop_front() {
+                            Some(ClientReply::Outcome(outcome)) => {
+                                responder.respond(acp::RequestPermissionResponse::new(outcome))
+                            }
+                            Some(ClientReply::HandlerError) => Err(AcpError::internal_error()),
+                            None => panic!("permission request with no queued client reply"),
+                        }
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let _ = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+
+                    backend.push(dto::SessionEvent::PermissionReplied(dto::PermissionReplied {
+                        sessionID: "ses_mock_1".into(),
+                        requestID: "per_ignored".into(),
+                        reply: Some("once".into()),
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            "ses_mock_1",
+                            vec![ContentBlock::Text(TextContent::new("hi"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+        assert!(seen_requests.lock().expect("requests lock").is_empty(), "no client request for the echo");
+        assert!(backend.recorded_replies().is_empty(), "no reply forwarded for the echo");
+    }
+
+    // ======================= Wave 3: stopReason refinement =======================
+
+    #[tokio::test]
+    async fn execution_interrupted_stops_with_cancelled() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let _ = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    backend.push(dto::SessionEvent::ExecutionInterrupted(
+                        dto::SessionRef { sessionID: "ses_mock_1".into() },
+                    ));
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            "ses_mock_1",
+                            vec![ContentBlock::Text(TextContent::new("run"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::Cancelled);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn provider_auth_failure_surfaces_auth_required_error() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let _ = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    backend.push(dto::SessionEvent::ExecutionFailed(dto::ExecutionFailed {
+                        session: dto::SessionRef { sessionID: "ses_mock_1".into() },
+                        error: dto::StructuredError {
+                            kind: Some("provider.auth".into()),
+                            message: Some("provider astra is not authenticated".into()),
+                        },
+                    }));
+                    let resp = cx
+                        .send_request(PromptRequest::new(
+                            "ses_mock_1",
+                            vec![ContentBlock::Text(TextContent::new("run"))],
+                        ))
+                        .block_task()
+                        .await
+                        .expect_err("provider.auth must fail the request");
+                    assert_eq!(
+                        resp.code,
+                        agent_client_protocol::ErrorCode::AuthRequired,
+                        "official authRequired code -32000"
+                    );
+                    assert_eq!(
+                        resp.data.as_ref().and_then(|d| d.get("message")),
+                        Some(&serde_json::json!("provider astra is not authenticated"))
+                    );
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn content_filter_failure_stops_with_refusal() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let _ = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    backend.push(dto::SessionEvent::ExecutionFailed(dto::ExecutionFailed {
+                        session: dto::SessionRef { sessionID: "ses_mock_1".into() },
+                        error: dto::StructuredError {
+                            kind: Some("content-filter".into()),
+                            message: Some("blocked by content policy".into()),
+                        },
+                    }));
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            "ses_mock_1",
+                            vec![ContentBlock::Text(TextContent::new("run"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::Refusal);
+                    Ok(())
+                }
             })
             .await;
 
