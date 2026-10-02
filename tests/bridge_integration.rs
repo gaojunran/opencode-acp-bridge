@@ -1,4 +1,7 @@
-//! Wave 2 (Lane C) integration tests. Both are opt-in via `BRIDGE_IT=1`
+//! Wave 2 (Lane C) integration tests. Both are opt-in via `BRIDGE_IT=1`.
+//! Run with `--test-threads=1`: parallel runs interfere on the shared
+//! scratch server (concurrent session churn can trigger instance reloads
+//! that drop other tests' sessions).
 //! (same gate as Lane A's `integration_lane_a_flow` in src/opencode/api.rs)
 //! and need the scratch 2.0.21 server on 127.0.0.1:47779 with auth
 //! `opencode:test123` — restart it per the recipe at the end of
@@ -160,7 +163,10 @@ async fn lane_c_duplex_e2e() {
                     .send_request(LoadSessionRequest::new(sid.0.clone(), SESSION_DIR))
                     .block_task()
                     .await?;
-                assert!(load.modes.is_none());
+                // Wave 6b+: load responses carry SessionModeState (agent catalog
+                // filtered to primary/all + non-hidden).
+                let modes = load.modes.expect("modes present since wave 6b");
+                assert!(!modes.available_modes.is_empty());
 
                 // 5. cleanup the opencode session.
                 client.delete_session(sid.0.as_ref()).await.expect("delete_session cleanup");

@@ -130,6 +130,13 @@ Working (live-verified against opencode 2.0.21 + a live aft environment):
   `${child.id}:`-prefixed toolCallIds
 - structured turn failures surfaced as ACP errors with the provider message
 - aft dialect: image passthrough + `--no-aft` opt-out (see above)
+- session management: `session/list` (paginated, per-cwd), `session/resume`
+  (zero replay), `session/delete`, advertised via `sessionCapabilities`
+- slash commands pushed via `available_commands_update` after each session
+  lifecycle response
+- modes: opencode agent catalog (primary/all, non-hidden) exposed as ACP
+  modes; `set_mode` → session agent switch; `current_mode_update` on own,
+  remote, and step-started self-heal paths
 
 Not yet (see `docs/opencode-api.md`): form elicitation, retry/compaction
 `session_info` markers and catalog-reload pushes are structure-ready but have
