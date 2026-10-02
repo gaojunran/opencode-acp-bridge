@@ -941,3 +941,158 @@ async fn wave5_aft_image_passthrough_e2e() {
 
     std::fs::remove_dir_all(&png_dir).expect("remove .aft-e2e");
 }
+
+// ---------------------------------------------------------------------------
+// Wave 5.5: files[] structured diff rung — live apply_patch turn on scratch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires BRIDGE_IT=1 (scratch opencode)"]
+async fn wave5_5_apply_patch_files_diff_e2e() {
+    if !it_enabled() {
+        eprintln!("skipped: BRIDGE_IT=1 not set");
+        return;
+    }
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+
+    let client = OpencodeClient::new(SCRATCH, SCRATCH_PASSWORD).expect("valid scratch URL");
+    client
+        .config()
+        .await
+        .unwrap_or_else(|e| panic!("scratch {SCRATCH} unreachable: {e}"));
+
+    let svc = Arc::new(AgentService::new(
+        Arc::new(HttpBackend::new(client.clone())) as Arc<dyn OpenCodeBackend>,
+    ));
+    let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+    let agent_task = tokio::spawn({
+        let svc = Arc::clone(&svc);
+        async move {
+            let _ = svc.serve(agent_side).await;
+        }
+    });
+
+    let all_updates = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+
+    let outcome: Result<(), AcpError> = Client
+        .builder()
+        .name("bridge-it-wave5_5")
+        .on_receive_request(
+            async move |req: acp::RequestPermissionRequest,
+                        responder: Responder<acp::RequestPermissionResponse>,
+                        _cx: ConnectionTo<Agent>| {
+                let _ = req;
+                responder.respond(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        "once",
+                    )),
+                ))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let all_updates = Arc::clone(&all_updates);
+                async move |notif: SessionNotification, _cx| {
+                    all_updates.lock().expect("updates lock").push(notif);
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_side, {
+            let client = client.clone();
+            async move |cx| {
+                let _init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(FIXTURE_DIR.to_string()))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+
+                client
+                    .set_model(
+                        &sid.0,
+                        &ModelRef {
+                            id: MODEL_ID.into(),
+                            providerID: MODEL_PROVIDER.into(),
+                            variant: None,
+                        },
+                    )
+                    .await
+                    .expect("set_model on scratch");
+
+                let prompt = cx.send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new(
+                        "Use the apply_patch tool to add a new file files-rung-e2e.txt \
+                         containing exactly one line: rung-ok. Then reply DONE.",
+                    ))],
+                ));
+                let resp =
+                    match tokio::time::timeout(Duration::from_secs(180), prompt.block_task()).await
+                    {
+                        Ok(r) => r?,
+                        Err(_) => panic!("apply_patch turn did not finish within 180s"),
+                    };
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+                client.delete_session(sid.0.as_ref()).await.expect("delete_session cleanup");
+                Ok(())
+            }
+        })
+        .await;
+
+    agent_task.abort();
+    outcome.expect("wave5_5 client run ok");
+    let updates = all_updates.lock().expect("updates lock").clone();
+    assert!(!updates.is_empty(), "no session updates collected");
+
+    // ② rung: apply_patch diff blocks come from files[].filePath (absolute,
+    // not inferred from the Index: header), type=add forces old_text=None.
+    let mut saw_diff = false;
+    for n in &updates {
+        let SessionUpdate::ToolCallUpdate(u) = &n.update else {
+            continue;
+        };
+        if u.fields.status != Some(ToolCallStatus::Completed) {
+            continue;
+        }
+        let Some(blocks) = &u.fields.content else { continue };
+        for b in blocks {
+            let ToolCallContent::Diff(d) = b else { continue };
+            assert!(
+                d.path.to_string_lossy().ends_with("files-rung-e2e.txt"),
+                "diff path must be the absolute files[].filePath, got {}",
+                d.path.display()
+            );
+            assert!(
+                d.new_text.contains("rung-ok"),
+                "new_text must carry the added line, got {:?}",
+                d.new_text
+            );
+            assert!(
+                d.old_text.is_none(),
+                "type=add must force old_text=None, got {:?}",
+                d.old_text
+            );
+            saw_diff = true;
+        }
+    }
+    assert!(
+        saw_diff,
+        "apply_patch turn must produce a diff block via the files[] rung ({} updates)",
+        updates.len()
+    );
+
+    let _ = std::fs::remove_file(format!("{FIXTURE_DIR}/files-rung-e2e.txt"));
+}
