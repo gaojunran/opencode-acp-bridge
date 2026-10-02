@@ -82,22 +82,53 @@ named in the message. Logs go to stderr — Zed collects them in its per-agent
 debug log. Exit codes: `0` normal, `1` probe/resolution failure, `2` usage
 error.
 
+## AFT compatibility (tool-call hoist)
+
+With the [`@cortexkit/aft-opencode`](https://www.npmjs.com/package/@cortexkit/aft-opencode)
+plugin active, seven built-in tools (read/edit/write/apply_patch/bash/grep/glob)
+are replaced by same-name registrations. The SSE event stream keeps the core
+shape — tool names, event taxonomy, and envelopes are unchanged — so most of
+the bridge works unmodified. What differs, and how it is handled (all rows
+wire-verified against a live aft v0.58.0 environment; captures in
+`tests/fixtures/aft-*.sse`):
+
+| aft behavior | Wire effect | Bridge handling |
+| --- | --- | --- |
+| Same-name tool replacement | Stream undeformed: same tool names, same event types | No change needed — all existing mappings apply |
+| `edit` / `write` results | `metadata.filediff` identical in shape to core | Diff blocks via the primary `filediff` path (unchanged) |
+| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` | Diff blocks via the existing diff-string fallback chain |
+| `read` on an image | Content part `{type:"file", uri:"data:<mime>;base64,…", mime:"image/png"}` | Mapped to an ACP image content block (base64 payload + `mime_type`, original `uri` preserved) — previously dropped as unknown |
+| Tool input args | Model's raw parameters (aft canonicalizes on a copy) | Permission `toolCall` construction works unchanged |
+| Non-image or non-data-URI file parts | Not observed on the wire | Skipped — never guessed (`#[serde(other)]` sink) |
+| `--no-aft` flag | — | Disables the file/image passthrough only; diff extraction stays on (dialect-neutral) |
+
+Note the contrast with the official adapter: it builds diff blocks from the
+edit tool's `input.oldString/newString`, which is empty under aft's hoist —
+this bridge reads result metadata instead, so the same code path covers both
+dialects. Image delivery itself does not depend on the relay: the image block
+is emitted with the tool result; whether the *turn* then completes depends on
+the model provider accepting image input.
+
 ## Status
 
-Working (live-verified against opencode 2.0.21):
+Working (live-verified against opencode 2.0.21 + a live aft environment):
 
 - session/new + load with full history replay (before the response, per ACP
   contract)
 - prompt → streaming text/reasoning/tool events, turn end via
   `session.execution.*`
 - tool-call state machine incl. diff content blocks (#52636 fix)
-- cancel → `interrupt`
-- permission loop: `permission.asked` → ACP `requestPermission` (Wave 3,
-  landing now) — wire contract live-verified end to end
+- cancel → `interrupt` (with bounded drain of in-flight tools)
+- permission loop: `permission.asked` → ACP `requestPermission` → reply
+  routing (incl. child sessions)
+- child-session projection (#48232): child tool events forwarded under
+  `${child.id}:`-prefixed toolCallIds
+- structured turn failures surfaced as ACP errors with the provider message
+- aft dialect: image passthrough + `--no-aft` opt-out (see above)
 
-Not yet (Wave 4 backlog — see `docs/opencode-api.md`): child-session
-forwarding, form elicitation, compaction/retry markers, config-option pushes,
-cancel drain details.
+Not yet (see `docs/opencode-api.md`): form elicitation, retry/compaction
+`session_info` markers and catalog-reload pushes are structure-ready but have
+no wire event on 2.0.21 to trigger them live.
 
 ## Wire contract
 
