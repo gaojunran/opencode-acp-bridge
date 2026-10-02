@@ -503,6 +503,7 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
         dto::SessionEvent::UsageUpdated(u) => Some(&u.session.sessionID),
         dto::SessionEvent::Renamed(r) => Some(&r.session.sessionID),
         dto::SessionEvent::SessionCreated(_) => None,
+        dto::SessionEvent::AgentSelected(sel) => Some(&sel.sessionID),
     }
 }
 

@@ -397,6 +397,38 @@ working). `cctq/*` gave `provider.no-route`. CodeBuddy lacks its token in scratc
 Integration tests must be opt-in via env (`BRIDGE_IT=1`) so plain `cargo test` stays
 hermetic (fixtures only).
 
+## Modes (agent ↔ ACP mode mapping, wire-verified 2.0.21)
+
+1. **Agent catalog**: `GET /api/agent?location[directory]=<cwd>` — the
+   `location[directory]` deepObject query is MANDATORY; omitted, the endpoint
+   returns an empty list (Lane A `agents()` once hit this).
+   `{location, data: Agent.Info[]}`, fields `id, name, mode, hidden,
+   description, color, model, request, system, steps, permissions`;
+   `mode ∈ {subagent, primary, all}`.
+2. **Mode filtering**: an agent is a mode iff `mode ∈ {primary, all}` AND
+   `hidden == false`. On the scratch fixture (18 agents) that leaves
+   `orchestrator` + `build` (explorer/fixer are subagents; compaction/title/
+   dreamer-* are hidden internals).
+3. **Switch**: `POST /api/session/{id}/agent` body `{"agent": "<id>"}` → 204
+   no body (the ACP `session/set_mode` wire).
+4. **Switch event**: SSE `session.agent.selected` `{sessionID, agent}` — sent
+   for BOTH own and remote switches. The bridge tracks the mode and emits
+   `current_mode_update` only on an actual tracked-value change: a remote
+   switch updates, the own-switch echo diffs to zero and stays suppressed.
+5. **Default agent**: new sessions start on `orchestrator` (fixture
+   step.started empirical: parent sessions all run orchestrator) — this is
+   the newSession/load/resume `currentModeId` default.
+6. **Message records carry the agent**: assistant messages
+   `{"type":"assistant", ..., "agent":"orchestrator", "model":{...}}` —
+   the load/resume `currentModeId` source (the LAST assistant message's
+   agent; no assistant message → `orchestrator`).
+7. **Schema**: `SessionModeState.current_mode_id` is REQUIRED (not Option);
+   `SessionMode{id, name, description?}`.
+
+Self-heal: a `step.started.agent` differing from the tracked value (e.g. the
+server config changed the default agent) updates the tracked mode and emits
+`current_mode_update` once.
+
 ## Governance for lanes
 
 - `src/dto.rs` is the shared contract. Lanes may **add** fields (with serde defaults)

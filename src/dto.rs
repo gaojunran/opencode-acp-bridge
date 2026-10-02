@@ -127,10 +127,10 @@ pub struct ProviderInfo {
     pub package: Option<String>,
 }
 
-// Agent/command/skill shapes: model from fixtures when needed (agents.json).
-// Untyped for now — the bridge's ACP surface (modes/commands/skills) can start
-// from these raw values.
-pub type AgentInfo = Value;
+// Command/skill shapes: model from fixtures when needed (agents.json).
+// Untyped for now — the bridge's ACP surface (commands/skills) can start
+// from these raw values. `AgentInfo` is the typed catalog entry below
+// (Wave 6b).
 pub type CommandInfo = Value;
 pub type SkillInfo = Value;
 
@@ -746,6 +746,33 @@ pub struct PermissionReplied {
     pub reply: Option<String>,
 }
 
+/// One entry of the agent catalog (`GET /api/agent` → Agent.Info,
+/// wire-verified on 2.0.21): the ACP mode-list source. `mode` is
+/// `subagent | primary | all`; `hidden` marks internal agents
+/// (compaction/title/dreamer-*) that must not surface as modes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    /// `subagent` | `primary` | `all`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Payload of the `session.agent.selected` SSE event (wire-verified on
+/// 2.0.21): the agent running a session changed. Emitted for both own
+/// switches (the bridge's own `/agent` POST echo) and remote switches
+/// (UI/settings); the ACP layer suppresses the own-switch echo.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionAgentSelected {
+    pub sessionID: String,
+    pub agent: String,
+}
+
 /// Typed decoding of the event kinds the bridge maps to ACP updates.
 ///
 /// The `permission.*` pair is verified on the wire (both fixtures in
@@ -812,6 +839,11 @@ pub enum SessionEvent {
     UsageUpdated(UsageUpdated),
     Renamed(SessionRenamed),
     SessionCreated(SessionCreated),
+    /// `session.agent.selected` — the session's agent changed (own-switch
+    /// echo or remote switch). Not mapped to an ACP update by the mapping
+    /// layer: the agent layer consumes it for `current_mode_update`
+    /// tracking (with echo suppression).
+    AgentSelected(SessionAgentSelected),
 }
 
 fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
@@ -854,6 +886,7 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.usage.updated" => parse(data).map(SessionEvent::UsageUpdated),
         "session.renamed" => parse(data).map(SessionEvent::Renamed),
         "session.created" => parse(data).map(SessionEvent::SessionCreated),
+        "session.agent.selected" => parse(data).map(SessionEvent::AgentSelected),
         _ => None,
     }
 }

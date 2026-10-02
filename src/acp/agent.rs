@@ -107,6 +107,21 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     fn delete_session(&self, _session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         Box::pin(async { Err(anyhow::anyhow!("delete_session not available on this backend")) })
     }
+
+    /// Wave 6b: the agent catalog for a directory (`GET /api/agent` with
+    /// the deepObject `location[directory]` filter — the ACP mode list
+    /// source). Default: unavailable (wave boundary); the live override
+    /// landed on `HttpBackend` this wave.
+    fn agents(&self, _directory: &str) -> BoxFuture<'_, Result<Vec<dto::AgentInfo>, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("agents not available on this backend")) })
+    }
+
+    /// Wave 6b: switch the agent running a session (`POST
+    /// /api/session/{id}/agent`, the `session/set_mode` wire). Default:
+    /// unavailable (wave boundary); live override on `HttpBackend`.
+    fn set_agent(&self, _session_id: &str, _agent: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("set_agent not available on this backend")) })
+    }
 }
 
 /// The ACP agent service: state + handler wiring.
@@ -129,6 +144,14 @@ struct SessionEntry {
     /// `loadSession.cwd`), used as the tool-call location on permission
     /// prompts (mirrors the official adapter's `cwd` for shell tools).
     cwd: String,
+    /// Tracked ACP mode (the opencode agent id). Established by the
+    /// lifecycle responses (newSession → "orchestrator", load/resume → the
+    /// last assistant message's agent); updated by `session/set_mode`, the
+    /// `session.agent.selected` SSE event and (self-heal) mismatched
+    /// `step.started` agents. `current_mode_update` fires only when this
+    /// value actually changes — which is what suppresses the own-switch
+    /// SSE echo.
+    mode: Mutex<Option<String>>,
 }
 
 impl AgentService {
@@ -209,6 +232,16 @@ impl AgentService {
                     let svc = Arc::clone(&self);
                     async move |req: acp::DeleteSessionRequest, responder, _cx| {
                         svc.delete_session(req, responder).await
+                    }
+                },
+                on_receive_request!(),
+            )
+            // ---------- setMode ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::SetSessionModeRequest, responder, cx| {
+                        svc.set_mode(req, responder, cx).await
                     }
                 },
                 on_receive_request!(),
@@ -305,16 +338,30 @@ impl AgentService {
                 ));
             }
         };
+        // Wave 6b: the mode list from the agent catalog (degraded to empty
+        // on failure — session creation must not fail on metadata), and the
+        // opencode 2.0.21 default agent as the initial mode.
+        let agents = match self.backend.agents(&cwd).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "agents fetch failed — empty mode list");
+                Vec::new()
+            }
+        };
+        let modes = to_session_modes(&agents);
+        let current = "orchestrator";
+        let mode_state = acp::SessionModeState::new(current, modes);
         self.sessions.lock().expect("sessions lock").insert(
             acp::SessionId::from(session_id.clone()),
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: cwd.clone(),
+                mode: Mutex::new(Some(current.to_string())),
             }),
         );
-        tracing::info!(session_id, "ACP newSession -> opencode session");
+        tracing::info!(session_id, modes = %mode_state.available_modes.len(), current_mode = current, "ACP newSession -> opencode session");
         let session_id = acp::SessionId::from(session_id);
-        responder.respond(acp::NewSessionResponse::new(session_id.clone()))?;
+        responder.respond(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state))?;
         // Wave 6a: initial `available_commands_update` push, AFTER the
         // response, spawned so the fetch can never gate session creation.
         self.spawn_commands_push(&session_id, &cx);
@@ -352,15 +399,45 @@ impl AgentService {
         responder.respond(acp::ListSessionsResponse::new(mapped).next_cursor(next))
     }
 
+    /// Wave 6b: the mode list for a session's directory — the agent
+    /// catalog filtered to visible primary/all agents. Degraded to empty
+    /// on fetch failure (a lifecycle response must not fail on metadata).
+    async fn fetch_modes(&self, cwd: &str) -> Vec<acp::SessionMode> {
+        match self.backend.agents(cwd).await {
+            Ok(agents) => to_session_modes(&agents),
+            Err(e) => {
+                tracing::warn!(error = %e, "agents fetch failed — empty mode list");
+                Vec::new()
+            }
+        }
+    }
+
     /// Wave 6a `session/resume`: like `session/load` (register the session
     /// so a later prompt works) but WITHOUT replaying history — the response
-    /// carries only modes/configOptions (both `None` here, matching load).
+    /// carries only modes/configOptions (both populated modes here; no
+    /// configOptions). Messages are fetched for the currentModeId metadata
+    /// only; nothing is replayed.
     async fn resume_session(
         self: &Arc<Self>,
         req: acp::ResumeSessionRequest,
         responder: Responder<acp::ResumeSessionResponse>,
         cx: ConnectionTo<Client>,
     ) -> Result<(), AcpError> {
+        // Metadata pass: last assistant message's agent → current mode.
+        // A fetch failure degrades to the default (resume must not fail).
+        let records = match self.backend.messages(&req.session_id.0).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %req.session_id, "resume: messages fetch failed (mode falls back to default)");
+                Vec::new()
+            }
+        };
+        let current = last_assistant_agent(&records)
+            .unwrap_or_else(|| "orchestrator".to_string());
+        let mode_state = acp::SessionModeState::new(
+            current.clone(),
+            self.fetch_modes(&req.cwd.to_string_lossy()).await,
+        );
         // Register unconditionally — the client may resume a session this
         // bridge never loaded, and the next prompt must still route.
         self.sessions.lock().expect("sessions lock").insert(
@@ -368,13 +445,56 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
+                mode: Mutex::new(Some(current)),
             }),
         );
         tracing::info!(session = %req.session_id, "ACP session/resume (no replay)");
-        responder.respond(acp::ResumeSessionResponse::new())?;
+        responder.respond(acp::ResumeSessionResponse::new().modes(mode_state))?;
         // Wave 6a: initial `available_commands_update` push, after the
         // response (spawned — never gate the resume).
         self.spawn_commands_push(&req.session_id, &cx);
+        Ok(())
+    }
+
+    /// Wave 6b `session/set_mode`: switch the opencode agent running the
+    /// session (`POST /api/session/{id}/agent` body `{"agent": modeId}` →
+    /// 204 → empty ACP response). Tracks the mode FIRST, then emits exactly
+    /// one `current_mode_update` — the server's own-switch SSE echo
+    /// (`session.agent.selected` with the same agent) then diffs to zero
+    /// against the tracked value and stays suppressed.
+    async fn set_mode(
+        self: &Arc<Self>,
+        req: acp::SetSessionModeRequest,
+        responder: Responder<acp::SetSessionModeResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let Some(entry) = self
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .get(&req.session_id)
+            .cloned()
+        else {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "message": "set_mode: unknown session"
+                })),
+            );
+        };
+        if let Err(e) = self.backend.set_agent(&req.session_id.0, &req.mode_id.0).await {
+            tracing::error!(error = %e, session = %req.session_id, mode = %req.mode_id, "set_agent failed");
+            return responder.respond_with_internal_error(format!(
+                "opencode agent switch failed: {e}"
+            ));
+        }
+        let mode = req.mode_id.0.to_string();
+        *entry.mode.lock().expect("mode lock") = Some(mode.clone());
+        tracing::info!(session = %req.session_id, mode, "session/set_mode -> opencode agent");
+        responder.respond(acp::SetSessionModeResponse::new())?;
+        cx.send_notification(acp::SessionNotification::new(
+            req.session_id.clone(),
+            acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(mode)),
+        ))?;
         Ok(())
     }
 
@@ -422,15 +542,23 @@ impl AgentService {
                 update,
             ))?;
         }
+        // Wave 6b: current mode = the last assistant message's agent
+        // (wire fact: assistant messages carry `agent`); no assistant
+        // message yet → the opencode default. Mode list from the catalog.
+        let current = last_assistant_agent(&records)
+            .unwrap_or_else(|| "orchestrator".to_string());
+        let modes = self.fetch_modes(&req.cwd.to_string_lossy()).await;
+        let mode_state = acp::SessionModeState::new(current.clone(), modes);
         // Refresh state so a subsequent prompt on this session works.
         self.sessions.lock().expect("sessions lock").insert(
             req.session_id.clone(),
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
+                mode: Mutex::new(Some(current)),
             }),
         );
-        responder.respond(acp::LoadSessionResponse::new())?;
+        responder.respond(acp::LoadSessionResponse::new().modes(mode_state))?;
         // Wave 6a: initial `available_commands_update` push, after the
         // response (spawned — never gate the load).
         self.spawn_commands_push(&req.session_id, &cx);
@@ -579,6 +707,65 @@ impl AgentService {
                     window_ms = self.drain_window.as_millis(),
                     "turn cancelled via session/cancel — draining in-flight events"
                 );
+            }
+
+            // ---------- mode tracking (Wave 6b) ----------
+            // `session.agent.selected` (own-switch echo + remote switches)
+            // and `step.started.agent` (self-heal: the server ran a
+            // different agent than tracked — e.g. a config default change)
+            // drive the tracked mode; `current_mode_update` fires only on
+            // an ACTUAL change. Own-switch echo suppression falls out of
+            // this: set_mode updated the tracked value first, so the echo
+            // diffs to zero. Only the parent session's events are tracked
+            // (children's ride their own sessionID and are dropped by the
+            // session filter above; during the cancel drain mode pushes
+            // are muted).
+            if !draining {
+                let event_agent: Option<&str> = match &event {
+                    dto::SessionEvent::AgentSelected(sel)
+                        if sel.sessionID == req.session_id.0.as_ref() =>
+                    {
+                        Some(&sel.agent)
+                    }
+                    dto::SessionEvent::StepStarted(s)
+                        if s.session.sessionID == req.session_id.0.as_ref() =>
+                    {
+                        s.agent.as_deref()
+                    }
+                    _ => None,
+                };
+                if let Some(agent) = event_agent {
+                    let changed = {
+                        let mut mode = entry.mode.lock().expect("mode lock");
+                        if mode.as_deref() != Some(agent) {
+                            *mode = Some(agent.to_string());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        tracing::info!(session = %req.session_id, agent, "current mode -> {agent}");
+                        cx.send_notification(acp::SessionNotification::new(
+                            req.session_id.clone(),
+                            acp::SessionUpdate::CurrentModeUpdate(
+                                acp::CurrentModeUpdate::new(agent.to_string()),
+                            ),
+                        ))?;
+                    } else {
+                        tracing::debug!(
+                            session = %req.session_id,
+                            agent,
+                            "agent echo suppressed (tracked mode unchanged)"
+                        );
+                    }
+                    // `AgentSelected` has no ACP update mapping — consume
+                    // it here; `StepStarted` continues to the mapping below
+                    // (retry-clear bookkeeping).
+                    if matches!(event, dto::SessionEvent::AgentSelected(_)) {
+                        continue;
+                    }
+                }
             }
 
             // ---------- permission bridging (Wave 3) ----------
@@ -1085,6 +1272,36 @@ pub fn epoch_ms_to_iso(epoch_ms: i64) -> Option<String> {
     Some(format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z"))
 }
 
+/// Wave 6b: filter the wire agent catalog into the ACP mode list. Wire
+/// rules (2.0.21): modes are `mode ∈ {primary, all}` (subagents are
+/// `subagent`), and `hidden == false` (compaction/title/dreamer-* are
+/// hidden internals). Sorted by wire order (the server returns them in
+/// config order: orchestrator, build, …).
+fn to_session_modes(agents: &[dto::AgentInfo]) -> Vec<acp::SessionMode> {
+    agents
+        .iter()
+        .filter(|a| !a.hidden && matches!(a.mode.as_deref(), Some("primary") | Some("all")))
+        .map(|a| {
+            let mut mode = acp::SessionMode::new(a.id.clone(), a.name.clone());
+            if let Some(d) = &a.description {
+                mode = mode.description(d.clone());
+            }
+            mode
+        })
+        .collect()
+}
+
+/// Wave 6b: the last assistant message's `agent` field (the currentModeId
+/// source for load/resume), or `None` when the session has no assistant
+/// message yet (callers fall back to the opencode default agent).
+fn last_assistant_agent(records: &[dto::MessageRecord]) -> Option<String> {
+    records
+        .iter()
+        .rev()
+        .find(|r| r.kind == "assistant")
+        .and_then(|r| r.agent.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,15 +1310,18 @@ mod tests {
         CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
         PromptRequest, SessionNotification, TextContent,
     };
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{broadcast, oneshot};
 
     // ---------------- mock backend ----------------
 
-    #[derive(Default)]
     struct MockBackend {
-        /// Event queue handed out once, on the first `event_stream` call.
-        events: Mutex<Option<mpsc::UnboundedReceiver<dto::SessionEvent>>>,
-        events_tx: Mutex<Option<mpsc::UnboundedSender<dto::SessionEvent>>>,
+        /// Wave 6b: event bus for the turn loop. A broadcast sender carries
+    /// mid-turn pushes to the LIVE stream; pushes made while no stream is
+    /// subscribed (between turns) land in `pending` for the next prompt's
+    /// stream. Multi-turn tests get exact per-turn delivery: no loss, no
+    /// stale replay.
+    events_tx: Mutex<broadcast::Sender<dto::SessionEvent>>,
+    pending: Mutex<Vec<dto::SessionEvent>>,
         messages_out: Mutex<Option<Vec<dto::MessageRecord>>>,
         /// Wave 6a: set by `messages()` — resume must never call it.
         messages_called: AtomicBool,
@@ -1123,14 +1343,18 @@ mod tests {
         /// Wave 6a: optional gate — `list_commands` blocks until released
         /// (proves the lifecycle response is not gated on the catalog fetch).
         commands_gate: Mutex<Option<oneshot::Receiver<()>>>,
+        /// Wave 6b: canned agent catalog (the ACP mode list source).
+        agents_out: Mutex<Option<Vec<dto::AgentInfo>>>,
+        /// Wave 6b: every (session_id, agent) passed to `set_agent`.
+        set_agent_calls: Mutex<Vec<(String, String)>>,
     }
 
     impl MockBackend {
         fn new() -> Arc<Self> {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, _rx) = broadcast::channel(1024);
             Arc::new(Self {
-                events: Mutex::new(Some(rx)),
-                events_tx: Mutex::new(Some(tx)),
+                events_tx: Mutex::new(tx),
+                pending: Mutex::new(Vec::new()),
                 messages_out: Mutex::new(None),
                 messages_called: AtomicBool::new(false),
                 interrupted: AtomicBool::new(false),
@@ -1143,13 +1367,20 @@ mod tests {
                 deleted: Mutex::new(Vec::new()),
                 commands: Mutex::new(None),
                 commands_gate: Mutex::new(None),
+                agents_out: Mutex::new(None),
+                set_agent_calls: Mutex::new(Vec::new()),
             })
         }
 
         fn push(&self, event: dto::SessionEvent) {
-            let tx = self.events_tx.lock().expect("tx lock");
-            let Some(tx) = tx.as_ref() else { panic!("backend already consumed") };
-            let _ = tx.send(event);
+            // Both copies, deliberately: `pending` is drained by the next
+            // stream (events pushed between turns, or while the previous
+            // stream's drop is still settling), the broadcast reaches a
+            // mid-turn push to the running stream. A push consumed by a
+            // live stream leaves a pending copy that only matters if
+            // another turn starts before it is drained — no test does that.
+            self.pending.lock().expect("pending lock").push(event.clone());
+            let _ = self.events_tx.lock().expect("tx lock").send(event);
         }
 
         fn set_messages(&self, records: Vec<dto::MessageRecord>) {
@@ -1170,6 +1401,14 @@ mod tests {
 
         fn set_commands(&self, commands: Vec<serde_json::Value>) {
             *self.commands.lock().expect("commands lock") = Some(commands);
+        }
+
+        fn set_agents(&self, agents: Vec<dto::AgentInfo>) {
+            *self.agents_out.lock().expect("agents lock") = Some(agents);
+        }
+
+        fn recorded_set_agent_calls(&self) -> Vec<(String, String)> {
+            self.set_agent_calls.lock().expect("set_agent lock").clone()
         }
 
         /// Block the next `list_commands` call until the returned sender
@@ -1236,13 +1475,24 @@ mod tests {
             &self,
             _session_id: &str,
         ) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
-            let rx =
-                self.events.lock().expect("events lock").take().expect("stream already taken");
+            // One stream per prompt. Events pushed between turns were parked
+            // in `pending`; the fresh subscription only sees pushes that
+            // happen after it (tokio broadcast semantics).
+            let ledger = std::mem::take(&mut *self.pending.lock().expect("pending lock"));
+            let tx = self.events_tx.lock().expect("tx lock").clone();
             Box::pin(async move {
-                let stream: EventStream = Box::pin(futures_util::stream::unfold(
-                    rx,
-                    |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
-                ));
+                let rx = tx.subscribe();
+                let live = futures_util::stream::unfold(rx, |mut rx| async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => return Some((event, rx)),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                });
+                let stream: EventStream =
+                    Box::pin(futures_util::stream::iter(ledger).chain(live));
                 Ok(stream)
             })
         }
@@ -1306,6 +1556,19 @@ mod tests {
 
         fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
             self.deleted.lock().expect("deleted lock").push(session_id.to_string());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn agents(&self, _directory: &str) -> BoxFuture<'_, Result<Vec<dto::AgentInfo>, anyhow::Error>> {
+            let out = self.agents_out.lock().expect("agents lock").clone();
+            Box::pin(async move { Ok(out.unwrap_or_default()) })
+        }
+
+        fn set_agent(&self, session_id: &str, agent: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.set_agent_calls
+                .lock()
+                .expect("set_agent lock")
+                .push((session_id.to_string(), agent.to_string()));
             Box::pin(async { Ok(()) })
         }
     }
@@ -1454,7 +1717,11 @@ mod tests {
                     ))
                     .block_task()
                     .await?;
-                assert!(resp.modes.is_none());
+                // Wave 6b: modes populated (fixture records hold no
+                // assistant agent → opencode default).
+                let modes = resp.modes.expect("load carries the mode state");
+                assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
+                assert!(modes.available_modes.is_empty(), "mock has no agent catalog");
                 Ok(())
             })
             .await;
@@ -2725,7 +2992,10 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-            assert!(resp.modes.is_none());
+            // Wave 6b: no assistant message → default mode, empty catalog.
+            let modes = resp.modes.expect("resume carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
+            assert!(modes.available_modes.is_empty());
             assert!(resp.config_options.is_none());
             // No command catalog → no push; the resumed session is registered,
             // so a prompt must route (and end) normally.
@@ -2744,9 +3014,11 @@ mod tests {
         })
         .await;
         outcome.expect("client run ok");
+        // Wave 6b: resume fetches messages for the currentModeId metadata
+        // (nothing else — the replay path stays closed).
         assert!(
-            !backend.messages_called.load(Ordering::SeqCst),
-            "resume must not fetch persisted history"
+            backend.messages_called.load(Ordering::SeqCst),
+            "resume fetches messages for the mode metadata"
         );
         let notifications = collected.lock().expect("collected lock");
         assert!(
@@ -2864,7 +3136,10 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-            assert!(resume.modes.is_none());
+            // Wave 6b: empty catalog → empty modes, current from messages
+            // (mock message store is empty → default).
+            let modes = resume.modes.expect("resume carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
             // Both pushes are spawned after their responses — wait for both.
             wait_for(&collected, |n| commands_pushes(n).len() >= 2).await;
             Ok(())
@@ -2901,5 +3176,293 @@ mod tests {
         // Leap day, pre-epoch, and epoch boundaries.
         assert_eq!(epoch_ms_to_iso(951_782_400_000), Some("2000-02-29T00:00:00Z".into()));
         assert_eq!(epoch_ms_to_iso(-1), Some("1969-12-31T23:59:59Z".into()));
+    }
+
+    // ======================= Wave 6b: modes =======================
+
+    fn wire_agent(id: &str, mode: &str, hidden: bool, description: Option<&str>) -> dto::AgentInfo {
+        dto::AgentInfo {
+            id: id.into(),
+            name: id.into(),
+            mode: Some(mode.into()),
+            hidden,
+            description: description.map(str::to_string),
+        }
+    }
+
+    fn agent_selected(sid: &str, agent: &str) -> dto::SessionEvent {
+        dto::SessionEvent::AgentSelected(dto::SessionAgentSelected {
+            sessionID: sid.into(),
+            agent: agent.into(),
+        })
+    }
+
+    fn wire_msg(kind: &str, agent: Option<&str>) -> dto::MessageRecord {
+        dto::MessageRecord {
+            kind: kind.into(),
+            id: format!("{kind}-rec"),
+            text: None,
+            agent: agent.map(str::to_string),
+            model: None,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        }
+    }
+
+    fn mode_updates(n: &[SessionNotification]) -> Vec<&acp::CurrentModeUpdate> {
+        n.iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::CurrentModeUpdate(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn new_session_responds_with_filtered_modes_and_default_mode() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, Some("plans and delegates")),
+            wire_agent("build", "primary", false, None),
+            // subagents must not surface as modes…
+            wire_agent("explorer", "subagent", false, None),
+            wire_agent("fixer", "subagent", false, None),
+            // …nor hidden internals…
+            wire_agent("compaction", "primary", true, None),
+            wire_agent("title", "primary", true, None),
+            // …but `all` counts as a mode.
+            wire_agent("dreamer-x", "all", false, None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let modes = ns.modes.expect("newSession carries the mode state");
+            // 2.0.21 default agent.
+            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
+            // Filtered: primary/all + !hidden, wire order preserved.
+            let ids: Vec<&str> = modes
+                .available_modes
+                .iter()
+                .map(|m| m.id.0.as_ref())
+                .collect();
+            assert_eq!(ids, vec!["orchestrator", "build", "dreamer-x"]);
+            assert_eq!(
+                modes.available_modes[0].description.as_deref(),
+                Some("plans and delegates"),
+                "description passthrough"
+            );
+            assert_eq!(modes.available_modes[1].name.as_str(), "build");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn set_mode_calls_wire_emits_single_update_and_rejects_unknown_session() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // Unknown session → invalid_params, no wire call.
+            let err = cx
+                .send_request(acp::SetSessionModeRequest::new("ses_unknown", "build"))
+                .block_task()
+                .await
+                .expect_err("unknown session must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            // Known session → empty response.
+            let _ = cx
+                .send_request(acp::SetSessionModeRequest::new(sid, "build"))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(
+            backend.recorded_set_agent_calls(),
+            vec![("ses_mock_1".to_string(), "build".to_string())],
+            "exactly one wire switch, for the known session"
+        );
+        let notifications = collected.lock().expect("collected lock");
+        let updates = mode_updates(&notifications);
+        assert_eq!(updates.len(), 1, "exactly one current_mode_update on set_mode");
+        assert_eq!(updates[0].current_mode_id.0.as_ref(), "build");
+    }
+
+    #[tokio::test]
+    async fn agent_selected_remote_switch_emits_update_then_echo_stays_suppressed() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // Turn 1: a REMOTE switch to build (agent differs from the
+            // tracked default) → one current_mode_update.
+            backend.push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            backend.push(agent_selected(&sid.0, "build"));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // Turn 2: the own-switch echo (same agent) → suppressed.
+            backend.push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            backend.push(agent_selected(&sid.0, "build"));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        let updates = mode_updates(&notifications);
+        assert_eq!(
+            updates.len(),
+            1,
+            "remote switch emits once; the same-agent echo stays suppressed"
+        );
+        assert_eq!(updates[0].current_mode_id.0.as_ref(), "build");
+    }
+
+    #[tokio::test]
+    async fn step_started_self_heals_desynced_tracked_mode() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let started = |agent: Option<&str>| {
+                dto::SessionEvent::StepStarted(dto::StepStarted {
+                    session: dto::SessionRef { sessionID: sid.0.to_string() },
+                    agent: agent.map(str::to_string),
+                    model: None,
+                    assistantMessageID: "msg_x".into(),
+                    snapshot: None,
+                    started: None,
+                })
+            };
+            // Turn 1: the server runs `build` although the tracked mode is
+            // the default (config default agent) → self-heal update.
+            backend.push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            backend.push(started(Some("build")));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // Turn 2: still build → the tracked value matches, no update.
+            backend.push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            backend.push(started(Some("build")));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: sid.0.to_string(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        let updates = mode_updates(&notifications);
+        assert_eq!(updates.len(), 1, "self-heal fires once on the desync");
+        assert_eq!(updates[0].current_mode_id.0.as_ref(), "build");
+    }
+
+    #[tokio::test]
+    async fn load_and_resume_use_last_assistant_agent_as_current_mode() {
+        let backend = MockBackend::new();
+        backend.set_messages(vec![
+            wire_msg("user", None),
+            wire_msg("assistant", Some("build")),
+            wire_msg("idle", None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // Load: the LAST assistant message's agent.
+            let load = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let modes = load.modes.expect("load carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "build");
+            // Resume: same rule (fresh message fetch — the load consumed the
+            // mock store, so set it again; newest assistant wins).
+            backend.set_messages(vec![
+                wire_msg("user", None),
+                wire_msg("assistant", Some("build")),
+                wire_msg("assistant", Some("orchestrator")),
+            ]);
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let modes = resume.modes.expect("resume carries the mode state");
+            assert_eq!(
+                modes.current_mode_id.0.as_ref(),
+                "orchestrator",
+                "newest assistant message wins"
+            );
+            // No assistant messages at all → default.
+            backend.set_messages(vec![wire_msg("user", None)]);
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let modes = resume.modes.expect("resume carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator", "no assistant -> default");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
     }
 }

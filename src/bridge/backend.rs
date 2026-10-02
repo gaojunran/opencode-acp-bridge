@@ -11,7 +11,7 @@
 
 use futures_util::StreamExt;
 
-use crate::acp::agent::{BoxFuture, EventStream, OpenCodeBackend};
+use crate::acp::agent::{BoxFuture, EventStream, OpenCodeBackend, SessionList};
 use crate::dto::{Location, SessionCreateRequest};
 use crate::opencode::api::OpencodeClient;
 
@@ -113,6 +113,56 @@ impl OpenCodeBackend for HttpBackend {
         let req = crate::dto::PermissionReplyRequest { decision, message: None };
         Box::pin(async move {
             self.client.permission_reply(&session_id, &request_id, &req).await?;
+            Ok(())
+        })
+    }
+
+    // Wave 6a tail (authorized this wave): the session-management + catalog
+    // overrides — live wire calls mirroring the trait's default-unavailable
+    // contract, now in production.
+
+    fn list_commands(&self) -> BoxFuture<'_, Option<Vec<serde_json::Value>>> {
+        let client = self.client.clone();
+        Box::pin(async move { client.commands().await.ok() })
+    }
+
+    fn list_sessions(
+        &self,
+        directory: Option<&str>,
+        cursor: Option<&str>,
+    ) -> BoxFuture<'_, Result<SessionList, anyhow::Error>> {
+        let client = self.client.clone();
+        let directory = directory.map(str::to_string);
+        // ACP cursor is opaque — forward it as the wire `next` token.
+        let cursor = cursor.map(|c| crate::dto::Cursor { previous: None, next: Some(c.to_string()) });
+        Box::pin(async move {
+            let env = client.list_sessions(directory.as_deref(), cursor.as_ref()).await?;
+            let next = env.cursor.as_ref().and_then(|c| c.next.clone());
+            Ok((env.data, next))
+        })
+    }
+
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            client.delete_session(&session_id).await?;
+            Ok(())
+        })
+    }
+
+    fn agents(&self, directory: &str) -> BoxFuture<'_, Result<Vec<crate::dto::AgentInfo>, anyhow::Error>> {
+        let client = self.client.clone();
+        let directory = directory.to_string();
+        Box::pin(async move { Ok(client.agents(&directory).await?) })
+    }
+
+    fn set_agent(&self, session_id: &str, agent: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        let agent = agent.to_string();
+        Box::pin(async move {
+            client.set_session_agent(&session_id, &agent).await?;
             Ok(())
         })
     }

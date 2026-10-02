@@ -31,8 +31,9 @@
 #![allow(dead_code)]
 
 use crate::dto::{
-    Cursor, Envelope, InboxUserMessage, MessageRecord, MessagesEnvelope, ModelInfo, ModelRef,
-    PermissionReplyRequest, PromptRequest, ProviderInfo, SessionCreateRequest, SessionInfo,
+    AgentInfo, Cursor, Envelope, InboxUserMessage, MessageRecord, MessagesEnvelope, ModelInfo,
+    ModelRef, PermissionReplyRequest, PromptRequest, ProviderInfo, SessionCreateRequest,
+    SessionInfo,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
@@ -421,10 +422,28 @@ impl OpencodeClient {
     // Catalog & config
     // ------------------------------------------------------------
 
-    /// `GET /api/agent` → `{location, data: [...]}` (untyped for now).
-    pub async fn agents(&self) -> Result<Vec<Value>, ApiError> {
-        let url = self.endpoint_url("/agent");
-        Ok(self.send_json::<Vec<Value>>(Method::GET, url, None).await?.data)
+    /// `GET /api/agent?location[directory]=<cwd>` → `{location, data:
+    /// Agent.Info[]}`. The deepObject directory filter is MANDATORY
+    /// (wire-verified 2.0.21): omitted, the endpoint returns an empty list.
+    /// `location` vs `location[directory]`: the server only matches the
+    /// bracketed form — the plain `location` key is not a filter.
+    pub async fn agents(&self, directory: &str) -> Result<Vec<AgentInfo>, ApiError> {
+        let mut url = self.endpoint_url("/agent");
+        url.query_pairs_mut().append_pair("location[directory]", directory);
+        Ok(self.send_json::<Vec<AgentInfo>>(Method::GET, url, None).await?.data)
+    }
+
+    /// `POST /api/session/{id}/agent` body `{"agent": "<id>"}` → 204.
+    /// Switches the agent running a session (the ACP `session/set_mode`
+    /// wire; wire-verified: 204 with no body).
+    pub async fn set_session_agent(
+        &self,
+        session_id: &str,
+        agent: &str,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint_url(&format!("/session/{}/agent", encode_segment(session_id)));
+        let body = self.encode(&Method::POST, &url, &SessionAgentRequest { agent: agent.to_string() })?;
+        self.send_unit(Method::POST, url, Some(body)).await
     }
 
     /// `GET /api/command` → `{location, data: [...]}`.
@@ -535,6 +554,13 @@ pub struct InterruptResponse {
     pub interrupted: bool,
 }
 
+/// `POST /api/session/{id}/agent` body — `{"agent": "<id>"}`. 204, no
+/// response body (wire-verified 2.0.21).
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionAgentRequest {
+    pub agent: String,
+}
+
 // ============================================================
 // Unit tests (hermetic: no network)
 // ============================================================
@@ -543,7 +569,6 @@ pub struct InterruptResponse {
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
-    use serde_json::json;
 
     fn client() -> OpencodeClient {
         OpencodeClient::new("http://127.0.0.1:44041", "test123").expect("valid base url")
@@ -649,12 +674,13 @@ mod tests {
     #[test]
     fn deserializes_agents_fixture() {
         let raw = include_str!("../../tests/fixtures/agents.json");
-        let env: Envelope<Vec<Value>> = serde_json::from_str(raw).expect("fixture parses");
+        let env: Envelope<Vec<AgentInfo>> = serde_json::from_str(raw).expect("fixture parses");
         assert!(!env.data.is_empty());
-        assert_eq!(
-            env.data[0].as_object().expect("agent object")["id"],
-            json!("orchestrator")
-        );
+        assert_eq!(env.data[0].id, "orchestrator");
+        assert!(env.data[0].mode.is_some());
+        // Wire fixture carries every Agent.Info field; unknown ones (color,
+        // model, permissions, …) are tolerated by the partial struct.
+        assert!(env.data.iter().all(|a| a.hidden || !a.hidden));
     }
 
     #[test]

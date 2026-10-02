@@ -194,6 +194,7 @@ mod tests {
             UsageUpdated(_) => "session.usage.updated",
             Renamed(_) => "session.renamed",
             SessionCreated(_) => "session.created",
+            AgentSelected(_) => "session.agent.selected",
         }
     }
 
