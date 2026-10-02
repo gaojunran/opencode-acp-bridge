@@ -66,12 +66,31 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
         request_id: &str,
         decision: dto::PermissionReply,
     ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+
+    /// Wave 4 catalog fetch: the model list backing `config_option_update`
+    /// pushes on catalog reload. Default: unavailable — the live bridge
+    /// (`HttpBackend`) does not override yet, so the push is skipped until
+    /// the fetch lands in a follow-up wave (the wave boundary keeps
+    /// `src/bridge/**` untouched); mocks override to exercise the push path.
+    fn list_models(&self) -> BoxFuture<'_, Option<Vec<dto::ModelInfo>>> {
+        Box::pin(async { None })
+    }
+
+    /// Wave 4 slash-command catalog for `available_commands_update` pushes.
+    /// Same default-unavailable contract as [`Self::list_models`].
+    fn list_commands(&self) -> BoxFuture<'_, Option<Vec<serde_json::Value>>> {
+        Box::pin(async { None })
+    }
 }
 
 /// The ACP agent service: state + handler wiring.
 pub struct AgentService {
     backend: Arc<dyn OpenCodeBackend>,
     sessions: Mutex<HashMap<acp::SessionId, Arc<SessionEntry>>>,
+    /// How long the turn loop keeps draining in-flight events after a
+    /// `session/cancel` before abandoning still-open tool calls (official
+    /// wind-down, ~5s).
+    drain_window: std::time::Duration,
 }
 
 struct SessionEntry {
@@ -85,7 +104,18 @@ struct SessionEntry {
 
 impl AgentService {
     pub fn new(backend: Arc<dyn OpenCodeBackend>) -> Self {
-        Self { backend, sessions: Mutex::new(HashMap::new()) }
+        Self {
+            backend,
+            sessions: Mutex::new(HashMap::new()),
+            drain_window: std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// Override the cancel-drain window (default 5s, official behavior).
+    #[allow(dead_code)]
+    pub fn with_drain_window(mut self, drain_window: std::time::Duration) -> Self {
+        self.drain_window = drain_window;
+        self
     }
 
     /// Run the agent over the given transport until the connection closes.
@@ -299,60 +329,175 @@ impl AgentService {
         };
 
         let mut state = updates::MappingState::new();
-        while let Some(event) = stream.next().await {
-            // The SSE stream is session-tagged; drop other sessions' traffic.
-            if let Some(sid) = updates::event_session_id(&event) {
-                if sid != req.session_id.0.as_ref() {
-                    continue;
+        // Child (subagent) sessions of this session, registered from
+        // `session.created {parentID}` — their tool events project into this
+        // turn as nested ACP tool calls (`${child.id}:` / `${child.title}:
+        //` prefixes, official #48232 behavior).
+        let mut children: Vec<updates::ToolNs> = Vec::new();
+        // Cancel drain: after `session/cancel` the loop keeps consuming the
+        // stream for up to `drain_window` (official ~5s wind-down), then
+        // abandons still-open tool calls as failed.
+        let mut draining = false;
+        let mut drain_deadline = std::time::Instant::now();
+        loop {
+            // Next event. Drain mode bounds the wait so a silent server
+            // cannot hang the cancel forever.
+            let event = if draining {
+                let remaining =
+                    drain_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
                 }
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(Some(event)) => event,
+                    _ => break,
+                }
+            } else {
+                match stream.next().await {
+                    Some(event) => event,
+                    None => break,
+                }
+            };
+
+            // ---------- session filter ----------
+            // First: register children of THIS session (the wire emits
+            // `session.created` before any child event). Nothing else maps
+            // from `session.created`, so registration is the whole handling.
+            if let dto::SessionEvent::SessionCreated(created) = &event {
+                let Some((child_id, child_title)) = created
+                    .parentID
+                    .as_deref()
+                    .filter(|parent_id| *parent_id == req.session_id.0.as_ref())
+                    .and(created.sessionID.as_deref())
+                    .map(|child_id| {
+                        (child_id.to_string(), created.title.clone().unwrap_or_default())
+                    })
+                else {
+                    continue;
+                };
+                tracing::info!(
+                    session = %req.session_id,
+                    child = %child_id,
+                    title = %child_title,
+                    "child session registered for projection"
+                );
+                children.push(updates::ToolNs { child_id, child_title });
+                continue;
+            }
+            // Then drop other sessions' traffic — except registered
+            // children, whose events ride the same stream under their own
+            // (child) sessionID (wire-verified in subagent-child fixture).
+            let is_child_event = updates::event_session_id(&event)
+                .map(|sid| {
+                    sid != req.session_id.0.as_ref()
+                        && children.iter().any(|c| c.child_id == sid)
+                })
+                .unwrap_or(false);
+            if matches!(
+                updates::event_session_id(&event),
+                Some(sid) if sid != req.session_id.0.as_ref() && !is_child_event
+            ) {
+                continue;
             }
 
             tracing::debug!(session = %req.session_id, event = ?event, "sse event");
 
-            // session/cancel won? End the turn (the interrupt call itself was
-            // already made by the cancel handler).
-            if entry.cancel.load(Ordering::Acquire) {
-                tracing::info!(session = %req.session_id, "turn cancelled via session/cancel");
-                return responder.respond(acp::PromptResponse::new(acp::StopReason::Cancelled));
+            // ---------- cancel → drain ----------
+            // `session/cancel` won (the interrupt call itself was already
+            // made by the cancel handler): keep consuming in-flight events
+            // within the drain window instead of cutting the stream.
+            if !draining && entry.cancel.load(Ordering::Acquire) {
+                draining = true;
+                drain_deadline = std::time::Instant::now() + self.drain_window;
+                tracing::info!(
+                    session = %req.session_id,
+                    window_ms = self.drain_window.as_millis(),
+                    "turn cancelled via session/cancel — draining in-flight events"
+                );
             }
 
             // ---------- permission bridging (Wave 3) ----------
             // `permission.asked` is a turn-level signal, not an update: ask
             // the ACP client and forward the decision before the turn can
-            // resume. The server holds the execution until we reply.
+            // resume. The server holds the execution until we reply. A child
+            // ask carries the CHILD's sessionID (wire-verified) — the client
+            // request is addressed to the client's own (parent) session, the
+            // reply goes to the ask's sessionID (the #48232 routing rule).
+            // During the cancel drain asks are auto-rejected: the user
+            // already cancelled, and the client would auto-cancel the prompt
+            // anyway — but the server reply must still be sent
+            // (uninterruptible reply rule).
             if let dto::SessionEvent::PermissionAsked(asked) = &event {
-                self.forward_permission(asked, &mut state, &entry.cwd, &cx).await;
+                if draining {
+                    if let Err(e) = self
+                        .backend
+                        .permission_reply(&asked.sessionID, &asked.id, dto::PermissionReply::Reject)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            session = %asked.sessionID,
+                            request = %asked.id,
+                            "drain-time permission reject failed"
+                        );
+                    }
+                } else {
+                    let ns = children.iter().find(|c| c.child_id == asked.sessionID);
+                    self.forward_permission(asked, ns, &req.session_id, &mut state, &entry.cwd, &cx)
+                        .await;
+                }
                 continue;
             }
 
+            // ---------- child projection ----------
+            // Child lifecycle/text/reasoning events are not surfaced; tool
+            // events project as nested tool calls under the child namespace.
+            if is_child_event {
+                if let Some(ns) = children.iter().find(|c| {
+                    updates::event_session_id(&event) == Some(c.child_id.as_str())
+                }) {
+                    for update in updates::to_child_updates(&event, ns, &mut state) {
+                        cx.send_notification(acp::SessionNotification::new(
+                            req.session_id.clone(),
+                            update,
+                        ))?;
+                    }
+                }
+                continue;
+            }
+
+            // ---------- turn end ----------
+            // While draining, the first parent terminal event ends the drain
+            // — the cancel already won, the response is Cancelled either way.
+            if draining && updates::stop_update(&event).is_some() {
+                self.abandon_open_tools(&req, &state, &cx)?;
+                return responder.respond(self.stop_response(acp::StopReason::Cancelled, &state));
+            }
             match updates::stop_update(&event) {
                 Some(updates::TurnEnd::EndTurn) => {
                     tracing::info!(session = %req.session_id, "turn ended (end_turn)");
-                    return responder.respond(acp::PromptResponse::new(
-                        acp::StopReason::EndTurn,
-                    ));
+                    return responder
+                        .respond(self.stop_response(acp::StopReason::EndTurn, &state));
                 }
                 Some(updates::TurnEnd::Cancelled) => {
                     // `session.execution.interrupted` (official cancellation
                     // path) or an `aborted`-kind failure.
                     tracing::info!(session = %req.session_id, "turn cancelled (interrupted)");
-                    return responder.respond(acp::PromptResponse::new(
-                        acp::StopReason::Cancelled,
-                    ));
+                    self.abandon_open_tools(&req, &state, &cx)?;
+                    return responder
+                        .respond(self.stop_response(acp::StopReason::Cancelled, &state));
                 }
                 Some(updates::TurnEnd::MaxTokens) => {
                     // `length` failure — official mapping to max_tokens.
                     tracing::info!(session = %req.session_id, "turn ended (max_tokens)");
-                    return responder.respond(acp::PromptResponse::new(
-                        acp::StopReason::MaxTokens,
-                    ));
+                    return responder
+                        .respond(self.stop_response(acp::StopReason::MaxTokens, &state));
                 }
                 Some(updates::TurnEnd::Refusal) => {
                     // `content-filter` failure — official mapping to refusal.
                     tracing::info!(session = %req.session_id, "turn ended (refusal)");
-                    return responder.respond(acp::PromptResponse::new(
-                        acp::StopReason::Refusal,
-                    ));
+                    return responder
+                        .respond(self.stop_response(acp::StopReason::Refusal, &state));
                 }
                 Some(updates::TurnEnd::AuthRequired { message }) => {
                     // `provider.auth` failure — the ACP JSON-RPC contract has
@@ -374,6 +519,26 @@ impl AgentService {
                     return responder.respond_with_internal_error(msg);
                 }
                 None => {
+                    // Wave 4: catalog reload pushes. `model.updated` /
+                    // `provider.updated` carry no session (`{}`) and reach
+                    // every active turn loop; the push targets the client's
+                    // active session.
+                    if matches!(
+                        &event,
+                        dto::SessionEvent::ModelUpdated(_) | dto::SessionEvent::ProviderUpdated(_)
+                    ) {
+                        self.push_catalog_updates(&req, &cx).await;
+                    }
+                    // Wave 4: step-level error taxonomy (log-only — v1 has
+                    // no per-step failure update; the turn outcome arrives
+                    // via `session.execution.failed`).
+                    if let Some(outcome) = updates::step_failed_outcome(&event) {
+                        tracing::info!(
+                            session = %req.session_id,
+                            step_outcome = ?outcome,
+                            "step failed"
+                        );
+                    }
                     for update in updates::to_updates(&event, &mut state) {
                         cx.send_notification(acp::SessionNotification::new(
                             req.session_id.clone(),
@@ -384,8 +549,13 @@ impl AgentService {
             }
         }
 
-        // Stream ended without a terminal event: connection lost or the
-        // backend did not emit execution.succeeded/failed.
+        // Stream ended without a terminal event: connection lost, the
+        // backend did not emit execution.succeeded/failed — or the cancel
+        // drain window elapsed. Both end cancelled when draining.
+        if draining {
+            self.abandon_open_tools(&req, &state, &cx)?;
+            return responder.respond(self.stop_response(acp::StopReason::Cancelled, &state));
+        }
         tracing::warn!(session = %req.session_id, "event stream ended without a terminal event");
         responder.respond_with_internal_error(
             "event stream ended before the execution completed".to_string(),
@@ -405,25 +575,40 @@ impl AgentService {
     /// allow_always "Always allow", `reject` → reject_once "Reject"; any
     /// other outcome (dismissed, cancelled, transport error) rejects — the
     /// "race cancel → reject" rule, and the server reply is uninterruptible.
+    ///
+    /// Wave 4: `ns` is `Some` for asks raised inside a child session — the
+    /// client request is addressed to the parent session (the client only
+    /// knows one session), the tool call id/title get the child namespace
+    /// prefix, and the backend reply goes to the ask's OWN (child) sessionID
+    /// — the #48232 routing rule (wire-verified: child asks carry the child
+    /// sessionID).
     async fn forward_permission(
         self: &Arc<Self>,
         asked: &dto::PermissionAsked,
+        ns: Option<&updates::ToolNs>,
+        parent_session_id: &acp::SessionId,
         state: &mut updates::MappingState,
         cwd: &str,
         cx: &ConnectionTo<Client>,
     ) {
         // Tool-call identity: `source.id` (the call_* id of the triggering
-        // tool call); fall back to the permission request id.
+        // tool call); fall back to the permission request id. Child asks
+        // come prefixed with the child namespace.
         let tool_call_id = asked
             .source
             .as_ref()
             .map(|s| s.id.clone())
             .unwrap_or_else(|| asked.id.clone());
+        let tool_call_id = ns
+            .map(|n| n.tool_call_id(&tool_call_id))
+            .unwrap_or(tool_call_id);
         // Title: "<action>: <first resource>" — e.g. "shell: echo hi".
+        // Child asks get the `${child.title}: …` prefix.
         let title = match asked.resources.first() {
             Some(resource) => format!("{}: {}", asked.action, resource),
             None => asked.action.clone(),
         };
+        let title = ns.map(|n| n.title(&title)).unwrap_or(title);
         // state.input = metadata merged over the cached tool input (tool
         // input cached from tool.input.ended / tool.called by the mapping).
         let mut input = serde_json::Map::new();
@@ -442,7 +627,9 @@ impl AgentService {
                 .locations(vec![acp::ToolCallLocation::new(cwd)]),
         );
         let request = acp::RequestPermissionRequest::new(
-            acp::SessionId::from(asked.sessionID.clone()),
+            // The client's session — the PARENT session for child asks (the
+            // client never sees child session ids on the wire).
+            parent_session_id.clone(),
             update,
             Vec::from([
                 acp::PermissionOption::new(
@@ -513,6 +700,84 @@ impl AgentService {
         }
     }
 
+    /// Abandon still-open tool calls as failed ("Cancelled") — official
+    /// cancel-drain behavior. No-op when nothing is open. Must run before
+    /// the prompt response so the client sees the terminal updates first.
+    fn abandon_open_tools(
+        self: &Arc<Self>,
+        req: &acp::PromptRequest,
+        state: &updates::MappingState,
+        cx: &ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        for update in state.abandon_open_tools() {
+            cx.send_notification(acp::SessionNotification::new(req.session_id.clone(), update))?;
+        }
+        Ok(())
+    }
+
+    /// The prompt response for a turn end — folds a pending retry into the
+    /// `_meta` (`{"opencode/retry": …}`), official behavior: the retry is
+    /// announced so the client can reflect "will retry" even if the turn
+    /// ended before the retry fired.
+    fn stop_response(
+        &self,
+        reason: acp::StopReason,
+        state: &updates::MappingState,
+    ) -> acp::PromptResponse {
+        let response = acp::PromptResponse::new(reason);
+        match state.retry_meta() {
+            Some(meta) => {
+                let mut response = response;
+                response.meta = Some(serde_json::Map::from_iter([(
+                    "opencode/retry".to_string(),
+                    meta.clone(),
+                )]));
+                response
+            }
+            None => response,
+        }
+    }
+
+    /// Wave 4: push `config_option_update` (the model catalog as options)
+    /// after a catalog reload (`model.updated` / `provider.updated` — both
+    /// carry `{}`; the catalog is re-fetched). Skipped when the backend has
+    /// no catalog access (default trait impl — the live bridge does not
+    /// override yet; see [`OpenCodeBackend::list_models`]).
+    async fn push_catalog_updates(
+        self: &Arc<Self>,
+        req: &acp::PromptRequest,
+        cx: &ConnectionTo<Client>,
+    ) {
+        let Some(models) = self.backend.list_models().await else {
+            tracing::debug!(session = %req.session_id, "catalog push skipped: no model catalog");
+            return;
+        };
+        if models.is_empty() {
+            return;
+        }
+        // The option value scheme is `<provider>/<model>` (CLI notation); the
+        // client echoes it back verbatim in set_config_option — a future wave
+        // resolving the selection must split on the first '/'.
+        let options: Vec<acp::SessionConfigSelectOption> = models
+            .iter()
+            .map(|m| {
+                let name = m
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| m.modelID.clone().unwrap_or_else(|| m.id.clone()));
+                acp::SessionConfigSelectOption::new(
+                    format!("{}/{}", m.providerID, m.id),
+                    name,
+                )
+            })
+            .collect();
+        let update = acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(vec![
+            acp::SessionConfigOption::select("model", "Model", "", options),
+        ]));
+        tracing::info!(session = %req.session_id, options = models.len(), "catalog reload push");
+        let _ = cx.send_notification(acp::SessionNotification::new(req.session_id.clone(), update));
+    }
+
     async fn cancel(
         &self,
         session_id: acp::SessionId,
@@ -558,6 +823,8 @@ mod tests {
         /// Recorded (session_id, request_id, decision) of permission replies.
         permission_replies: Mutex<Vec<(String, String, dto::PermissionReply)>>,
         permission_seen: Mutex<Option<oneshot::Sender<()>>>,
+        /// Wave 4: canned model catalog for `config_option_update` pushes.
+        models: Mutex<Option<Vec<dto::ModelInfo>>>,
     }
 
     impl MockBackend {
@@ -571,6 +838,7 @@ mod tests {
                 interrupt_seen: Mutex::new(None),
                 permission_replies: Mutex::new(Vec::new()),
                 permission_seen: Mutex::new(None),
+                models: Mutex::new(None),
             })
         }
 
@@ -598,6 +866,10 @@ mod tests {
 
         fn recorded_replies(&self) -> Vec<(String, String, dto::PermissionReply)> {
             self.permission_replies.lock().expect("permission lock").clone()
+        }
+
+        fn set_models(&self, models: Vec<dto::ModelInfo>) {
+            *self.models.lock().expect("models lock") = Some(models);
         }
     }
 
@@ -662,6 +934,11 @@ mod tests {
                 }
                 Ok(())
             })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Option<Vec<dto::ModelInfo>>> {
+            let models = self.models.lock().expect("models lock").clone();
+            Box::pin(async move { models })
         }
     }
 
@@ -894,7 +1171,8 @@ mod tests {
                 );
 
                 // One more event lets the turn loop observe the cancel flag
-                // and answer the pending prompt.
+                // and enter the drain; the interrupted event then ends the
+                // drain (the cancel already won).
                 backend.push(dto::SessionEvent::TextDelta(dto::TextDelta {
                     base: dto::OrdinalRef {
                         sessionID: "ses_mock_1".into(),
@@ -903,6 +1181,9 @@ mod tests {
                     },
                     delta: "never rendered".into(),
                 }));
+                backend.push(dto::SessionEvent::ExecutionInterrupted(
+                    dto::SessionRef { sessionID: "ses_mock_1".into() },
+                ));
 
                 let resp = prompt.block_task().await?;
                 assert_eq!(resp.stop_reason, acp::StopReason::Cancelled);
@@ -1433,5 +1714,454 @@ mod tests {
 
         agent_task.abort();
         outcome.expect("client run ok");
+    }
+
+    // ======================= Wave 4 =======================
+
+    fn child_created(parent: &str) -> dto::SessionEvent {
+        dto::SessionEvent::SessionCreated(dto::SessionCreated {
+            sessionID: Some("ses_child_1".into()),
+            slug: None,
+            version: None,
+            projectID: None,
+            location: None,
+            subpath: None,
+            parentID: Some(parent.into()),
+            title: Some("List the repo".into()),
+        })
+    }
+
+    fn child_tool_started(id: &str) -> dto::SessionEvent {
+        dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: dto::ToolRef {
+                sessionID: "ses_child_1".into(),
+                assistantMessageID: "msg_c1".into(),
+                id: id.into(),
+            },
+            name: "grep".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn child_session_tool_events_project_as_namespaced_calls() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_notification(
+                {
+                    let collected = Arc::clone(&collected);
+                    async move |notif: SessionNotification, _cx| {
+                        collected.lock().expect("collected lock").push(notif);
+                        Ok(())
+                    }
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+                    let sid = ns.session_id.clone();
+
+                    // Child announced (wire: session.created with parentID),
+                    // then its tool events ride the child's own sessionID,
+                    // then the child turn ENDS — which must NOT stop the
+                    // parent turn.
+                    backend.push(child_created("ses_mock_1"));
+                    backend.push(child_tool_started("call_c1"));
+                    backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                        base: dto::ToolRef {
+                            sessionID: "ses_child_1".into(),
+                            assistantMessageID: "msg_c1".into(),
+                            id: "call_c1".into(),
+                        },
+                        input: serde_json::json!({ "query": "*.rs" }),
+                        executed: Some(false),
+                    }));
+                    backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                        base: dto::ToolRef {
+                            sessionID: "ses_child_1".into(),
+                            assistantMessageID: "msg_c1".into(),
+                            id: "call_c1".into(),
+                        },
+                        content: None,
+                        metadata: None,
+                        executed: None,
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_child_1".into(),
+                    }));
+                    // The parent turn ends normally only afterwards.
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("use the subagent"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // The child's tool events projected as nested calls: `${child.id}:`
+        // toolCallId + `${child.title}:` title prefix.
+        let notifications = collected.lock().expect("collected lock");
+        let tool_updates: Vec<(String, Option<String>, Option<acp::ToolCallStatus>)> =
+            notifications
+                .iter()
+                .filter_map(|n| match &n.update {
+                    acp::SessionUpdate::ToolCallUpdate(u) => Some((
+                        u.tool_call_id.0.to_string(),
+                        u.fields.title.clone(),
+                        u.fields.status,
+                    )),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(tool_updates.len(), 3, "pending + called + completed");
+        assert!(tool_updates.iter().all(|(id, _, _)| id == "ses_child_1:call_c1"));
+        assert_eq!(tool_updates[0].1.as_deref(), Some("List the repo: grep"));
+        assert_eq!(tool_updates[0].2, Some(acp::ToolCallStatus::Pending));
+        assert_eq!(tool_updates[1].2, Some(acp::ToolCallStatus::InProgress));
+        assert_eq!(tool_updates[2].2, Some(acp::ToolCallStatus::Completed));
+        // All updates are addressed to the parent session (the client never
+        // hears child session ids).
+        assert!(notifications.iter().all(|n| &*n.session_id.0 == "ses_mock_1"));
+    }
+
+    #[tokio::test]
+    async fn child_permission_ask_targets_parent_and_replies_to_child() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let reply_seen = backend.install_permission_seen();
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    async move |req: acp::RequestPermissionRequest,
+                                responder: Responder<acp::RequestPermissionResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        responder.respond(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Selected(
+                                acp::SelectedPermissionOutcome::new("once"),
+                            ),
+                        ))
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+                    let sid = ns.session_id.clone();
+
+                    // A permission ask from INSIDE the child session (its
+                    // sessionID on the wire — the #48232 routing trap).
+                    backend.push(child_created("ses_mock_1"));
+                    backend.push(dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+                        id: "per_c1".into(),
+                        sessionID: "ses_child_1".into(),
+                        action: "shell".into(),
+                        resources: vec!["echo hi".into()],
+                        save: None,
+                        metadata: None,
+                        source: Some(dto::PermissionSource {
+                            kind: Some("tool".into()),
+                            messageID: Some("msg_c1".into()),
+                            id: "call_c1".into(),
+                        }),
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("run"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // The client asked once — addressed to the PARENT session with the
+        // namespaced toolCallId and the projected title.
+        {
+            let requests = seen_requests.lock().expect("requests lock");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(&*requests[0].session_id.0, "ses_mock_1");
+            assert_eq!(
+                requests[0].tool_call.tool_call_id.0.as_ref(),
+                "ses_child_1:call_c1"
+            );
+            assert_eq!(
+                requests[0].tool_call.fields.title.as_deref(),
+                Some("List the repo: shell: echo hi")
+            );
+            // …and the decision went to the ask's sessionID — the CHILD
+            // (#48232: replies must be addressed to the child session).
+            assert_eq!(
+                backend.recorded_replies(),
+                vec![(
+                    "ses_child_1".to_string(),
+                    "per_c1".to_string(),
+                    dto::PermissionReply::Once
+                )]
+            );
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_seen)
+            .await
+            .expect("child permission reply must reach the backend");
+    }
+
+    #[tokio::test]
+    async fn cancel_drain_abandons_still_open_tools() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_notification(
+                {
+                    let collected = Arc::clone(&collected);
+                    async move |notif: SessionNotification, _cx| {
+                        collected.lock().expect("collected lock").push(notif);
+                        Ok(())
+                    }
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+                    let sid = ns.session_id.clone();
+
+                    // Two tools start (pushed while the turn is in flight —
+                    // the mock stream only delivers to an active turn)…
+                    let prompt = cx.send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("run two"))],
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    for id in ["call_a", "call_b"] {
+                        backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                            base: dto::ToolRef {
+                                sessionID: "ses_mock_1".into(),
+                                assistantMessageID: "msg_mock_1".into(),
+                                id: id.into(),
+                            },
+                            name: "bash".into(),
+                        }));
+                    }
+
+                    // …then the client cancels. In-flight events keep flowing
+                    // during the wind-down: call_a completes, call_b stays
+                    // open; the interrupted event ends the drain.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    cx.send_notification(CancelNotification::new(sid.clone()))?;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_mock_1".into(),
+                            id: "call_a".into(),
+                        },
+                        content: None,
+                        metadata: None,
+                        executed: None,
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionInterrupted(
+                        dto::SessionRef { sessionID: "ses_mock_1".into() },
+                    ));
+
+                    let resp = prompt.block_task().await?;
+                    assert_eq!(resp.stop_reason, acp::StopReason::Cancelled);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // Exactly the still-open call is abandoned, Failed + "Cancelled";
+        // the call that completed during the drain is untouched.
+        let notifications = collected.lock().expect("collected lock");
+        let failed: Vec<(String, Option<String>)> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::ToolCallUpdate(u)
+                    if u.fields.status == Some(acp::ToolCallStatus::Failed) =>
+                {
+                    Some((u.tool_call_id.0.to_string(), u.fields.title.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "only the still-open call is abandoned");
+        assert_eq!(failed[0].0, "call_b");
+        assert_eq!(failed[0].1.as_deref(), Some("Cancelled"));
+        let completed = notifications.iter().any(|n| match &n.update {
+            acp::SessionUpdate::ToolCallUpdate(u) => {
+                u.tool_call_id.0.as_ref() == "call_a"
+                    && u.fields.status == Some(acp::ToolCallStatus::Completed)
+            }
+            _ => false,
+        });
+        assert!(completed, "call_a completed during the drain");
+    }
+
+    #[tokio::test]
+    async fn catalog_reload_pushes_config_option_update() {
+        let backend = MockBackend::new();
+        backend.set_models(vec![
+            dto::ModelInfo {
+                id: "GLM-5.3-astra".into(),
+                modelID: Some("GLM-5.3-astra".into()),
+                providerID: "astra".into(),
+                name: Some("GLM 5.3".into()),
+            },
+            dto::ModelInfo {
+                id: "deepseek_v4_flash_code".into(),
+                modelID: None,
+                providerID: "astra".into(),
+                name: None,
+            },
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_notification(
+                {
+                    let collected = Arc::clone(&collected);
+                    async move |notif: SessionNotification, _cx| {
+                        collected.lock().expect("collected lock").push(notif);
+                        Ok(())
+                    }
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+                    let sid = ns.session_id.clone();
+
+                    // Catalog reload signal (wire shape: `{}`) arrives
+                    // mid-turn; the catalog is re-fetched and pushed.
+                    backend.push(dto::SessionEvent::ModelUpdated(
+                        dto::ModelOrProviderUpdated {},
+                    ));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hi"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // One ConfigOptionUpdate with the mocked models as select options.
+        let notifications = collected.lock().expect("collected lock");
+        let configs: Vec<&acp::ConfigOptionUpdate> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::ConfigOptionUpdate(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(configs.len(), 1, "one catalog push");
+        let options = &configs[0].config_options;
+        assert_eq!(options.len(), 1);
+        let option = options[0].clone();
+        assert_eq!(option.id.0.as_ref(), "model");
+        assert_eq!(option.name.as_str(), "Model");
+        let acp::SessionConfigKind::Select(select) = option.kind else {
+            panic!("expected a select option");
+        };
+        assert_eq!(select.current_value.0.as_ref(), "");
+        let acp::SessionConfigSelectOptions::Ungrouped(values) = select.options else {
+            panic!("expected select options");
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].value.0.as_ref(), "astra/GLM-5.3-astra");
+        assert_eq!(values[0].name.as_str(), "GLM 5.3");
+        assert_eq!(values[1].value.0.as_ref(), "astra/deepseek_v4_flash_code");
+        assert_eq!(values[1].name.as_str(), "deepseek_v4_flash_code");
     }
 }

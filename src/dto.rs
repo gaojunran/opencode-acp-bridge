@@ -532,6 +532,89 @@ pub struct ToolSuccess {
     pub executed: Option<bool>,
 }
 
+/// Payload of a `session.tool.failed` event: a tool call ended in error.
+/// Official-adapter shape (`{assistantMessageID, error, …}`); extra fields
+/// are tolerated so an unobserved real shape degrades to a silent skip.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolRefError {
+    #[serde(flatten)]
+    pub base: ToolRef,
+    pub error: StructuredError,
+}
+
+/// Payload of a `session.step.failed` event (2.0.21 event processors carry
+/// `{assistantMessageID, error, finish?}`). The official ACP adapter does not
+/// consume this — step failures surface via `session.execution.failed` — but
+/// the kind must decode so the bridge can log the step-level error taxonomy.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StepFailed {
+    #[serde(flatten)]
+    pub session: SessionRef,
+    pub assistantMessageID: String,
+    pub error: StructuredError,
+    #[serde(default)]
+    pub finish: Option<String>,
+}
+
+/// Payload of a `session.retry.scheduled` event. Field set taken from the
+/// official adapter's session_info_update mapping; wire-unknown — all fields
+/// tolerant so a different real shape degrades to a silent skip.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryScheduled {
+    pub sessionID: String,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub nextRetryAt: Option<Value>,
+    #[serde(default)]
+    pub error: Option<StructuredError>,
+}
+
+/// Payload of a `session.compaction.started` event (wire-captured in
+/// tests/fixtures/compaction.sse.jsonl: `{sessionID, reason, recent,
+/// inputID}`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionStarted {
+    pub sessionID: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub recent: Option<String>,
+    #[serde(default)]
+    pub inputID: Option<String>,
+}
+
+/// Payload of a `session.compaction.ended` event. Wire-unknown (only
+/// started/failed captured); all fields tolerant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionEnded {
+    pub sessionID: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub inputID: Option<String>,
+}
+
+/// Payload of a `session.compaction.failed` event (wire-captured in
+/// tests/fixtures/compaction.sse.jsonl: `{sessionID, reason, inputID,
+/// error}`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionFailed {
+    pub sessionID: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub inputID: Option<String>,
+    #[serde(default)]
+    pub error: Option<StructuredError>,
+}
+
+/// Payload of `model.updated` / `provider.updated` events — verified empty
+/// (`{}`) on the wire: they are directory-change signals; the catalog itself
+/// is fetched on demand.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelOrProviderUpdated {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageUpdated {
     #[serde(flatten)]
@@ -563,6 +646,14 @@ pub struct SessionCreated {
     pub location: Option<Value>,
     #[serde(default)]
     pub subpath: Option<Value>,
+    /// Parent session id — present when this is a subagent (child) session
+    /// (wire-verified: spawned sessions carry `parentID` + `title` + `agent`).
+    #[serde(default)]
+    pub parentID: Option<String>,
+    /// Human-readable title (child sessions carry the task prompt title,
+    /// used for the `${child.title}: …` ACP projection prefix).
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// The `source` of a permission prompt: the tool call that triggered it.
@@ -647,6 +738,31 @@ pub enum SessionEvent {
     ToolCalled(ToolCalled),
     ToolProgress(ToolRef),
     ToolSuccess(ToolSuccess),
+    /// Failure kind for a tool call (`session.tool.failed`, consumed by the
+    /// official 2.0.21 adapter; not yet on the bridge's own captures —
+    /// decoded tolerantly so a wrong field shape degrades to a silent skip).
+    ToolFailed(ToolRefError),
+    // steps
+    /// `session.step.failed` — per-step error path (wire-verified to exist in
+    /// the 2.0.21 event processors; NOT consumed by the official ACP adapter,
+    /// which surfaces step errors via `session.execution.failed`).
+    StepFailed(StepFailed),
+    /// `session.retry.scheduled` — server scheduled an automatic retry.
+    RetryScheduled(RetryScheduled),
+    /// `session.compaction.started` — compaction of the session began.
+    CompactionStarted(CompactionStarted),
+    /// `session.compaction.ended` — compaction finished (payload shape
+    /// unobserved on the wire; tolerant decode).
+    CompactionEnded(CompactionEnded),
+    /// `session.compaction.failed` — compaction could not run.
+    CompactionFailed(CompactionFailed),
+    // catalog
+    /// `model.updated {}` — the model directory changed; clients refresh
+    /// the model catalog.
+    ModelUpdated(ModelOrProviderUpdated),
+    /// `provider.updated {}` — the provider directory changed; clients
+    /// refresh the model catalog.
+    ProviderUpdated(ModelOrProviderUpdated),
     // meta
     UsageUpdated(UsageUpdated),
     Renamed(SessionRenamed),
@@ -682,6 +798,14 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.tool.called" => parse(data).map(SessionEvent::ToolCalled),
         "session.tool.progress" => parse(data).map(SessionEvent::ToolProgress),
         "session.tool.success" => parse(data).map(SessionEvent::ToolSuccess),
+        "session.tool.failed" => parse(data).map(SessionEvent::ToolFailed),
+        "session.step.failed" => parse(data).map(SessionEvent::StepFailed),
+        "session.retry.scheduled" => parse(data).map(SessionEvent::RetryScheduled),
+        "session.compaction.started" => parse(data).map(SessionEvent::CompactionStarted),
+        "session.compaction.ended" => parse(data).map(SessionEvent::CompactionEnded),
+        "session.compaction.failed" => parse(data).map(SessionEvent::CompactionFailed),
+        "model.updated" => parse(data).map(SessionEvent::ModelUpdated),
+        "provider.updated" => parse(data).map(SessionEvent::ProviderUpdated),
         "session.usage.updated" => parse(data).map(SessionEvent::UsageUpdated),
         "session.renamed" => parse(data).map(SessionEvent::Renamed),
         "session.created" => parse(data).map(SessionEvent::SessionCreated),
@@ -828,6 +952,131 @@ mod tests {
             raw.contains("session.execution.succeeded"),
             "fixture resumes to a successful turn end"
         );
+    }
+
+    /// Wave 4: the live-captured subagent (child-session) turn must decode
+    /// end-to-end. Wire facts pinned by this fixture:
+    ///   • child events flow in the shared stream under the CHILD's own
+    ///     sessionID (no marker on the tool events themselves),
+    ///   • `session.created` announces each child with `parentID` + `title`,
+    ///   • `model.updated` / `provider.updated` carry an empty payload `{}`.
+    #[test]
+    fn decode_subagent_child_capture() {
+        let raw = include_str!("../tests/fixtures/subagent-child.sse.jsonl");
+        let mut decoded = 0;
+        let mut created_with_parent = 0;
+        let mut child_tool_events = 0;
+        let mut saw_model_updated = false;
+        let mut saw_provider_updated = false;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line == ": heartbeat" {
+                continue;
+            }
+            let env: EventEnvelope =
+                serde_json::from_str(line.strip_prefix("data: ").expect("data: prefix"))
+                    .expect("envelope parses");
+            let skipped = env.kind.starts_with("rpc.")
+                || matches!(
+                    env.kind.as_str(),
+                    "server.connected"
+                        | "session.inbox.enqueued"
+                        | "session.inbox.delivered"
+                        | "project.updated"
+                        | "session.instructions.updated"
+                        | "session.permissions"
+                        | "session.model.selected"
+                );
+            if skipped {
+                continue;
+            }
+            let event = decode_event(&env.kind, &env.data)
+                .unwrap_or_else(|| panic!("frame kind `{}` must decode", env.kind));
+            match event {
+                SessionEvent::SessionCreated(created) => {
+                    if created.parentID.is_some() {
+                        created_with_parent += 1;
+                        assert!(
+                            created.title.as_deref().is_some_and(|t| !t.is_empty()),
+                            "child session.created carries a title"
+                        );
+                    }
+                }
+                SessionEvent::ModelUpdated(_) => saw_model_updated = true,
+                SessionEvent::ProviderUpdated(_) => saw_provider_updated = true,
+                _ => {}
+            }
+            // Count tool-kind frames under a child sessionID (not the main
+            // fixture session). The fixture has one parent + two children.
+            if matches!(
+                env.kind.as_str(),
+                "session.tool.input.started"
+                    | "session.tool.input.ended"
+                    | "session.tool.called"
+                    | "session.tool.success"
+                    | "session.tool.progress"
+            ) && env.data.get("sessionID").and_then(|v| v.as_str()) != Some("ses_f0434a963ffendAHE24ngf0ScP")
+            {
+                child_tool_events += 1;
+            }
+            decoded += 1;
+        }
+        assert!(decoded > 100, "expected the full subagent turns, got {decoded} frames");
+        assert!(created_with_parent >= 2, "children announced with parentID: {created_with_parent}");
+        assert!(child_tool_events >= 4, "child tool events ride their own sessionID");
+        assert!(saw_model_updated && saw_provider_updated, "catalog reload events present");
+    }
+
+    /// Wave 4: the live-captured compaction turn (POST /api/session/…/compact)
+    /// — `session.compaction.started` / `session.compaction.failed` shapes.
+    #[test]
+    fn decode_compaction_capture() {
+        let raw = include_str!("../tests/fixtures/compaction.sse.jsonl");
+        let mut saw_started = false;
+        let mut saw_failed = false;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line == ": heartbeat" {
+                continue;
+            }
+            let env: EventEnvelope =
+                serde_json::from_str(line.strip_prefix("data: ").expect("data: prefix"))
+                    .expect("envelope parses");
+            match env.kind.as_str() {
+                "server.connected" | "session.inbox.enqueued" | "session.inbox.delivered" => {}
+                "session.compaction.started" => {
+                    let SessionEvent::CompactionStarted(started) =
+                        decode_event(&env.kind, &env.data).expect("started decodes")
+                    else {
+                        panic!("wrong variant");
+                    };
+                    assert_eq!(started.reason.as_deref(), Some("manual"));
+                    assert!(started.inputID.as_deref().is_some_and(|i| i.starts_with("msg_")));
+                    saw_started = true;
+                }
+                "session.compaction.failed" => {
+                    let SessionEvent::CompactionFailed(failed) =
+                        decode_event(&env.kind, &env.data).expect("failed decodes")
+                    else {
+                        panic!("wrong variant");
+                    };
+                    assert_eq!(
+                        failed.error.as_ref().and_then(|e| e.kind.as_deref()),
+                        Some("compaction.unavailable")
+                    );
+                    saw_failed = true;
+                }
+                _ => {
+                    assert!(
+                        decode_event(&env.kind, &env.data).is_some(),
+                        "frame kind `{}` must decode",
+                        env.kind
+                    );
+                }
+            }
+        }
+        assert!(saw_started && saw_failed, "compaction started+failed frames present");
+        assert!(raw.contains("session.execution.succeeded"), "compact run ends the turn");
     }
 
     /// The persisted tool part must expose the diff-fix data source.

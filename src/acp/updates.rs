@@ -10,7 +10,7 @@
 //! chunks of the same assistant message (each chunk type gets its own
 //! `message_id` from the same ID; the client groups by that ID).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Cost, SessionInfoUpdate, SessionUpdate, TextContent,
@@ -20,6 +20,52 @@ use agent_client_protocol::schema::v1::{
 use crate::dto::{self, ToolContent, ToolMetadata};
 
 use super::diff;
+
+/// Namespace of a subagent (child) session whose tool events are projected
+/// into the parent turn (official `#48232` behavior: when the client does not
+/// declare `opencode/child-session-updates`, child tool events surface in the
+/// parent stream as nested tool calls).
+///
+/// Wire facts (captured in tests/fixtures/subagent-child.sse.jsonl): child
+/// events flow through the shared `/api/event` stream carrying the CHILD's
+/// own sessionID; `session.created` announces the child with `parentID` +
+/// `title` + `agent`. The ACP mapping prefixes every projected tool call id
+/// with `${child.id}:` and every title with `${child.title}: …`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolNs {
+    /// Child session id (`ses_...`).
+    pub child_id: String,
+    /// Child session title (from `session.created`).
+    pub child_title: String,
+}
+
+impl ToolNs {
+    /// The ACP toolCallId for a raw opencode `call_...` id of this child.
+    pub fn tool_call_id(&self, raw: &str) -> String {
+        format!("{}:{}", self.child_id, raw)
+    }
+
+    /// The ACP display title for a raw title of this child.
+    pub fn title(&self, raw: &str) -> String {
+        format!("{}: {}", self.child_title, raw)
+    }
+}
+
+/// The identity of an opencode tool event's call — raw `call_...` id, plus
+/// the child namespace when the event belongs to a projected subagent.
+fn tool_call_id(ns: Option<&ToolNs>, raw: &str) -> String {
+    match ns {
+        Some(ns) => ns.tool_call_id(raw),
+        None => raw.to_string(),
+    }
+}
+
+fn tool_title(ns: Option<&ToolNs>, raw: &str) -> String {
+    match ns {
+        Some(ns) => ns.title(raw),
+        None => raw.to_string(),
+    }
+}
 
 
 /// Per-session bookkeeping for the event → update mapping.
@@ -36,7 +82,17 @@ pub struct MappingState {
     /// prompt (Wave 3: `state.input` of the pending tool call). Populated
     /// best-effort from `session.tool.input.ended` (raw JSON text) and
     /// authoritatively from `session.tool.called` (parsed input object).
+    /// Keyed by the FINAL (namespaced) toolCallId so the permission prompt
+    /// and the cancel drain address the same calls the client sees.
     pub(crate) tool_inputs: HashMap<String, serde_json::Value>,
+    /// Tool calls still open (final toolCallIds): advertised to the client
+    /// but not yet completed/failed. Read by the cancel drain to abandon
+    /// stragglers with `Failed` + "Cancelled".
+    open_tools: HashSet<String>,
+    /// Pending automatic retry (from `session.retry.scheduled`) — cleared on
+    /// the next `step.started`, folded into the PromptResponse `_meta` when
+    /// the turn ends before the retry fires.
+    retry: Option<serde_json::Value>,
 }
 
 impl MappingState {
@@ -48,6 +104,42 @@ impl MappingState {
     /// / `tool.called`). Used to build the permission prompt's `state.input`.
     pub fn tool_input(&self, tool_call_id: &str) -> Option<&serde_json::Value> {
         self.tool_inputs.get(tool_call_id)
+    }
+
+    /// Mark a tool call open. `id` must be the FINAL (namespaced) toolCallId.
+    pub(crate) fn open_tool(&mut self, id: impl Into<String>) {
+        self.open_tools.insert(id.into());
+    }
+
+    /// Mark a tool call closed (completed or failed).
+    pub(crate) fn close_tool(&mut self, id: &str) {
+        self.open_tools.remove(id);
+    }
+
+    /// The still-open tool calls at end-of-turn, abandoned as failed with
+    /// title "Cancelled" (official cancel-drain behavior).
+    pub fn abandon_open_tools(&self) -> Vec<SessionUpdate> {
+        self.open_tools
+            .iter()
+            .map(|id| {
+                tool_update(
+                    id,
+                    ToolCallUpdateFields::new()
+                        .status(ToolCallStatus::Failed)
+                        .title("Cancelled"),
+                )
+            })
+            .collect()
+    }
+
+    /// Pending retry meta object (the value for `_meta["opencode/retry"]`).
+    pub fn retry_meta(&self) -> Option<&serde_json::Value> {
+        self.retry.as_ref()
+    }
+
+    /// Take (and clear) the pending retry — used by the step.started clear.
+    fn take_retry(&mut self) -> Option<serde_json::Value> {
+        self.retry.take()
     }
 }
 
@@ -68,44 +160,176 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
                 .message_id(d.base.assistantMessageID.as_str()),
         )],
 
-        // ---------- tools ----------
-        dto::SessionEvent::ToolInputStarted(t) => {
-            // ACP convention (mirrors the TS bridge): while input streams, the
-            // call is advertised as `pending` with the tool name as title.
-            state.tool_titles.insert(t.base.id.clone(), t.name.clone());
-            vec![tool_update(&t.base.id, ToolCallUpdateFields::new()
-                .status(ToolCallStatus::Pending)
-                .title(t.name.clone()))]
-        }
-        dto::SessionEvent::ToolInputEnded(t) => {
-            // `text` is the raw JSON input string — pass it through verbatim
-            // (the pending call's streaming input, as a JSON string value).
-            // Also cache the parsed input for the permission prompt.
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
-                state
-                    .tool_inputs
-                    .insert(t.base.id.clone(), parsed);
-            }
-            vec![tool_update(&t.base.id, ToolCallUpdateFields::new()
-                .raw_input(serde_json::Value::String(t.text.clone())))]
-        }
-        dto::SessionEvent::ToolCalled(t) => {
-            // Parsed input now available → mark in progress.
-            state.tool_inputs.insert(t.base.id.clone(), t.input.clone());
-            vec![tool_update(&t.base.id, ToolCallUpdateFields::new()
-                .status(ToolCallStatus::InProgress)
-                .raw_input(t.input.clone()))]
-        }
+        // ---------- tools (parent namespace) ----------
+        dto::SessionEvent::ToolInputStarted(_)
+        | dto::SessionEvent::ToolInputEnded(_)
+        | dto::SessionEvent::ToolCalled(_)
+        | dto::SessionEvent::ToolSuccess(_)
+        | dto::SessionEvent::ToolFailed(_) => to_tool_updates(event, None, state),
         dto::SessionEvent::ToolProgress(_) => {
             // No-op: the call is already `in_progress` since `tool.called`.
             // Kept as its own arm so the mapping is explicit and greppable.
             vec![]
         }
+
+        // ---------- scheduling / maintenance ----------
+        dto::SessionEvent::RetryScheduled(r) => {
+            let mut obj = serde_json::Map::new();
+            if let Some(attempt) = r.attempt {
+                obj.insert("attempt".into(), serde_json::Value::from(attempt));
+            }
+            if let Some(next) = &r.nextRetryAt {
+                obj.insert("nextRetryAt".into(), next.clone());
+            }
+            if let Some(err) = &r.error {
+                obj.insert("error".into(), error_value(err));
+            }
+            let obj = serde_json::Value::Object(obj);
+            state.retry = Some(obj.clone());
+            vec![info_update_with_meta("opencode/retry", &obj)]
+        }
+        dto::SessionEvent::StepStarted(_) => {
+            // Official: a pending retry is cleared when the next step starts.
+            state.take_retry().map_or_else(Vec::new, |_| {
+                vec![info_update_with_meta("opencode/retry", &serde_json::Value::Null)]
+            })
+        }
+        dto::SessionEvent::CompactionStarted(c) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), "started".into());
+            if let Some(input) = &c.inputID {
+                obj.insert("messageId".into(), input.clone().into());
+            }
+            if let Some(reason) = &c.reason {
+                obj.insert("reason".into(), reason.clone().into());
+            }
+            vec![info_update_with_meta(
+                "opencode/compaction",
+                &serde_json::Value::Object(obj),
+            )]
+        }
+        dto::SessionEvent::CompactionEnded(c) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), "ended".into());
+            if let Some(input) = &c.inputID {
+                obj.insert("messageId".into(), input.clone().into());
+            }
+            if let Some(reason) = &c.reason {
+                obj.insert("reason".into(), reason.clone().into());
+            }
+            vec![info_update_with_meta(
+                "opencode/compaction",
+                &serde_json::Value::Object(obj),
+            )]
+        }
+        dto::SessionEvent::CompactionFailed(c) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), "failed".into());
+            if let Some(input) = &c.inputID {
+                obj.insert("messageId".into(), input.clone().into());
+            }
+            if let Some(reason) = &c.reason {
+                obj.insert("reason".into(), reason.clone().into());
+            }
+            if let Some(err) = &c.error {
+                obj.insert("error".into(), error_value(err));
+            }
+            vec![info_update_with_meta(
+                "opencode/compaction",
+                &serde_json::Value::Object(obj),
+            )]
+        }
+
+        // ---------- steps ----------
+        dto::SessionEvent::StepFailed(_) => {
+            // No ACP update: v1 has no per-step failure surface and the
+            // official adapter does not consume this event — the error
+            // taxonomy arrives via `session.execution.failed`. The agent
+            // layer logs the step-level outcome (`step_failed_outcome`).
+            vec![]
+        }
+
+        // ---------- catalog ----------
+        dto::SessionEvent::ModelUpdated(_) | dto::SessionEvent::ProviderUpdated(_) => {
+            // The events are directory-change signals; the catalog push
+            // itself is built by the agent layer (it needs a backend fetch).
+            vec![]
+        }
+
+        // ---------- meta ----------
+        dto::SessionEvent::UsageUpdated(u) => {
+            let tokens = u.tokens.as_ref();
+            let used = tokens.map(|t| {
+                t.input.unwrap_or(0) + t.output.unwrap_or(0) + t.reasoning.unwrap_or(0)
+            });
+            let mut usage = UsageUpdate::new(used.unwrap_or(0), 0);
+            if let Some(cost) = u.cost {
+                usage = usage.cost(Cost::new(cost, "USD"));
+            }
+            vec![SessionUpdate::UsageUpdate(usage)]
+        }
+        dto::SessionEvent::Renamed(r) => vec![SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title(r.title.clone()),
+        )],
+
+        // Everything else has no ACP update counterpart.
+        _ => vec![],
+    }
+}
+
+/// Tool-event arms shared by the parent namespace (`to_updates`) and the
+/// child projection (`to_child_updates`). `ns` is `Some` only for child
+/// events: every id is prefixed `${child.id}:`, every title `${child.title}:`.
+fn to_tool_updates(
+    event: &dto::SessionEvent,
+    ns: Option<&ToolNs>,
+    state: &mut MappingState,
+) -> Vec<SessionUpdate> {
+    match event {
+        dto::SessionEvent::ToolInputStarted(t) => {
+            // ACP convention (mirrors the TS bridge): while input streams, the
+            // call is advertised as `pending` with the tool name as title.
+            let id = tool_call_id(ns, &t.base.id);
+            state.tool_titles.insert(id.clone(), t.name.clone());
+            state.open_tool(id.clone());
+            vec![tool_update(
+                &id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Pending)
+                    .title(tool_title(ns, &t.name)),
+            )]
+        }
+        dto::SessionEvent::ToolInputEnded(t) => {
+            // `text` is the raw JSON input string — pass it through verbatim
+            // (the pending call's streaming input, as a JSON string value).
+            // Also cache the parsed input for the permission prompt.
+            let id = tool_call_id(ns, &t.base.id);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                state.tool_inputs.insert(id.clone(), parsed);
+            }
+            vec![tool_update(
+                &id,
+                ToolCallUpdateFields::new().raw_input(serde_json::Value::String(t.text.clone())),
+            )]
+        }
+        dto::SessionEvent::ToolCalled(t) => {
+            // Parsed input now available → mark in progress.
+            let id = tool_call_id(ns, &t.base.id);
+            state.tool_inputs.insert(id.clone(), t.input.clone());
+            vec![tool_update(
+                &id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(t.input.clone()),
+            )]
+        }
         dto::SessionEvent::ToolSuccess(t) => {
+            let id = tool_call_id(ns, &t.base.id);
+            state.close_tool(&id);
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             if let Some(meta) = &t.metadata {
                 if let Some(title) = &meta.title {
-                    fields = fields.title(title.clone());
+                    fields = fields.title(tool_title(ns, title));
                 }
             }
             if let Some(content) = &t.content {
@@ -130,28 +354,59 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
                     fields = fields.content(Some(blocks));
                 }
             }
-            vec![tool_update(&t.base.id, fields)]
+            vec![tool_update(&id, fields)]
         }
-
-        // ---------- meta ----------
-        dto::SessionEvent::UsageUpdated(u) => {
-            let tokens = u.tokens.as_ref();
-            let used = tokens.map(|t| {
-                t.input.unwrap_or(0) + t.output.unwrap_or(0) + t.reasoning.unwrap_or(0)
-            });
-            let mut usage = UsageUpdate::new(used.unwrap_or(0), 0);
-            if let Some(cost) = u.cost {
-                usage = usage.cost(Cost::new(cost, "USD"));
-            }
-            vec![SessionUpdate::UsageUpdate(usage)]
+        dto::SessionEvent::ToolFailed(t) => {
+            let id = tool_call_id(ns, &t.base.id);
+            state.close_tool(&id);
+            // v1 has no error field on tool updates: the failure surfaces as
+            // `Failed` with the error message in the raw output.
+            let message = t
+                .error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Tool execution failed".to_string());
+            vec![tool_update(
+                &id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Failed)
+                    .raw_output(serde_json::Value::String(message)),
+            )]
         }
-        dto::SessionEvent::Renamed(r) => vec![SessionUpdate::SessionInfoUpdate(
-            SessionInfoUpdate::new().title(r.title.clone()),
-        )],
-
-        // Everything else has no ACP update counterpart.
         _ => vec![],
     }
+}
+
+/// Map a projected CHILD-session event to ACP updates. Only tool events have
+/// a projection (nested tool calls); child lifecycle/text/reasoning events
+/// are not surfaced (the parent's own stream carries the orchestration).
+pub fn to_child_updates(
+    event: &dto::SessionEvent,
+    ns: &ToolNs,
+    state: &mut MappingState,
+) -> Vec<SessionUpdate> {
+    to_tool_updates(event, Some(ns), state)
+}
+
+/// `_meta` object for a `session_info_update` (retry / compaction pushes).
+fn info_update_with_meta(key: &str, value: &serde_json::Value) -> SessionUpdate {
+    let mut meta = serde_json::Map::new();
+    meta.insert(key.to_string(), value.clone());
+    let mut update = SessionInfoUpdate::new();
+    update.meta = Some(meta);
+    SessionUpdate::SessionInfoUpdate(update)
+}
+
+/// StructuredError → JSON object (for `_meta` error fields).
+fn error_value(err: &dto::StructuredError) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(kind) = &err.kind {
+        obj.insert("type".into(), kind.clone().into());
+    }
+    if let Some(message) = &err.message {
+        obj.insert("message".into(), message.clone().into());
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// Outcome of a finished execution — the ACP stop signal.
@@ -184,13 +439,24 @@ pub enum TurnEnd {
 /// `provider.auth` → authentication-required error · `content-filter` →
 /// refusal · `aborted` → cancelled · `length` → max_tokens · anything else →
 /// error stop with the safe message.
-fn failure_outcome(error: &dto::StructuredError) -> TurnEnd {
+pub(crate) fn failure_outcome(error: &dto::StructuredError) -> TurnEnd {
     match error.kind.as_deref() {
         Some("provider.auth") => TurnEnd::AuthRequired { message: error.message.clone() },
         Some("content-filter") => TurnEnd::Refusal,
         Some("aborted") => TurnEnd::Cancelled,
         Some("length") => TurnEnd::MaxTokens,
         _ => TurnEnd::Error { message: error.message.clone() },
+    }
+}
+
+/// Step-level error taxonomy: `session.step.failed` maps through the same
+/// table as execution failures. The bridge does NOT stop the turn on it (the
+/// official adapter surfaces step errors via `session.execution.failed`); the
+/// agent layer uses this to log/attribute the step-level failure kind.
+pub fn step_failed_outcome(event: &dto::SessionEvent) -> Option<TurnEnd> {
+    match event {
+        dto::SessionEvent::StepFailed(s) => Some(failure_outcome(&s.error)),
+        _ => None,
     }
 }
 
@@ -228,6 +494,13 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
         dto::SessionEvent::ToolCalled(t) => Some(&t.base.sessionID),
         dto::SessionEvent::ToolProgress(t) => Some(&t.sessionID),
         dto::SessionEvent::ToolSuccess(t) => Some(&t.base.sessionID),
+        dto::SessionEvent::ToolFailed(t) => Some(&t.base.sessionID),
+        dto::SessionEvent::StepFailed(s) => Some(&s.session.sessionID),
+        dto::SessionEvent::RetryScheduled(r) => Some(&r.sessionID),
+        dto::SessionEvent::CompactionStarted(c) => Some(&c.sessionID),
+        dto::SessionEvent::CompactionEnded(c) => Some(&c.sessionID),
+        dto::SessionEvent::CompactionFailed(c) => Some(&c.sessionID),
+        dto::SessionEvent::ModelUpdated(_) | dto::SessionEvent::ProviderUpdated(_) => None,
         dto::SessionEvent::UsageUpdated(u) => Some(&u.session.sessionID),
         dto::SessionEvent::Renamed(r) => Some(&r.session.sessionID),
         dto::SessionEvent::SessionCreated(_) => None,
@@ -584,5 +857,291 @@ mod tests {
     fn dto_session_title() -> String {
         // The fixture's session.renamed title.
         "Current directory listing with ls -la".to_string()
+    }
+
+    // ======================= Wave 4 =======================
+
+    use agent_client_protocol::schema::v1 as acp;
+
+    fn tool_ref(session: &str, msg: &str, id: &str) -> dto::ToolRef {
+        dto::ToolRef {
+            sessionID: session.into(),
+            assistantMessageID: msg.into(),
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn tool_failed_closes_the_call_and_maps_failed_status() {
+        let mut state = MappingState::new();
+        // Open the call first (input.started), then fail it.
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_x"),
+            name: "bash".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_x", "msg_x", "call_x"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("boom".into()),
+            },
+        });
+        let updates = to_updates(&failed, &mut state);
+        assert_eq!(updates.len(), 1);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call update")
+        };
+        assert_eq!(u.tool_call_id.0.as_ref(), "call_x");
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+        // v1 has no error field on tool updates — the message rides raw_output.
+        assert_eq!(u.fields.raw_output, Some(serde_json::Value::String("boom".into())));
+        // The call is closed: the cancel drain must not re-abandon it.
+        assert!(state.abandon_open_tools().is_empty());
+    }
+
+    #[test]
+    fn abandon_open_tools_fails_only_still_open_calls() {
+        let mut state = MappingState::new();
+        for id in ["call_a", "call_b", "call_c"] {
+            let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_x", "msg_x", id),
+                name: "bash".into(),
+            });
+            let _ = to_updates(&started, &mut state);
+        }
+        // Close call_a normally, fail call_b, leave call_c open.
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_x", "msg_x", "call_a"),
+            content: None,
+            metadata: None,
+            executed: None,
+        });
+        let _ = to_updates(&success, &mut state);
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_x", "msg_x", "call_b"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: None,
+            },
+        });
+        let _ = to_updates(&failed, &mut state);
+
+        let abandoned = state.abandon_open_tools();
+        assert_eq!(abandoned.len(), 1, "only the still-open call is abandoned");
+        let acp::SessionUpdate::ToolCallUpdate(u) = &abandoned[0] else {
+            panic!("expected a tool_call update")
+        };
+        assert_eq!(u.tool_call_id.0.as_ref(), "call_c");
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+        assert_eq!(u.fields.title, Some("Cancelled".into()));
+    }
+
+    #[test]
+    fn retry_scheduled_pushes_meta_and_step_started_clears_it() {
+        let mut state = MappingState::new();
+        let retry = dto::SessionEvent::RetryScheduled(dto::RetryScheduled {
+            sessionID: "ses_x".into(),
+            attempt: Some(2),
+            nextRetryAt: Some(serde_json::json!({"ms": 1790930000000u64})),
+            error: Some(dto::StructuredError {
+                kind: Some("provider.internal".into()),
+                message: Some("retrying".into()),
+            }),
+        });
+        let updates = to_updates(&retry, &mut state);
+        assert_eq!(updates.len(), 1, "retry.scheduled → one session_info_update");
+        let acp::SessionUpdate::SessionInfoUpdate(info) = &updates[0] else {
+            panic!("expected session_info_update")
+        };
+        let meta = info.meta.as_ref().expect("_meta present");
+        let obj = meta.get("opencode/retry").and_then(|v| v.as_object()).expect("retry object");
+        assert_eq!(obj.get("attempt"), Some(&serde_json::json!(2)));
+        assert_eq!(obj.get("nextRetryAt"), Some(&serde_json::json!({"ms": 1790930000000u64})));
+        assert_eq!(
+            obj.get("error").and_then(|e| e.get("type")),
+            Some(&serde_json::json!("provider.internal"))
+        );
+        assert_eq!(state.retry_meta(), Some(&serde_json::json!(obj)));
+
+        // step.started clears the pending retry (official: meta → null).
+        let started = dto::SessionEvent::StepStarted(dto::StepStarted {
+            session: dto::SessionRef { sessionID: "ses_x".into() },
+            agent: None,
+            model: None,
+            assistantMessageID: "msg_x".into(),
+            snapshot: None,
+            started: None,
+        });
+        let updates = to_updates(&started, &mut state);
+        assert_eq!(updates.len(), 1, "clear pushes one update");
+        let acp::SessionUpdate::SessionInfoUpdate(info) = &updates[0] else {
+            panic!("expected session_info_update")
+        };
+        assert_eq!(
+            info.meta.as_ref().and_then(|m| m.get("opencode/retry")),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(state.retry_meta(), None, "pending retry cleared");
+        // A second step.started pushes nothing (nothing pending).
+        assert!(to_updates(&started, &mut state).is_empty());
+    }
+
+    #[test]
+    fn compaction_events_push_compaction_meta() {
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::CompactionStarted(dto::CompactionStarted {
+            sessionID: "ses_x".into(),
+            reason: Some("manual".into()),
+            recent: Some("".into()),
+            inputID: Some("msg_inbox_1".into()),
+        });
+        let updates = to_updates(&started, &mut state);
+        let acp::SessionUpdate::SessionInfoUpdate(info) = &updates[0] else {
+            panic!("expected session_info_update")
+        };
+        let obj = info
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("opencode/compaction"))
+            .and_then(|v| v.as_object())
+            .expect("compaction object");
+        assert_eq!(obj.get("status"), Some(&serde_json::json!("started")));
+        assert_eq!(obj.get("messageId"), Some(&serde_json::json!("msg_inbox_1")));
+
+        let failed = dto::SessionEvent::CompactionFailed(dto::CompactionFailed {
+            sessionID: "ses_x".into(),
+            reason: Some("manual".into()),
+            inputID: Some("msg_inbox_1".into()),
+            error: Some(dto::StructuredError {
+                kind: Some("compaction.unavailable".into()),
+                message: Some("Nothing to compact yet".into()),
+            }),
+        });
+        let updates = to_updates(&failed, &mut state);
+        let acp::SessionUpdate::SessionInfoUpdate(info) = &updates[0] else {
+            panic!("expected session_info_update")
+        };
+        let obj = info
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("opencode/compaction"))
+            .and_then(|v| v.as_object())
+            .expect("compaction object");
+        assert_eq!(obj.get("status"), Some(&serde_json::json!("failed")));
+        assert_eq!(
+            obj.get("error").and_then(|e| e.get("message")),
+            Some(&serde_json::json!("Nothing to compact yet"))
+        );
+        // The tolerant ended event also maps to a meta push.
+        let ended = dto::SessionEvent::CompactionEnded(dto::CompactionEnded {
+            sessionID: "ses_x".into(),
+            reason: None,
+            inputID: None,
+        });
+        let updates = to_updates(&ended, &mut state);
+        let acp::SessionUpdate::SessionInfoUpdate(info) = &updates[0] else {
+            panic!("expected session_info_update")
+        };
+        assert_eq!(
+            info.meta
+                .as_ref()
+                .and_then(|m| m.get("opencode/compaction"))
+                .and_then(|v| v.get("status")),
+            Some(&serde_json::json!("ended"))
+        );
+    }
+
+    #[test]
+    fn child_projection_prefixes_ids_and_titles() {
+        let mut state = MappingState::new();
+        let ns = ToolNs {
+            child_id: "ses_child_1".into(),
+            child_title: "Explore the repo".into(),
+        };
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_child_1", "msg_c1", "call_c1"),
+            name: "grep".into(),
+        });
+        let updates = to_child_updates(&started, &ns, &mut state);
+        assert_eq!(updates.len(), 1);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call update")
+        };
+        assert_eq!(u.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
+        assert_eq!(u.fields.title, Some("Explore the repo: grep".into()));
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Pending));
+
+        // Success closes the NAMESPACED id and prefixes the meta title.
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_child_1", "msg_c1", "call_c1"),
+            content: None,
+            metadata: Some(dto::ToolMetadata {
+                title: Some("grep *.rs".into()),
+                diff: None,
+                filediff: None,
+                truncated: None,
+                diagnostics: None,
+            }),
+            executed: None,
+        });
+        let updates = to_child_updates(&success, &ns, &mut state);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call update")
+        };
+        assert_eq!(u.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
+        assert_eq!(u.fields.title, Some("Explore the repo: grep *.rs".into()));
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Completed));
+        assert!(state.abandon_open_tools().is_empty(), "namespaced call closed");
+
+        // Non-tool child events do not project.
+        let exec = dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+            sessionID: "ses_child_1".into(),
+        });
+        assert!(to_child_updates(&exec, &ns, &mut state).is_empty());
+        let text = dto::SessionEvent::TextDelta(dto::TextDelta {
+            base: dto::OrdinalRef {
+                sessionID: "ses_child_1".into(),
+                assistantMessageID: "msg_c1".into(),
+                ordinal: Some(0),
+            },
+            delta: "child thinking".into(),
+        });
+        assert!(to_child_updates(&text, &ns, &mut state).is_empty());
+        // …and the permission input cache is keyed by the namespaced id.
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_child_1", "msg_c1", "call_c2"),
+            text: r#"{"command": "ls"}"#.into(),
+        });
+        let _ = to_child_updates(&ended, &ns, &mut state);
+        assert_eq!(
+            state.tool_input("ses_child_1:call_c2"),
+            Some(&serde_json::json!({"command": "ls"}))
+        );
+        assert_eq!(state.tool_input("call_c2"), None);
+    }
+
+    #[test]
+    fn step_failed_maps_through_the_failure_taxonomy() {
+        let event = dto::SessionEvent::StepFailed(dto::StepFailed {
+            session: dto::SessionRef { sessionID: "ses_x".into() },
+            assistantMessageID: "msg_x".into(),
+            error: dto::StructuredError {
+                kind: Some("provider.auth".into()),
+                message: Some("auth expired".into()),
+            },
+            finish: None,
+        });
+        // No ACP update for step failures (v1 has no per-step surface)…
+        let mut state = MappingState::new();
+        assert!(to_updates(&event, &mut state).is_empty());
+        assert_eq!(event_session_id(&event), Some("ses_x"));
+        // …but the taxonomy is exposed for the agent layer to log.
+        let outcome = step_failed_outcome(&event).expect("step outcome");
+        assert!(matches!(outcome, TurnEnd::AuthRequired { .. }), "{outcome:?}");
+        assert!(step_failed_outcome(&dto::SessionEvent::ExecutionSucceeded(
+            dto::SessionRef { sessionID: "ses_x".into() }
+        ))
+        .is_none());
     }
 }
