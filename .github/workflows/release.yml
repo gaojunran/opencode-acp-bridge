@@ -60,4 +60,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          gh release create "$tag" dist/* --title "$tag" --generate-notes
+          gh release create "$tag" dist/* --repo "${GITHUB_REPOSITORY}" --title "$tag" --generate-notes
