@@ -24,8 +24,9 @@ use agent_client_protocol::{
     Agent, Client, ConnectionTo, Error as AcpError, Responder, on_receive_notification,
     on_receive_request,
 };
-use opencode_acp_bridge::acp::agent::{AgentService, OpenCodeBackend};
+use opencode_acp_bridge::acp::agent::{AgentService, BoxFuture, EventStream, OpenCodeBackend};
 use opencode_acp_bridge::bridge::backend::HttpBackend;
+use opencode_acp_bridge::dto;
 use opencode_acp_bridge::dto::ModelRef;
 use opencode_acp_bridge::opencode::api::OpencodeClient;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -231,6 +232,269 @@ async fn lane_c_duplex_e2e() {
     );
 
     remove_artifacts(SESSION_DIR);
+}
+
+// ============================================================
+// Wave 6a E2E: session/list + resume + delete + commands push
+// ============================================================
+
+/// Test-local backend for the Wave 6a E2E: the core delegates to the real
+/// [`HttpBackend`]; the Wave 6a surface (list/delete/commands) overrides
+/// with live wire calls. The wave boundary keeps `src/bridge/**` frozen, so
+/// the production overrides on `HttpBackend` land in a follow-up wave — this
+/// wrapper exercises exactly the same wire calls the production override
+/// will, through the same [`OpencodeClient`].
+struct WireBackend {
+    inner: Arc<HttpBackend>,
+    client: OpencodeClient,
+}
+
+impl OpenCodeBackend for WireBackend {
+    fn create_session(&self, cwd: &str) -> BoxFuture<'_, Result<String, anyhow::Error>> {
+        self.inner.create_session(cwd)
+    }
+
+    fn prompt(&self, session_id: &str, text: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        self.inner.prompt(session_id, text)
+    }
+
+    fn interrupt(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        self.inner.interrupt(session_id)
+    }
+
+    fn messages(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<dto::MessageRecord>, anyhow::Error>> {
+        self.inner.messages(session_id)
+    }
+
+    fn event_stream(&self, session_id: &str) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
+        self.inner.event_stream(session_id)
+    }
+
+    fn permission_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: dto::PermissionReply,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        self.inner.permission_reply(session_id, request_id, decision)
+    }
+
+    fn list_commands(&self) -> BoxFuture<'_, Option<Vec<serde_json::Value>>> {
+        let client = self.client.clone();
+        Box::pin(async move { client.commands().await.ok() })
+    }
+
+    fn list_sessions(
+        &self,
+        directory: Option<&str>,
+        cursor: Option<&str>,
+    ) -> BoxFuture<'_, Result<(Vec<dto::SessionInfo>, Option<String>), anyhow::Error>> {
+        let client = self.client.clone();
+        let directory = directory.map(str::to_string);
+        // The ACP cursor is opaque — forward it as the `next` token.
+        let cursor = cursor.map(|c| dto::Cursor { previous: None, next: Some(c.to_string()) });
+        Box::pin(async move {
+            let env = client.list_sessions(directory.as_deref(), cursor.as_ref()).await?;
+            let next = env.cursor.as_ref().and_then(|c| c.next.clone());
+            Ok((env.data, next))
+        })
+    }
+
+    fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            client.delete_session(&session_id).await?;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BRIDGE_IT=1 and the scratch 2.0.21 server on 127.0.0.1:47779"]
+async fn wave6a_session_management_e2e() {
+    if !it_enabled() {
+        eprintln!("skipped: BRIDGE_IT=1 not set");
+        return;
+    }
+
+    std::fs::create_dir_all(SESSION_DIR).expect("mkdir it-laneC");
+
+    let client = OpencodeClient::new(SCRATCH, SCRATCH_PASSWORD).expect("valid scratch URL");
+    client
+        .config()
+        .await
+        .unwrap_or_else(|e| panic!("scratch server {SCRATCH} unreachable (restart per docs/opencode-api.md recipe): {e}"));
+
+    let wire_backend = Arc::new(WireBackend {
+        inner: Arc::new(HttpBackend::new(client.clone())),
+        client: client.clone(),
+    });
+    let svc = Arc::new(AgentService::new(
+        wire_backend.clone() as Arc<dyn OpenCodeBackend>
+    ));
+    let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+    let agent_task = tokio::spawn({
+        let svc = Arc::clone(&svc);
+        async move { let _ = svc.serve(agent_side).await; }
+    });
+
+    let all_updates = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+
+    let outcome: Result<(), AcpError> = Client
+        .builder()
+        .name("bridge-it-wave6a")
+        .on_receive_notification(
+            {
+                let all_updates = Arc::clone(&all_updates);
+                async move |notif: SessionNotification, _cx| {
+                    all_updates.lock().expect("updates lock").push(notif);
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(client_side, {
+            let client = client.clone();
+            let all_updates = Arc::clone(&all_updates);
+            async move |cx| {
+                // 1. initialize — the session-management ring is advertised.
+                let init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let sc = &init.agent_capabilities.session_capabilities;
+                assert!(sc.list.is_some() && sc.delete.is_some() && sc.resume.is_some(),
+                    "list/delete/resume advertised: {sc:?}");
+
+                // 2. newSession → initial available_commands_update push
+                //    (non-empty: the scratch server has slash commands).
+                let ns = cx
+                    .send_request(NewSessionRequest::new(SESSION_DIR))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+                assert!(sid.0.starts_with("ses_"), "opencode session id passthrough, got {}", sid.0);
+
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let push = loop {
+                    let found = all_updates.lock().expect("updates lock").iter().find_map(|n| {
+                        match &n.update {
+                            acp::SessionUpdate::AvailableCommandsUpdate(u) if n.session_id == sid => {
+                                Some(u.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(found) = found {
+                        break found;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "available_commands_update did not arrive within 10s"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                assert!(
+                    !push.available_commands.is_empty(),
+                    "scratch server exposes slash commands"
+                );
+                assert!(push.available_commands.iter().all(|c| !c.name.is_empty()));
+                assert!(
+                    push.available_commands.iter().all(|c| c.input.is_none()),
+                    "opencode commands carry no input schema"
+                );
+
+                // 3. Give the session real history (a live turn), so a
+                //    broken resume that replays would be observable.
+                client
+                    .set_model(
+                        &sid.0,
+                        &ModelRef {
+                            id: MODEL_ID.into(),
+                            providerID: MODEL_PROVIDER.into(),
+                            variant: None,
+                        },
+                    )
+                    .await
+                    .expect("set_model on scratch");
+                let prompt = cx.send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("Reply with: e2e resume ok"))],
+                ));
+                let resp = tokio::time::timeout(Duration::from_secs(120), prompt.block_task())
+                    .await
+                    .expect("live turn did not finish within 120s")?;
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+
+                // 3b. session/list with the cwd filter sees the session,
+                //     with an ISO 8601 UTC updatedAt from the wire time.
+                let list = cx
+                    .send_request(acp::ListSessionsRequest::new()
+                        .cwd(std::path::PathBuf::from(SESSION_DIR)))
+                    .block_task()
+                    .await?;
+                let listed = list
+                    .sessions
+                    .iter()
+                    .find(|s| s.session_id == sid)
+                    .expect("the new session appears in session/list");
+                if let Some(ts) = &listed.updated_at {
+                    assert_eq!(ts.len(), 20, "YYYY-MM-DDTHH:MM:SSZ: {ts}");
+                    assert!(ts.as_bytes()[10] == b'T' && ts.ends_with('Z'), "ISO 8601 UTC: {ts}");
+                }
+
+                // 4. resume — zero replay. Only the resume's own commands
+                //    push may arrive after the response.
+                let before = all_updates.lock().expect("updates lock").len();
+                let resume = cx
+                    .send_request(acp::ResumeSessionRequest::new(sid.clone(), SESSION_DIR))
+                    .block_task()
+                    .await?;
+                assert!(resume.modes.is_none());
+                tokio::time::sleep(Duration::from_millis(250)).await; // stray replay would land by now
+                let tail: Vec<_> = all_updates.lock().expect("updates lock")[before..].to_vec();
+                for n in &tail {
+                    assert!(
+                        matches!(&n.update, acp::SessionUpdate::AvailableCommandsUpdate(_)),
+                        "resume must not replay history, got {:?}",
+                        n.update
+                    );
+                }
+
+                // 5. delete — empty response; the session vanishes from list.
+                let _ = cx
+                    .send_request(acp::DeleteSessionRequest::new(sid.clone()))
+                    .block_task()
+                    .await?;
+                let list = cx
+                    .send_request(acp::ListSessionsRequest::new()
+                        .cwd(std::path::PathBuf::from(SESSION_DIR)))
+                    .block_task()
+                    .await?;
+                assert!(
+                    !list.sessions.iter().any(|s| s.session_id == sid),
+                    "deleted session gone from session/list"
+                );
+
+                Ok(())
+            }
+        })
+        .await;
+
+    agent_task.abort();
+    // Belt and braces: never leave the scratch session behind.
+    if let Ok(env) = client.list_sessions(Some(SESSION_DIR), None).await {
+        for s in env.data {
+            if s.id.starts_with("ses_") {
+                let _ = client.delete_session(&s.id).await;
+            }
+        }
+    }
+    outcome.expect("wave 6a client run ok");
 }
 
 // ============================================================

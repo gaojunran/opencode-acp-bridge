@@ -1,9 +1,11 @@
-//! ACP agent assembly (Wave 1 skeleton).
+//! ACP agent assembly.
 //!
-//! Protocol surface only — the stdio main loop and the `session/list` +
-//! `session/resume` unstable surface arrive in Wave 2. The ACP ↔ opencode
-//! wiring runs through the [`OpenCodeBackend`] trait (implemented by the
-//! HTTP/SSE lane), which keeps this module fully mock-testable.
+//! Protocol surface: initialize / newSession / loadSession / resume / list /
+//! delete / prompt / cancel (Wave 6a closes the session-management ring:
+//! `session/list`, `session/resume`, `session/delete` + the
+//! `available_commands_update` initial push). The ACP ↔ opencode wiring runs
+//! through the [`OpenCodeBackend`] trait (implemented by the HTTP/SSE lane),
+//! which keeps this module fully mock-testable.
 //!
 //! Concurrency note: the prompt turn is **spawned** (`ConnectionTo::spawn`)
 //! rather than awaited inline, so the dispatch loop stays free to process
@@ -30,6 +32,10 @@ use super::{replay, updates};
 /// Convenience aliases for backend implementors.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type EventStream = Pin<Box<dyn Stream<Item = dto::SessionEvent> + Send>>;
+
+/// Wave 6a: a session list — (sessions, next-page token).
+/// (Kept in the `list_sessions` fallible signature to stay readable.)
+pub type SessionList = (Vec<dto::SessionInfo>, Option<String>);
 
 /// The opencode-facing capabilities Lane B needs (implemented by the HTTP/SSE
 /// lane in Wave 2). The event stream is the session-tagged SSE stream:
@@ -80,6 +86,26 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     /// Same default-unavailable contract as [`Self::list_models`].
     fn list_commands(&self) -> BoxFuture<'_, Option<Vec<serde_json::Value>>> {
         Box::pin(async { None })
+    }
+
+    /// Wave 6: list opencode sessions for a directory (`session/list`
+    /// backend). `cursor` is the ACP opaque page token, forwarded verbatim
+    /// (as the `next` token). Returns (sessions, next-page token — the wire
+    /// envelope's `next` cursor, if any). Default: unavailable — same wave
+    /// boundary as [`Self::list_models`]; the live override lands in a
+    /// follow-up wave.
+    fn list_sessions(
+        &self,
+        _directory: Option<&str>,
+        _cursor: Option<&str>,
+    ) -> BoxFuture<'_, Result<SessionList, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("list_sessions not available on this backend")) })
+    }
+
+    /// Wave 6: delete a session (`session/delete` backend). Default:
+    /// unavailable — same wave boundary as [`Self::list_models`].
+    fn delete_session(&self, _session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("delete_session not available on this backend")) })
     }
 }
 
@@ -151,8 +177,38 @@ impl AgentService {
             .on_receive_request(
                 {
                     let svc = Arc::clone(&self);
-                    async move |req: acp::NewSessionRequest, responder, _cx| {
-                        svc.new_session(req, responder).await
+                    async move |req: acp::NewSessionRequest, responder, cx| {
+                        svc.new_session(req, responder, cx).await
+                    }
+                },
+                on_receive_request!(),
+            )
+            // ---------- listSession ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::ListSessionsRequest, responder, _cx| {
+                        svc.list_sessions(req, responder).await
+                    }
+                },
+                on_receive_request!(),
+            )
+            // ---------- resumeSession ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::ResumeSessionRequest, responder, cx| {
+                        svc.resume_session(req, responder, cx).await
+                    }
+                },
+                on_receive_request!(),
+            )
+            // ---------- deleteSession ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::DeleteSessionRequest, responder, _cx| {
+                        svc.delete_session(req, responder).await
                     }
                 },
                 on_receive_request!(),
@@ -205,7 +261,15 @@ impl AgentService {
         req: acp::InitializeRequest,
         responder: Responder<acp::InitializeResponse>,
     ) -> Result<(), AcpError> {
-        let caps = acp::AgentCapabilities::new().load_session(true);
+        // Wave 6a: advertise the session-management ring. Each sub-capability
+        // is a marker struct — `{}` on the wire (schema 1.5.0 stable; only
+        // `fork` is unstable-feature-gated, we do not advertise it).
+        let caps = acp::AgentCapabilities::new().load_session(true).session_capabilities(
+            acp::SessionCapabilities::new()
+                .list(acp::SessionListCapabilities::new())
+                .delete(acp::SessionDeleteCapabilities::new())
+                .resume(acp::SessionResumeCapabilities::new()),
+        );
         let info = acp::Implementation::new(
             "opencode-acp-bridge",
             concat!("opencode ", env!("CARGO_PKG_VERSION")),
@@ -218,9 +282,10 @@ impl AgentService {
     }
 
     async fn new_session(
-        &self,
+        self: &Arc<Self>,
         req: acp::NewSessionRequest,
         responder: Responder<acp::NewSessionResponse>,
+        cx: ConnectionTo<Client>,
     ) -> Result<(), AcpError> {
         let cwd = req.cwd;
         if !cwd.is_absolute() {
@@ -248,11 +313,95 @@ impl AgentService {
             }),
         );
         tracing::info!(session_id, "ACP newSession -> opencode session");
-        responder.respond(acp::NewSessionResponse::new(session_id))
+        let session_id = acp::SessionId::from(session_id);
+        responder.respond(acp::NewSessionResponse::new(session_id.clone()))?;
+        // Wave 6a: initial `available_commands_update` push, AFTER the
+        // response, spawned so the fetch can never gate session creation.
+        self.spawn_commands_push(&session_id, &cx);
+        Ok(())
+    }
+
+    /// Wave 6a `session/list`: list the sessions of a directory, mapping
+    /// each opencode session into ACP [`acp::SessionInfo`]. The ACP cursor is
+    /// opaque — forwarded verbatim, and the wire envelope's `next` token
+    /// comes back as `nextCursor`.
+    async fn list_sessions(
+        &self,
+        req: acp::ListSessionsRequest,
+        responder: Responder<acp::ListSessionsResponse>,
+    ) -> Result<(), AcpError> {
+        let cwd = req.cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+        let (sessions, next) = match self
+            .backend
+            .list_sessions(cwd.as_deref(), req.cursor.as_deref())
+            .await
+        {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::error!(error = %e, "backend list_sessions failed");
+                return responder.respond_with_internal_error(format!(
+                    "failed to list sessions: {e}"
+                ));
+            }
+        };
+        let mapped: Vec<acp::SessionInfo> = sessions
+            .iter()
+            .map(|s| to_acp_session_info(s, cwd.as_deref()))
+            .collect();
+        tracing::info!(sessions = mapped.len(), ?next, "ACP session/list");
+        responder.respond(acp::ListSessionsResponse::new(mapped).next_cursor(next))
+    }
+
+    /// Wave 6a `session/resume`: like `session/load` (register the session
+    /// so a later prompt works) but WITHOUT replaying history — the response
+    /// carries only modes/configOptions (both `None` here, matching load).
+    async fn resume_session(
+        self: &Arc<Self>,
+        req: acp::ResumeSessionRequest,
+        responder: Responder<acp::ResumeSessionResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        // Register unconditionally — the client may resume a session this
+        // bridge never loaded, and the next prompt must still route.
+        self.sessions.lock().expect("sessions lock").insert(
+            req.session_id.clone(),
+            Arc::new(SessionEntry {
+                cancel: AtomicBool::new(false),
+                cwd: req.cwd.to_string_lossy().to_string(),
+            }),
+        );
+        tracing::info!(session = %req.session_id, "ACP session/resume (no replay)");
+        responder.respond(acp::ResumeSessionResponse::new())?;
+        // Wave 6a: initial `available_commands_update` push, after the
+        // response (spawned — never gate the resume).
+        self.spawn_commands_push(&req.session_id, &cx);
+        Ok(())
+    }
+
+    /// Wave 6a `session/delete`: drop the registry entry and delete the
+    /// opencode session. Empty response `{}` on success.
+    async fn delete_session(
+        &self,
+        req: acp::DeleteSessionRequest,
+        responder: Responder<acp::DeleteSessionResponse>,
+    ) -> Result<(), AcpError> {
+        self.sessions.lock().expect("sessions lock").remove(&req.session_id);
+        match self.backend.delete_session(&req.session_id.0).await {
+            Ok(()) => {
+                tracing::info!(session = %req.session_id, "ACP session/delete -> opencode");
+                responder.respond(acp::DeleteSessionResponse::new())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, session = %req.session_id, "backend delete_session failed");
+                responder.respond_with_internal_error(format!(
+                    "opencode session deletion failed: {e}"
+                ))
+            }
+        }
     }
 
     async fn load_session(
-        &self,
+        self: &Arc<Self>,
         req: acp::LoadSessionRequest,
         responder: Responder<acp::LoadSessionResponse>,
         cx: ConnectionTo<Client>,
@@ -281,7 +430,11 @@ impl AgentService {
                 cwd: req.cwd.to_string_lossy().to_string(),
             }),
         );
-        responder.respond(acp::LoadSessionResponse::new())
+        responder.respond(acp::LoadSessionResponse::new())?;
+        // Wave 6a: initial `available_commands_update` push, after the
+        // response (spawned — never gate the load).
+        self.spawn_commands_push(&req.session_id, &cx);
+        Ok(())
     }
 
     /// The ongoing turn: forwards mapped updates, answers the prompt at
@@ -750,6 +903,66 @@ impl AgentService {
         }
     }
 
+    /// Wave 6a: initial `available_commands_update` push (full-replacement
+    /// semantics) after a session lifecycle response — newSession, loadSession
+    /// and resume each push once, targeted at the new/loaded session. The
+    /// wire catalog is global (`GET /api/command` carries no directory), so
+    /// the fetch is per-push and the cwd scoping is the session the push
+    /// targets. Sent on a spawned task so the lifecycle response is never
+    /// gated on the catalog fetch.
+    fn spawn_commands_push(self: &Arc<Self>, session_id: &acp::SessionId, cx: &ConnectionTo<Client>) {
+        let session_id = session_id.clone();
+        let svc = Arc::clone(self);
+        let task_cx = cx.clone();
+        let log_id = session_id.clone();
+        if let Err(e) = cx.clone().spawn(async move {
+            svc.push_available_commands(&session_id, &task_cx).await;
+            Ok(())
+        }) {
+            tracing::warn!(error = %e, session = %log_id, "commands push spawn failed");
+        }
+    }
+
+    /// The push itself: fetch the command catalog and send one
+    /// `available_commands_update` (full replacement). opencode commands have
+    /// no input schema, so ACP `input` is omitted. Degrades gracefully: no
+    /// catalog or an empty one → warn/skip, never an error (session
+    /// establishment is unaffected).
+    async fn push_available_commands(self: &Arc<Self>, session_id: &acp::SessionId, cx: &ConnectionTo<Client>) {
+        // Fetch failures surface as `None` (the trait's Option return cannot
+        // express the error distantly); warn per the drop-degradation
+        // contract so the skip is visible in logs.
+        let Some(commands) = self.backend.list_commands().await else {
+            tracing::warn!(session = %session_id, "commands push skipped: no command catalog");
+            return;
+        };
+        if commands.is_empty() {
+            return;
+        }
+        // Command shape on the wire: `{name, description?}` (Command.Info,
+        // live-probed; `changelog`-style entries carry no description).
+        // ACP requires a description — default to "". No input schema.
+        let available: Vec<acp::AvailableCommand> = commands
+            .iter()
+            .filter_map(|c| {
+                let name = c.get("name")?.as_str()?;
+                let description = c
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some(acp::AvailableCommand::new(name.to_string(), description))
+            })
+            .collect();
+        if available.is_empty() {
+            return;
+        }
+        let update =
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(available));
+        tracing::info!(session = %session_id, "available_commands_update push");
+        let _ = cx.send_notification(acp::SessionNotification::new(session_id.clone(), update));
+    }
+
     /// Wave 4: push `config_option_update` (the model catalog as options)
     /// after a catalog reload (`model.updated` / `provider.updated` — both
     /// carry `{}`; the catalog is re-fetched). Skipped when the backend has
@@ -812,6 +1025,66 @@ impl AgentService {
     }
 }
 
+// ============================================================
+// Wave 6a mapping helpers (session/list)
+// ============================================================
+
+/// Map one opencode wire session into ACP `SessionInfo`.
+///
+/// - `session_id` / `cwd`: the wire `id` + `location.directory` (the ACP
+///   type requires a cwd; sessions returned for a filtered list fall back to
+///   the request filter, then to empty — the wire always carries a location
+///   for real sessions).
+/// - `title`: passthrough.
+/// - `updated_at`: the wire `time.updated` (epoch **milliseconds**) converted
+///   to ISO 8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`); absent → `None`.
+/// - `additional_directories`: not modeled on the wire — stays empty
+///   (omitted from the response via the crate's skip-serialization).
+fn to_acp_session_info(session: &dto::SessionInfo, fallback_cwd: Option<&str>) -> acp::SessionInfo {
+    let cwd = session
+        .location
+        .as_ref()
+        .map(|l| l.directory.as_str())
+        .or(fallback_cwd)
+        .unwrap_or_default();
+    let updated_at = session
+        .time
+        .as_ref()
+        .and_then(|t| t.get("updated"))
+        .and_then(|u| {
+            u.as_i64()
+                .or_else(|| u.as_u64().map(|v| v as i64))
+                .or_else(|| u.as_f64().map(|v| v as i64))
+        })
+        .and_then(epoch_ms_to_iso);
+    acp::SessionInfo::new(session.id.clone(), cwd)
+        .title(session.title.clone())
+        .updated_at(updated_at)
+}
+
+/// Epoch milliseconds → RFC 3339 UTC `YYYY-MM-DDTHH:MM:SSZ` (no sub-second
+/// precision), via Howard Hinnant's civil-from-days algorithm. No `chrono`/
+/// `time` dependency on purpose (both are absent from Cargo.toml and the
+/// wave may not touch it); the 40-line algorithm is fully unit-tested.
+pub fn epoch_ms_to_iso(epoch_ms: i64) -> Option<String> {
+    let secs = epoch_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (h, min, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    Some(format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +1103,8 @@ mod tests {
         events: Mutex<Option<mpsc::UnboundedReceiver<dto::SessionEvent>>>,
         events_tx: Mutex<Option<mpsc::UnboundedSender<dto::SessionEvent>>>,
         messages_out: Mutex<Option<Vec<dto::MessageRecord>>>,
+        /// Wave 6a: set by `messages()` — resume must never call it.
+        messages_called: AtomicBool,
         interrupted: AtomicBool,
         interrupt_seen: Mutex<Option<oneshot::Sender<()>>>,
         /// Recorded (session_id, request_id, decision) of permission replies.
@@ -837,6 +1112,17 @@ mod tests {
         permission_seen: Mutex<Option<oneshot::Sender<()>>>,
         /// Wave 4: canned model catalog for `config_option_update` pushes.
         models: Mutex<Option<Vec<dto::ModelInfo>>>,
+        /// Wave 6a: canned session list for `session/list`.
+        sessions_out: Mutex<Option<Vec<dto::SessionInfo>>>,
+        /// Wave 6a: every (directory, cursor) pair handed to `list_sessions`.
+        list_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+        /// Wave 6a: session ids passed to `delete_session`.
+        deleted: Mutex<Vec<String>>,
+        /// Wave 6a: canned command catalog for `available_commands_update`.
+        commands: Mutex<Option<Vec<serde_json::Value>>>,
+        /// Wave 6a: optional gate — `list_commands` blocks until released
+        /// (proves the lifecycle response is not gated on the catalog fetch).
+        commands_gate: Mutex<Option<oneshot::Receiver<()>>>,
     }
 
     impl MockBackend {
@@ -846,11 +1132,17 @@ mod tests {
                 events: Mutex::new(Some(rx)),
                 events_tx: Mutex::new(Some(tx)),
                 messages_out: Mutex::new(None),
+                messages_called: AtomicBool::new(false),
                 interrupted: AtomicBool::new(false),
                 interrupt_seen: Mutex::new(None),
                 permission_replies: Mutex::new(Vec::new()),
                 permission_seen: Mutex::new(None),
                 models: Mutex::new(None),
+                sessions_out: Mutex::new(None),
+                list_calls: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
+                commands: Mutex::new(None),
+                commands_gate: Mutex::new(None),
             })
         }
 
@@ -862,6 +1154,31 @@ mod tests {
 
         fn set_messages(&self, records: Vec<dto::MessageRecord>) {
             *self.messages_out.lock().expect("messages lock") = Some(records);
+        }
+
+        fn set_sessions(&self, sessions: Vec<dto::SessionInfo>) {
+            *self.sessions_out.lock().expect("sessions lock") = Some(sessions);
+        }
+
+        fn recorded_list_calls(&self) -> Vec<(Option<String>, Option<String>)> {
+            self.list_calls.lock().expect("list lock").clone()
+        }
+
+        fn recorded_deleted(&self) -> Vec<String> {
+            self.deleted.lock().expect("deleted lock").clone()
+        }
+
+        fn set_commands(&self, commands: Vec<serde_json::Value>) {
+            *self.commands.lock().expect("commands lock") = Some(commands);
+        }
+
+        /// Block the next `list_commands` call until the returned sender
+        /// fires — used to prove the lifecycle response is sent before the
+        /// catalog fetch runs.
+        fn gate_commands(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.commands_gate.lock().expect("gate lock") = Some(rx);
+            tx
         }
 
         fn install_interrupt_seen(&self) -> oneshot::Receiver<()> {
@@ -909,6 +1226,7 @@ mod tests {
             &self,
             _session_id: &str,
         ) -> BoxFuture<'_, Result<Vec<dto::MessageRecord>, anyhow::Error>> {
+            self.messages_called.store(true, Ordering::SeqCst);
             let out =
                 self.messages_out.lock().expect("messages lock").take().unwrap_or_default();
             Box::pin(async move { Ok(out) })
@@ -951,6 +1269,44 @@ mod tests {
         fn list_models(&self) -> BoxFuture<'_, Option<Vec<dto::ModelInfo>>> {
             let models = self.models.lock().expect("models lock").clone();
             Box::pin(async move { models })
+        }
+
+        fn list_commands(&self) -> BoxFuture<'_, Option<Vec<serde_json::Value>>> {
+            let commands = self.commands.lock().expect("commands lock").clone();
+            let gate = self.commands_gate.lock().expect("gate lock").take();
+            Box::pin(async move {
+                if let Some(rx) = gate {
+                    // Test gate: block until the client releases. A bounded
+                    // wait keeps a broken implementation from hanging CI.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        rx,
+                    )
+                    .await;
+                }
+                commands
+            })
+        }
+
+        fn list_sessions(
+            &self,
+            directory: Option<&str>,
+            cursor: Option<&str>,
+        ) -> BoxFuture<'_, Result<(Vec<dto::SessionInfo>, Option<String>), anyhow::Error>> {
+            self.list_calls.lock().expect("list lock").push((
+                directory.map(str::to_string),
+                cursor.map(str::to_string),
+            ));
+            let out = self.sessions_out.lock().expect("sessions lock").clone();
+            // Echo the request cursor back as the next token: proves the
+            // opaque token round-trips through the handler untouched.
+            let next = cursor.map(str::to_string).or_else(|| Some("next-page-token".into()));
+            Box::pin(async move { Ok((out.unwrap_or_default(), next)) })
+        }
+
+        fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.deleted.lock().expect("deleted lock").push(session_id.to_string());
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2175,5 +2531,375 @@ mod tests {
         assert_eq!(values[0].name.as_str(), "GLM 5.3");
         assert_eq!(values[1].value.0.as_ref(), "astra/deepseek_v4_flash_code");
         assert_eq!(values[1].name.as_str(), "deepseek_v4_flash_code");
+    }
+
+    // ======================= Wave 6a: session management =======================
+
+    /// One-session wire shape for list tests (matches the session-create
+    /// fixture: `time` is `{created, updated}` epoch **milliseconds**).
+    fn wire_session(id: &str, title: Option<&str>, location: Option<&str>, updated_ms: Option<u64>) -> dto::SessionInfo {
+        dto::SessionInfo {
+            id: id.into(),
+            projectID: None,
+            title: title.map(str::to_string),
+            version: None,
+            subpath: None,
+            location: location.map(|d| dto::Location { directory: d.into() }),
+            agent: None,
+            model: None,
+            summary: None,
+            cost: None,
+            tokens: None,
+            time: updated_ms.map(|ms| {
+                serde_json::json!({
+                    "created": ms,
+                    "updated": ms,
+                })
+            }),
+        }
+    }
+
+    /// Shared duplex harness: agent on one end, a notification-collecting
+    /// client on the other; `f` runs the client script. Aborts the agent
+    /// task when the script completes and returns (outcome, notifications).
+    async fn run_client<F, Fut>(
+        svc: Arc<AgentService>,
+        backend: Arc<MockBackend>,
+        f: F,
+    ) -> (
+        Result<(), AcpError>,
+        Arc<Mutex<Vec<SessionNotification>>>,
+    )
+    where
+        F: FnOnce(
+                Arc<MockBackend>,
+                Arc<Mutex<Vec<SessionNotification>>>,
+                ConnectionTo<Agent>,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<(), AcpError>> + Send,
+    {
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move { let _ = svc.serve(agent_side).await; }
+        });
+        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+        let outcome: Result<(), AcpError> = Client
+            .builder()
+            .name("acp-test-client")
+            .on_receive_notification(
+                {
+                    let collected = Arc::clone(&collected);
+                    async move |notif: SessionNotification, _cx| {
+                        collected.lock().expect("collected lock").push(notif);
+                        Ok(())
+                    }
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(
+                client_side,
+                {
+                    let backend = Arc::clone(&backend);
+                    let collected = Arc::clone(&collected);
+                    async move |cx| f(backend, collected, cx).await
+                },
+            )
+            .await;
+        agent_task.abort();
+        (outcome, collected)
+    }
+
+    /// Wait until `pred` holds over the collected notifications (bounded).
+    async fn wait_for<F: Fn(&[SessionNotification]) -> bool>(collected: &Arc<Mutex<Vec<SessionNotification>>>, pred: F) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if pred(&collected.lock().expect("collected lock")) {
+                return;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("notification did not arrive within 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn commands_pushes(collected: &[SessionNotification]) -> Vec<&acp::AvailableCommandsUpdate> {
+        collected
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::AvailableCommandsUpdate(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_list_delete_resume_capabilities() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let init = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let caps = init.agent_capabilities;
+            assert!(caps.load_session);
+            // Wave 6a: list/delete/resume are marker structs — `{}` on the wire.
+            assert!(caps.session_capabilities.list.is_some(), "session/list advertised");
+            assert!(caps.session_capabilities.delete.is_some(), "session/delete advertised");
+            assert!(caps.session_capabilities.resume.is_some(), "session/resume advertised");
+            // Not advertised: close, fork (unstable), additionalDirectories.
+            assert!(caps.session_capabilities.close.is_none());
+            assert!(caps.session_capabilities.additional_directories.is_none());
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_passes_cursor_and_maps_session_info() {
+        let backend = MockBackend::new();
+        backend.set_sessions(vec![
+            wire_session("ses_list_1", Some("checkout review"), Some("/tmp/elsewhere"), Some(1_791_023_018_226)),
+            wire_session("ses_list_2", None, None, None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let resp = cx
+                .send_request(
+                acp::ListSessionsRequest::new()
+                    .cwd(std::path::PathBuf::from("/tmp/opencode/acp-fixture-project"))
+                    .cursor("tok-7"),
+            )
+                .block_task()
+                .await?;
+            // The opaque token round-trips: request cursor → backend → response.
+            assert_eq!(resp.next_cursor.as_deref(), Some("tok-7"));
+            assert_eq!(resp.sessions.len(), 2);
+            let s1 = &resp.sessions[0];
+            assert_eq!(s1.session_id.0.as_ref(), "ses_list_1");
+            assert_eq!(s1.cwd.to_string_lossy().as_ref(), "/tmp/elsewhere");
+            assert_eq!(s1.title.as_deref(), Some("checkout review"));
+            // time.updated (epoch ms, live wire shape) → ISO 8601 UTC.
+            assert_eq!(s1.updated_at.as_deref(), Some("2026-10-03T10:23:38Z"));
+            // No wire location → the list filter's cwd; no time → updated_at None.
+            let s2 = &resp.sessions[1];
+            assert_eq!(s2.cwd.to_string_lossy().as_ref(), "/tmp/opencode/acp-fixture-project");
+            assert!(s2.title.is_none());
+            assert!(s2.updated_at.is_none());
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        // The backend saw the directory filter AND the cursor.
+        assert_eq!(
+            backend.recorded_list_calls(),
+            vec![(Some("/tmp/opencode/acp-fixture-project".into()), Some("tok-7".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_registers_without_replaying_and_prompt_works() {
+        let backend = MockBackend::new();
+        // A replayer would fetch history — make the mock notice.
+        backend.set_messages(vec![]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // Resume a session this bridge never loaded.
+            let resp = cx
+                .send_request(acp::ResumeSessionRequest::new(
+                    "ses_never_loaded",
+                    "/tmp/opencode/acp-fixture-project",
+                ))
+                .block_task()
+                .await?;
+            assert!(resp.modes.is_none());
+            assert!(resp.config_options.is_none());
+            // No command catalog → no push; the resumed session is registered,
+            // so a prompt must route (and end) normally.
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_never_loaded".into(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(
+                    "ses_never_loaded",
+                    vec![ContentBlock::Text(TextContent::new("hi"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(
+            !backend.messages_called.load(Ordering::SeqCst),
+            "resume must not fetch persisted history"
+        );
+        let notifications = collected.lock().expect("collected lock");
+        assert!(
+            notifications.is_empty(),
+            "zero updates around resume (no replay, no push): got {}",
+            notifications.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_calls_backend_and_unregisters() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let sid = ns.session_id.clone();
+            // Empty response `{}` on success.
+            let _ = cx
+                .send_request(acp::DeleteSessionRequest::new(sid.clone()))
+                .block_task()
+                .await?;
+            // The registry entry is gone: a prompt must fail as unknown.
+            let err = cx
+                .send_request(PromptRequest::new(
+                    sid,
+                    vec![ContentBlock::Text(TextContent::new("hi"))],
+                ))
+                .block_task()
+                .await
+                .expect_err("deleted session must be unknown");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(backend.recorded_deleted(), vec!["ses_mock_1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn commands_push_after_new_session_not_gated_on_fetch() {
+        let backend = MockBackend::new();
+        backend.set_commands(vec![
+            serde_json::json!({ "name": "review", "description": "review changes" }),
+            // Wire shape: a command may carry no description (
+            // `changelog` on the live probe) — ACP requires one.
+            serde_json::json!({ "name": "changelog" }),
+        ]);
+        // Gate the catalog fetch: the newSession response must arrive while
+        // the push is still blocked — proving the response is not gated on it.
+        let gate = backend.gate_commands();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns_fut = cx.send_request(NewSessionRequest::new("/tmp"));
+            let ns = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                ns_fut.block_task(),
+            )
+            .await
+            .expect("newSession response within 10s (must not wait for the command fetch)")
+            .expect("newSession ok");
+            let sid = ns.session_id.clone();
+            // Release the fetch; the push then completes.
+            let _ = gate.send(());
+            wait_for(&collected, |n| !commands_pushes(n).is_empty()).await;
+            assert_eq!(sid.0.as_ref(), "ses_mock_1");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        assert!(notifications.iter().all(|n| &*n.session_id.0 == "ses_mock_1"));
+        let pushes = commands_pushes(&notifications);
+        assert_eq!(pushes.len(), 1, "one push per newSession");
+        // Full replacement shape: every command, in wire order, name+
+        // description; `input` omitted (opencode has no input schema).
+        assert_eq!(pushes[0].available_commands.len(), 2);
+        let c0 = &pushes[0].available_commands[0];
+        assert_eq!(c0.name.as_str(), "review");
+        assert_eq!(c0.description.as_str(), "review changes");
+        assert!(c0.input.is_none());
+        let c1 = &pushes[0].available_commands[1];
+        assert_eq!(c1.name.as_str(), "changelog");
+        assert_eq!(c1.description.as_str(), "", "missing wire description defaults to empty");
+    }
+
+    #[tokio::test]
+    async fn load_and_resume_trigger_commands_push() {
+        let backend = MockBackend::new();
+        backend.set_commands(vec![serde_json::json!({ "name": "commit", "description": "git commit" })]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let _ = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new(
+                    "ses_mock_2",
+                    "/tmp/opencode/acp-fixture-project",
+                ))
+                .block_task()
+                .await?;
+            assert!(resume.modes.is_none());
+            // Both pushes are spawned after their responses — wait for both.
+            wait_for(&collected, |n| commands_pushes(n).len() >= 2).await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = commands_pushes(&notifications);
+        assert_eq!(pushes.len(), 2, "load and resume each push once");
+        // Each push is targeted at its own lifecycle session.
+        let sessions: std::collections::BTreeSet<&str> = notifications
+            .iter()
+            .filter_map(|n| {
+                matches!(&n.update, acp::SessionUpdate::AvailableCommandsUpdate(_))
+                    .then_some(&*n.session_id.0)
+            })
+            .collect();
+        assert_eq!(
+            sessions.into_iter().collect::<Vec<_>>(),
+            vec!["ses_mock_1", "ses_mock_2"]
+        );
+        assert!(pushes.iter().all(|p| p.available_commands.len() == 1));
+        assert_eq!(pushes[0].available_commands[0].name.as_str(), "commit");
+    }
+
+    #[test]
+    fn epoch_ms_to_iso_formats_utc_timestamp() {
+        assert_eq!(epoch_ms_to_iso(0), Some("1970-01-01T00:00:00Z".into()));
+        assert_eq!(epoch_ms_to_iso(86_400_000), Some("1970-01-02T00:00:00Z".into()));
+        // The live fixture value (session-create.json time.updated).
+        assert_eq!(epoch_ms_to_iso(1_791_023_018_226), Some("2026-10-03T10:23:38Z".into()));
+        // Sub-second precision is truncated (the schema wants seconds).
+        assert_eq!(epoch_ms_to_iso(1_791_023_018_226 + 999), Some("2026-10-03T10:23:39Z".into()));
+        // Leap day, pre-epoch, and epoch boundaries.
+        assert_eq!(epoch_ms_to_iso(951_782_400_000), Some("2000-02-29T00:00:00Z".into()));
+        assert_eq!(epoch_ms_to_iso(-1), Some("1969-12-31T23:59:59Z".into()));
     }
 }
