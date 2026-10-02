@@ -1,11 +1,17 @@
 //! #52636 diff-fix: `dto::ToolMetadata` → ACP `ToolCallContent::Diff` blocks.
 //!
 //! The 2.0.21 wire carries file changes in `session.tool.success` /
-//! persisted completed-tool metadata:
+//! persisted completed-tool metadata. Priority chain (dialect-neutral —
+//! core and the aft hoist share every shape):
 //!
-//! - `metadata.filediff` — `{file: <absolute path>, patch: <unified diff>, ...}`
-//! - `metadata.diff`    — the same patch as a single string (fallback; may
-//!   contain several `Index:` sections for multi-file tools).
+//! 1. `metadata.filediff` — `{file: <absolute path>, patch: <unified diff>, ...}`
+//! 2. `metadata.files[]` — one per file: `{filePath, relativePath, type,
+//!    patch, additions, deletions}`; `filePath` is authoritative (never
+//!    derived from the patch text) and each entry's `patch` is its own
+//!    `Index:` section. Present ⇒ authoritative: a failing entry is
+//!    skipped with a warning, there is NO fallback to the combined string.
+//! 3. `metadata.diff` — the combined patch as a single string (fallback;
+//!    may contain several `Index:` sections for multi-file tools).
 //!
 //! `patch` is an SVN-style unified diff with an `Index: <path>` header. Real
 //! fixture quirk: **new files end with a stray `-\n` line** (a phantom empty
@@ -37,9 +43,9 @@ impl From<ParsedDiff> for Diff {
 
 /// Extract ACP diff content blocks from a successful tool's metadata.
 ///
-/// Primary source is `metadata.filediff`; when absent, `metadata.diff` is
-/// parsed (splitting multi-file `Index:` sections). Unparseable patches are
-/// skipped with a warning — never an error.
+/// Priority chain (see module docs): `filediff` → `files[]` (authoritative
+/// when present) → combined `diff` string. Unparseable patches are skipped
+/// with a warning — never an error, never a whole-metadata fallback.
 pub fn diff_blocks(meta: &ToolMetadata) -> Vec<ToolCallContent> {
     let mut out = Vec::new();
 
@@ -51,7 +57,15 @@ pub fn diff_blocks(meta: &ToolMetadata) -> Vec<ToolCallContent> {
             Err(e) => warn!(file = %fd.file, error = %e, "tool diff parse failed (filediff), skipping"),
         },
         None => {
-            // Fallback: parse the combined `diff` string section by section.
+            // Level ②: structured `files[]` — authoritative when present;
+            // per-entry failure skips ONLY that entry (see module docs).
+            if let Some(files) = &meta.files
+                && !files.is_empty()
+            {
+                return diff_blocks_from_files(files);
+            }
+            // Level ③: fallback — parse the combined `diff` string section
+            // by section.
             let Some(diff) = &meta.diff else {
                 return Vec::new();
             };
@@ -63,6 +77,48 @@ pub fn diff_blocks(meta: &ToolMetadata) -> Vec<ToolCallContent> {
     }
 
     out.into_iter().map(Diff::from).map(ToolCallContent::Diff).collect()
+}
+
+/// Level ②: map `metadata.files[]` to diff blocks.
+///
+/// `filePath` is the authoritative path — never derived from the patch
+/// text. Each entry's `patch` is its own `Index:` section (the header line
+/// is stripped, the body feeds the shared hunk parser). Entry semantics:
+/// `type = "add"` (wire-verified) drops the old side entirely;
+/// `type = "delete"` (modeled from the core source, not wire-verified)
+/// empties the new side; any other value uses the generic reconstruction
+/// from the patch body. `move_path` is deliberately ignored (not observed
+/// on the wire). Entry-level isolation: a failing entry is skipped with a
+/// warning; the remaining entries still map.
+fn diff_blocks_from_files(files: &[crate::dto::FileEntry]) -> Vec<ToolCallContent> {
+    let mut out = Vec::new();
+    for entry in files {
+        let lines: Vec<&str> = entry.patch.lines().collect();
+        // The entry patch is a single `Index:` section: drop the header
+        // line, feed the rest to the shared hunk parser. Lacking a header
+        // (never seen on the wire), the whole patch is the body.
+        let body: &[&str] = match lines.first() {
+            Some(l) if l.starts_with("Index: ") => &lines[1..],
+            _ => &lines,
+        };
+        match parse_section(&entry.file_path, body) {
+            Ok(Some(mut d)) => {
+                match entry.r#type.as_deref() {
+                    Some("add") => d.old_text = None,
+                    Some("delete") => d.new_text = String::new(),
+                    _ => {}
+                }
+                out.push(ToolCallContent::Diff(d.into()));
+            }
+            Ok(None) => warn!(file = %entry.file_path, "files[] entry has no hunks — skipping"),
+            Err(e) => warn!(
+                file = %entry.file_path,
+                error = %e,
+                "files[] entry parse failed — skipping"
+            ),
+        }
+    }
+    out
 }
 
 /// A parsed per-file diff, ready to become an ACP `Diff` block.
@@ -130,11 +186,10 @@ fn derive_path_from_headers(body: &[&str]) -> Option<String> {
         if let Some(p) = line.strip_prefix("+++ ") {
             return Some(strip_git_prefix(p.trim()));
         }
-        if candidate.is_none() {
-            if let Some(p) = line.strip_prefix("--- ") {
+        if candidate.is_none()
+            && let Some(p) = line.strip_prefix("--- ") {
                 candidate = Some(strip_git_prefix(p.trim()));
             }
-        }
     }
     candidate
 }
@@ -244,6 +299,7 @@ mod tests {
                 additions: Some(1),
                 deletions: Some(0),
             }),
+            files: None,
             title: Some("hello-acp-test.txt".into()),
             truncated: None,
             diagnostics: None,
@@ -263,6 +319,7 @@ mod tests {
         let meta = ToolMetadata {
             diff: Some(FIXTURE_PATCH.to_string()),
             filediff: None,
+            files: None,
             title: None,
             truncated: None,
             diagnostics: None,
@@ -337,6 +394,7 @@ mod tests {
         let meta = ToolMetadata {
             diff: Some(patch),
             filediff: None,
+            files: None,
             title: None,
             truncated: None,
             diagnostics: None,
@@ -381,6 +439,7 @@ mod tests {
         let meta = ToolMetadata {
             diff: None,
             filediff: None,
+            files: None,
             title: None,
             truncated: None,
             diagnostics: None,
@@ -392,9 +451,141 @@ mod tests {
         ToolMetadata {
             diff: Some(diff.to_string()),
             filediff: None,
+            files: None,
             title: None,
             truncated: None,
             diagnostics: None,
         }
+    }
+
+    // ======================= Level ②: metadata.files[] =======================
+
+    use crate::dto::FileEntry;
+
+    /// The real apply_patch entry from the aft capture
+    /// (tests/fixtures/aft-tool-turn.sse): `type: "add"`, single-file.
+    fn fixture_entry() -> FileEntry {
+        FileEntry {
+            file_path: "/tmp/opencode/aft-probe/added.txt".into(),
+            relative_path: Some(".aft-probe/added.txt".into()),
+            r#type: Some("add".into()),
+            patch: "Index: /tmp/opencode/aft-probe/added.txt\n\
+				   ===================================================================\n\
+				   --- /tmp/opencode/aft-probe/added.txt\n\
+				   +++ /tmp/opencode/aft-probe/added.txt\n\
+				   @@ -0,0 +1 @@\n\
+				   +patched ok\n"
+                .lines()
+                .map(|l| l.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            additions: Some(1),
+            deletions: Some(0),
+            move_path: None,
+        }
+    }
+
+    /// Fixture-driven: the aft apply_patch success maps via files[] with
+    /// `filePath` as the authoritative path — the absolute path, matching
+    /// the source of truth, not the Index: header text.
+    #[test]
+    fn files_entry_maps_with_authoritative_filepath() {
+        let meta = ToolMetadata {
+            diff: Some("Index: /should/never/be/used.txt\n".to_string()),
+            filediff: None,
+            files: Some(vec![fixture_entry()]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        };
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
+        assert!(d.old_text.is_none(), "type=add drops the old side");
+        assert_eq!(d.new_text, "patched ok");
+    }
+
+    /// Synthetic: a files[] entry whose path disagrees with the combined
+    /// diff string — Level ② wins, the string is never consulted.
+    #[test]
+    fn files_win_over_the_combined_diff_string() {
+        let meta = ToolMetadata {
+            diff: Some(
+                "Index: /fake/B.txt\n\
+				 ===================================================================\n\
+				 --- /fake/B.txt\n\
+				 +++ /fake/B.txt\n\
+				 @@ -1 +1 @@\n\
+				 -from-string\n\
+				 +from-string\n"
+                    .to_string(),
+            ),
+            filediff: None,
+            files: Some(vec![fixture_entry()]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        };
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1, "files[] only — the diff string is not parsed");
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
+        assert_eq!(d.new_text, "patched ok");
+    }
+
+    /// files[] present but every entry malformed ⇒ NO fallback to the
+    /// combined string (authoritative), and the tool never breaks.
+    #[test]
+    fn files_present_never_touches_the_fallback() {
+        let meta = ToolMetadata {
+            diff: Some(
+                "Index: /ok/from-string.txt\n\
+				 @@ -1 +1 @@\n\
+				 +would-have-parsed\n"
+                    .to_string(),
+            ),
+            filediff: None,
+            files: Some(vec![FileEntry {
+                // Garbage patch: a hunk header that is not a hunk header.
+                patch: "Index: /bad.txt\nnot a diff at all\n@@nope\n".into(),
+                ..fixture_entry()
+            }]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        };
+        let blocks = diff_blocks(&meta);
+        assert!(blocks.is_empty(), "malformed entry skipped, no fallback to the string");
+    }
+
+    /// Entry-level isolation: one malformed entry is skipped, the sibling
+    /// still maps.
+    #[test]
+    fn malformed_entry_skips_only_itself() {
+        let good = fixture_entry();
+        let bad = FileEntry {
+            file_path: "/tmp/bad.txt".into(),
+            patch: "Index: /tmp/bad.txt\nno hunks here\n".into(),
+            ..fixture_entry()
+        };
+        let meta = ToolMetadata {
+            diff: None,
+            filediff: None,
+            files: Some(vec![bad, good]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        };
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1, "only the malformed entry is skipped");
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
     }
 }

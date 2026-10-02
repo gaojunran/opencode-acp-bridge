@@ -347,6 +347,11 @@ pub struct ToolMetadata {
     /// Structured single-file diff.
     #[serde(default)]
     pub filediff: Option<FileDiff>,
+    /// Structured per-file diffs — the apply_patch payload (core 2.0.21 +
+    /// aft share this shape). Authoritative when present: the bridge never
+    /// falls back to the combined `diff` string.
+    #[serde(default)]
+    pub files: Option<Vec<FileEntry>>,
     /// Display title for the tool call (e.g. "hello-acp-test.txt").
     #[serde(default)]
     pub title: Option<String>,
@@ -354,6 +359,37 @@ pub struct ToolMetadata {
     pub truncated: Option<bool>,
     #[serde(default)]
     pub diagnostics: Option<Value>,
+}
+
+/// One entry of `metadata.files[]` (wire shape: `filePath`, `relativePath`,
+/// `type`, `patch`, `additions`, `deletions` — live-verified from a real
+/// apply_patch capture; `movePath` exists in the dev-clone source but was
+/// NOT observed on the wire).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEntry {
+    /// Absolute path of the file — the AUTHORITATIVE path (the diff mapping
+    /// takes it from here, never from the `Index:` header of `patch`).
+    pub file_path: String,
+    /// Project-relative path (display use).
+    pub relative_path: Option<String>,
+    /// Entry kind: `"add"` is wire-verified; `"delete"` is modeled from the
+    /// core source, not wire-verified. No semantics are invented beyond
+    /// these two — anything else falls back to generic reconstruction.
+    #[serde(rename = "type")]
+    pub r#type: Option<String>,
+    /// This file's own `Index:`-format patch section (same source text as
+    /// the combined `metadata.diff`). Note: new files carry a trailing
+    /// `-\n` line quirk.
+    pub patch: String,
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    /// Not observed on the wire — carried for forward compatibility only,
+    /// not used by the diff mapping.
+    #[serde(default)]
+    pub move_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1181,6 +1217,20 @@ mod tests {
         let patch_meta = successes[2].1.metadata.as_ref().expect("apply_patch metadata");
         assert!(patch_meta.filediff.is_none(), "apply_patch has no filediff");
         assert!(patch_meta.diff.is_some(), "apply_patch carries only the diff string");
+        // files[] — the structured apply_patch payload — must decode with
+        // its wire field names (`filePath`/`relativePath`/`type`/`patch`).
+        let files = patch_meta.files.as_ref().expect("apply_patch files[] present");
+        assert_eq!(files.len(), 1);
+        let entry = &files[0];
+        assert_eq!(entry.file_path, "/tmp/opencode/aft-probe/added.txt");
+        assert_eq!(entry.relative_path.as_deref(), Some(".aft-probe/added.txt"));
+        assert_eq!(entry.r#type.as_deref(), Some("add"));
+        assert!(entry.patch.starts_with("Index: /tmp/opencode/aft-probe/added.txt"));
+        assert_eq!(entry.additions, Some(1));
+        assert_eq!(entry.deletions, Some(0));
+        assert_eq!(entry.move_path, None, "movePath not on the wire");
+        // The edit carries no files[] (filediff is its shape).
+        assert!(edit_meta.files.is_none(), "edit has no files[]");
     }
 
     /// aft image read: the `{"type":"file","uri":"data:…;base64,…",

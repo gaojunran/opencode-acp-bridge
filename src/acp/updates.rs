@@ -1229,6 +1229,7 @@ mod tests {
                 title: Some("grep *.rs".into()),
                 diff: None,
                 filediff: None,
+                files: None,
                 truncated: None,
                 diagnostics: None,
             }),

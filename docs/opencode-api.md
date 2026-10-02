@@ -328,9 +328,10 @@ Heterogeneous array, discriminated by `type`, **newest first**:
   (`{filePath, relativePath, type, patch, additions, deletions}` per file —
   the dev-clone array shape DOES appear here, alongside the combined string).
   `edit`/`write` emit `filediff` instead (edit live-verified, write verified
-  since Wave 0). The bridge's fallback chain (combined string → per-file
-  `Index:` sections) covers it; `files[]` is currently unread — same data as
-  the combined string.
+  since Wave 0). The bridge's diff priority chain for apply_patch:
+  **`files[]` (structured — `filePath` authoritative) → combined `diff`
+  string fallback**; `files[]` present ⇒ authoritative, the string is never
+  consulted (per-entry failures skip only that entry).
 
 ## Turn flow for the bridge (prompt)
 
@@ -353,7 +354,7 @@ Verified against a live aft-enabled server (fixtures:
 | shape | aft | core (2.0.21) | bridge handling |
 |---|---|---|---|
 | `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit | present for edit/write (live-verified) | primary diff source (unchanged) |
-| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | **same — apply_patch has no `filediff` on core either** (live-verified; not an aft divergence) | fallback chain (unchanged) — multi-file `Index:` sections split |
+| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | **same — apply_patch has no `filediff` on core either** (live-verified; not an aft divergence) | level ③ fallback only — apply_patch maps from `metadata.files[]` (level ②, structured) when present |
 | `tool.success.content[]` file part `{"type":"file","uri":"data:…;base64,…","mime":"image/png"}` | image reads | absent | mapped to ACP `ImageContent` (`data` = payload after the data-URI prefix, `mime_type` = `mime`, `uri` preserved). Only `image/*` mimes are mapped — the only verified scenario; non-image / non-data-URI file parts are skipped, never guessed |
 | `tool.called.input` | model's raw args (canonicalization happens on a copy) | same | unchanged |
 

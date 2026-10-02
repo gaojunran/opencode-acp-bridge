@@ -98,7 +98,7 @@ v0.58.0 environment (captures in `tests/fixtures/aft-*.sse`):
 | --- | --- | --- |
 | Same-name tool replacement | Stream undeformed: same tool names, same event types | No change needed — all existing mappings apply |
 | `edit` / `write` results | `metadata.filediff` identical in shape to core | Diff blocks via the primary `filediff` path (unchanged) |
-| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` — **same shape as core, not aft-specific** | Diff blocks via the existing diff-string fallback chain |
+| `apply_patch` results | No `filediff`; `metadata.diff` (`Index:`-format string) + `metadata.files[]` — **same shape as core, not aft-specific** | Diff blocks from `metadata.files[]` (structured: `filePath` authoritative, entry-level failure isolation); the `diff` string is the level-③ fallback only |
 | `read` on an image | Content part `{type:"file", uri:"data:<mime>;base64,…", mime:"image/png"}` | Mapped to an ACP image content block (base64 payload + `mime_type`, original `uri` preserved) — previously dropped as unknown |
 | Tool input args | Model's raw parameters (aft canonicalizes on a copy) | Permission `toolCall` construction works unchanged |
 | Non-image or non-data-URI file parts | Not observed on the wire | Skipped — never guessed (`#[serde(other)]` sink) |
