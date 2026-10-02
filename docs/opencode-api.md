@@ -415,13 +415,18 @@ hermetic (fixtures only).
    for BOTH own and remote switches. The bridge tracks the mode and emits
    `current_mode_update` only on an actual tracked-value change: a remote
    switch updates, the own-switch echo diffs to zero and stays suppressed.
-5. **Default agent**: new sessions start on `orchestrator` (fixture
-   step.started empirical: parent sessions all run orchestrator) — this is
-   the newSession/load/resume `currentModeId` default.
+5. **Default agent**: DERIVED, never hardcoded — the first visible
+   `primary` agent in wire order (stock 2.0.21 = `orchestrator`, cross-checked
+   against fixture step.started: parent sessions all run orchestrator), falling
+   back to the first mode-eligible agent (`mode ∈ {primary, all}` &&
+   `!hidden`) when the catalog has no primary. A catalog that yields no modes
+   at all omits the `modes` payload from newSession/load/resume (an empty or
+   failed agents fetch degrades the same way) so Zed renders no picker instead
+   of an unmatched "Unknown" current mode.
 6. **Message records carry the agent**: assistant messages
    `{"type":"assistant", ..., "agent":"orchestrator", "model":{...}}` —
    the load/resume `currentModeId` source (the LAST assistant message's
-   agent; no assistant message → `orchestrator`).
+   agent; no assistant message → the derived default).
 7. **Schema**: `SessionModeState.current_mode_id` is REQUIRED (not Option);
    `SessionMode{id, name, description?}`.
 

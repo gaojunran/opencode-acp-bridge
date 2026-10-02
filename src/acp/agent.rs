@@ -145,8 +145,9 @@ struct SessionEntry {
     /// prompts (mirrors the official adapter's `cwd` for shell tools).
     cwd: String,
     /// Tracked ACP mode (the opencode agent id). Established by the
-    /// lifecycle responses (newSession → "orchestrator", load/resume → the
-    /// last assistant message's agent); updated by `session/set_mode`, the
+    /// lifecycle responses (newSession → the derived default — the first
+    /// visible primary agent; load/resume → the last assistant message's
+    /// agent, or the derived default); updated by `session/set_mode`, the
     /// `session.agent.selected` SSE event and (self-heal) mismatched
     /// `step.started` agents. `current_mode_update` fires only when this
     /// value actually changes — which is what suppresses the own-switch
@@ -340,7 +341,7 @@ impl AgentService {
         };
         // Wave 6b: the mode list from the agent catalog (degraded to empty
         // on failure — session creation must not fail on metadata), and the
-        // opencode 2.0.21 default agent as the initial mode.
+        // derived default agent as the initial mode.
         let agents = match self.backend.agents(&cwd).await {
             Ok(a) => a,
             Err(e) => {
@@ -349,19 +350,27 @@ impl AgentService {
             }
         };
         let modes = to_session_modes(&agents);
-        let current = "orchestrator";
-        let mode_state = acp::SessionModeState::new(current, modes);
+        let current = default_mode_id(&agents);
+        let session_id = acp::SessionId::from(session_id);
         self.sessions.lock().expect("sessions lock").insert(
-            acp::SessionId::from(session_id.clone()),
+            session_id.clone(),
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: cwd.clone(),
-                mode: Mutex::new(Some(current.to_string())),
+                mode: Mutex::new(current.clone()),
             }),
         );
-        tracing::info!(session_id, modes = %mode_state.available_modes.len(), current_mode = current, "ACP newSession -> opencode session");
-        let session_id = acp::SessionId::from(session_id);
-        responder.respond(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state))?;
+        tracing::info!(%session_id, modes = %modes.len(), current_mode = ?current, "ACP newSession -> opencode session");
+        match current {
+            // The derived default is in the filtered list by construction.
+            Some(id) => responder.respond(
+                acp::NewSessionResponse::new(session_id.clone())
+                    .modes(acp::SessionModeState::new(id, modes)),
+            )?,
+            // No pickable modes: omit the payload — Zed renders no picker
+            // instead of an unmatched "Unknown" current mode.
+            None => responder.respond(acp::NewSessionResponse::new(session_id.clone()))?,
+        }
         // Wave 6a: initial `available_commands_update` push, AFTER the
         // response, spawned so the fetch can never gate session creation.
         self.spawn_commands_push(&session_id, &cx);
@@ -399,12 +408,12 @@ impl AgentService {
         responder.respond(acp::ListSessionsResponse::new(mapped).next_cursor(next))
     }
 
-    /// Wave 6b: the mode list for a session's directory — the agent
-    /// catalog filtered to visible primary/all agents. Degraded to empty
-    /// on fetch failure (a lifecycle response must not fail on metadata).
-    async fn fetch_modes(&self, cwd: &str) -> Vec<acp::SessionMode> {
+    /// Wave 6b: the raw agent catalog for a session's directory (the ACP
+    /// mode list + derived default source). Degraded to an empty list on
+    /// fetch failure (a lifecycle response must not fail on metadata).
+    async fn fetch_agents(&self, cwd: &str) -> Vec<dto::AgentInfo> {
         match self.backend.agents(cwd).await {
-            Ok(agents) => to_session_modes(&agents),
+            Ok(agents) => agents,
             Err(e) => {
                 tracing::warn!(error = %e, "agents fetch failed — empty mode list");
                 Vec::new()
@@ -424,20 +433,21 @@ impl AgentService {
         cx: ConnectionTo<Client>,
     ) -> Result<(), AcpError> {
         // Metadata pass: last assistant message's agent → current mode.
-        // A fetch failure degrades to the default (resume must not fail).
+        // A fetch failure degrades to the derived default (resume must not
+        // fail).
         let records = match self.backend.messages(&req.session_id.0).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, session = %req.session_id, "resume: messages fetch failed (mode falls back to default)");
+                tracing::warn!(error = %e, session = %req.session_id, "resume: messages fetch failed (mode falls back to the default)");
                 Vec::new()
             }
         };
-        let current = last_assistant_agent(&records)
-            .unwrap_or_else(|| "orchestrator".to_string());
-        let mode_state = acp::SessionModeState::new(
-            current.clone(),
-            self.fetch_modes(&req.cwd.to_string_lossy()).await,
-        );
+        let agents = self.fetch_agents(&req.cwd.to_string_lossy()).await;
+        // The honest last-assistant agent wins even when it drifted out of
+        // the catalog (step.started self-heals); otherwise the derived
+        // default (first visible primary in wire order).
+        let current = last_assistant_agent(&records).or_else(|| default_mode_id(&agents));
+        let modes = to_session_modes(&agents);
         // Register unconditionally — the client may resume a session this
         // bridge never loaded, and the next prompt must still route.
         self.sessions.lock().expect("sessions lock").insert(
@@ -445,11 +455,21 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
-                mode: Mutex::new(Some(current)),
+                mode: Mutex::new(current.clone()),
             }),
         );
+        // No pickable modes → omit the payload (Zed renders no picker
+        // instead of an unmatched "Unknown" current mode).
+        let response = if modes.is_empty() {
+            acp::ResumeSessionResponse::new()
+        } else {
+            acp::ResumeSessionResponse::new().modes(acp::SessionModeState::new(
+                current.expect("modes non-empty ⇒ a derived default exists"),
+                modes,
+            ))
+        };
         tracing::info!(session = %req.session_id, "ACP session/resume (no replay)");
-        responder.respond(acp::ResumeSessionResponse::new().modes(mode_state))?;
+        responder.respond(response)?;
         // Wave 6a: initial `available_commands_update` push, after the
         // response (spawned — never gate the resume).
         self.spawn_commands_push(&req.session_id, &cx);
@@ -544,21 +564,34 @@ impl AgentService {
         }
         // Wave 6b: current mode = the last assistant message's agent
         // (wire fact: assistant messages carry `agent`); no assistant
-        // message yet → the opencode default. Mode list from the catalog.
-        let current = last_assistant_agent(&records)
-            .unwrap_or_else(|| "orchestrator".to_string());
-        let modes = self.fetch_modes(&req.cwd.to_string_lossy()).await;
-        let mode_state = acp::SessionModeState::new(current.clone(), modes);
+        // message yet → the derived default (first visible primary in wire
+        // order). Mode list + default both come from the one catalog fetch.
+        let agents = self.fetch_agents(&req.cwd.to_string_lossy()).await;
+        // The honest last-assistant agent wins even when it drifted out of
+        // the catalog (step.started self-heals); otherwise the derived
+        // default.
+        let current = last_assistant_agent(&records).or_else(|| default_mode_id(&agents));
+        let modes = to_session_modes(&agents);
         // Refresh state so a subsequent prompt on this session works.
         self.sessions.lock().expect("sessions lock").insert(
             req.session_id.clone(),
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
-                mode: Mutex::new(Some(current)),
+                mode: Mutex::new(current.clone()),
             }),
         );
-        responder.respond(acp::LoadSessionResponse::new().modes(mode_state))?;
+        // No pickable modes → omit the payload (Zed renders no picker
+        // instead of an unmatched "Unknown" current mode).
+        let response = if modes.is_empty() {
+            acp::LoadSessionResponse::new()
+        } else {
+            acp::LoadSessionResponse::new().modes(acp::SessionModeState::new(
+                current.expect("modes non-empty ⇒ a derived default exists"),
+                modes,
+            ))
+        };
+        responder.respond(response)?;
         // Wave 6a: initial `available_commands_update` push, after the
         // response (spawned — never gate the load).
         self.spawn_commands_push(&req.session_id, &cx);
@@ -1291,9 +1324,30 @@ fn to_session_modes(agents: &[dto::AgentInfo]) -> Vec<acp::SessionMode> {
         .collect()
 }
 
+/// The default agent id, derived from the wire catalog (opencode semantics:
+/// the first visible `primary` agent in wire order; the stock 2.0.21 catalog
+/// lists `orchestrator` first). Falls back to the first agent that would
+/// surface as a mode ([`to_session_modes`]'s filter: `mode ∈ {primary, all}`
+/// && `!hidden`), and to `None` when the catalog yields no modes at all.
+///
+/// `None` ⇒ callers must omit the ACP `modes` payload entirely, so clients
+/// (Zed) render no mode picker instead of an unmatched "Unknown" current
+/// mode when the server's catalog differs from the stock one.
+fn default_mode_id(agents: &[dto::AgentInfo]) -> Option<String> {
+    agents
+        .iter()
+        .find(|a| !a.hidden && a.mode.as_deref() == Some("primary"))
+        .or_else(|| {
+            agents
+                .iter()
+                .find(|a| !a.hidden && matches!(a.mode.as_deref(), Some("primary") | Some("all")))
+        })
+        .map(|a| a.id.clone())
+}
+
 /// Wave 6b: the last assistant message's `agent` field (the currentModeId
 /// source for load/resume), or `None` when the session has no assistant
-/// message yet (callers fall back to the opencode default agent).
+/// message yet (callers fall back to the derived default agent).
 fn last_assistant_agent(records: &[dto::MessageRecord]) -> Option<String> {
     records
         .iter()
@@ -1345,6 +1399,8 @@ mod tests {
         commands_gate: Mutex<Option<oneshot::Receiver<()>>>,
         /// Wave 6b: canned agent catalog (the ACP mode list source).
         agents_out: Mutex<Option<Vec<dto::AgentInfo>>>,
+        /// Wave 6b: force `agents()` to fail (proves the degrade path).
+        agents_fail: AtomicBool,
         /// Wave 6b: every (session_id, agent) passed to `set_agent`.
         set_agent_calls: Mutex<Vec<(String, String)>>,
     }
@@ -1368,6 +1424,7 @@ mod tests {
                 commands: Mutex::new(None),
                 commands_gate: Mutex::new(None),
                 agents_out: Mutex::new(None),
+                agents_fail: AtomicBool::new(false),
                 set_agent_calls: Mutex::new(Vec::new()),
             })
         }
@@ -1405,6 +1462,12 @@ mod tests {
 
         fn set_agents(&self, agents: Vec<dto::AgentInfo>) {
             *self.agents_out.lock().expect("agents lock") = Some(agents);
+        }
+
+        /// Make the next `agents()` calls fail (the lifecycle responses must
+        /// degrade to an omitted modes payload, not fail).
+        fn fail_agents(&self) {
+            self.agents_fail.store(true, Ordering::SeqCst);
         }
 
         fn recorded_set_agent_calls(&self) -> Vec<(String, String)> {
@@ -1560,8 +1623,15 @@ mod tests {
         }
 
         fn agents(&self, _directory: &str) -> BoxFuture<'_, Result<Vec<dto::AgentInfo>, anyhow::Error>> {
+            let fail = self.agents_fail.load(Ordering::SeqCst);
             let out = self.agents_out.lock().expect("agents lock").clone();
-            Box::pin(async move { Ok(out.unwrap_or_default()) })
+            Box::pin(async move {
+                if fail {
+                    Err(anyhow::anyhow!("mock agents fetch failure"))
+                } else {
+                    Ok(out.unwrap_or_default())
+                }
+            })
         }
 
         fn set_agent(&self, session_id: &str, agent: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
@@ -1717,11 +1787,9 @@ mod tests {
                     ))
                     .block_task()
                     .await?;
-                // Wave 6b: modes populated (fixture records hold no
-                // assistant agent → opencode default).
-                let modes = resp.modes.expect("load carries the mode state");
-                assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
-                assert!(modes.available_modes.is_empty(), "mock has no agent catalog");
+                // Wave 6b: the mock has no agent catalog → the modes payload
+                // is omitted (no picker) instead of a "Unknown" current mode.
+                assert!(resp.modes.is_none(), "empty catalog omits the modes payload");
                 Ok(())
             })
             .await;
@@ -2992,10 +3060,9 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-            // Wave 6b: no assistant message → default mode, empty catalog.
-            let modes = resp.modes.expect("resume carries the mode state");
-            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
-            assert!(modes.available_modes.is_empty());
+            // Wave 6b: no assistant message + empty catalog → the modes
+            // payload is omitted entirely (Zed renders no picker).
+            assert!(resp.modes.is_none(), "empty catalog omits the modes payload");
             assert!(resp.config_options.is_none());
             // No command catalog → no push; the resumed session is registered,
             // so a prompt must route (and end) normally.
@@ -3136,10 +3203,9 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-            // Wave 6b: empty catalog → empty modes, current from messages
-            // (mock message store is empty → default).
-            let modes = resume.modes.expect("resume carries the mode state");
-            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
+            // Wave 6b: empty catalog → the modes payload is omitted (no
+            // picker); the load/resume must still succeed and push.
+            assert!(resume.modes.is_none(), "empty catalog omits the modes payload");
             // Both pushes are spawned after their responses — wait for both.
             wait_for(&collected, |n| commands_pushes(n).len() >= 2).await;
             Ok(())
@@ -3417,6 +3483,13 @@ mod tests {
     #[tokio::test]
     async fn load_and_resume_use_last_assistant_agent_as_current_mode() {
         let backend = MockBackend::new();
+        // A stock catalog so the modes payload is present (the current mode
+        // assertions below are about the last-assistant-agent rule, not
+        // about the empty-catalog omitted-payload path).
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
         backend.set_messages(vec![
             wire_msg("user", None),
             wire_msg("assistant", Some("build")),
@@ -3460,6 +3533,122 @@ mod tests {
                 .await?;
             let modes = resume.modes.expect("resume carries the mode state");
             assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator", "no assistant -> default");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[test]
+    fn default_mode_id_follows_catalog_semantics() {
+        // First visible primary in wire order wins (no hardcoded name).
+        let agents = vec![
+            wire_agent("build", "primary", false, None),
+            wire_agent("orchestrator", "primary", false, None),
+        ];
+        assert_eq!(default_mode_id(&agents).as_deref(), Some("build"));
+        // Hidden primaries never win.
+        let agents = vec![
+            wire_agent("compaction", "primary", true, None),
+            wire_agent("build", "primary", false, None),
+        ];
+        assert_eq!(default_mode_id(&agents).as_deref(), Some("build"));
+        // No primary at all → the first mode-eligible agent (`all`).
+        let agents = vec![
+            wire_agent("dreamer-x", "all", false, None),
+            wire_agent("build", "all", false, None),
+        ];
+        assert_eq!(default_mode_id(&agents).as_deref(), Some("dreamer-x"));
+        // Nothing eligible → None (callers omit the modes payload).
+        let agents = vec![
+            wire_agent("explorer", "subagent", false, None),
+            wire_agent("compaction", "primary", true, None),
+        ];
+        assert_eq!(default_mode_id(&agents), None);
+    }
+
+    #[tokio::test]
+    async fn new_session_derives_default_from_catalog_without_orchestrator() {
+        // The user's server: no "orchestrator" agent, "build" is the first
+        // visible primary → newSession must not hardcode "orchestrator".
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("explorer", "subagent", false, None),
+            wire_agent("build", "primary", false, None),
+            wire_agent("dreamer-x", "all", false, None),
+            wire_agent("compaction", "primary", true, None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let modes = ns.modes.expect("newSession carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "build");
+            let ids: Vec<&str> = modes
+                .available_modes
+                .iter()
+                .map(|m| m.id.0.as_ref())
+                .collect();
+            assert_eq!(ids, vec!["build", "dreamer-x"]);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn new_session_without_pickable_modes_omits_the_modes_payload() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // Empty catalog (no set_agents) → no modes payload at all.
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            assert!(ns.modes.is_none(), "empty catalog omits the modes payload");
+            // A failing agents fetch degrades the same way (warn + omit).
+            b.fail_agents();
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            assert!(ns.modes.is_none(), "failed agents fetch omits the modes payload");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn load_and_resume_use_derived_default_without_orchestrator() {
+        let backend = MockBackend::new();
+        // No "orchestrator" in the catalog: the derived default is "build".
+        backend.set_agents(vec![
+            wire_agent("build", "primary", false, None),
+            wire_agent("explorer", "subagent", false, None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // No assistant messages → the derived default, not "orchestrator".
+            let load = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let modes = load.modes.expect("load carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "build");
+            // Resume follows the same rule.
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let modes = resume.modes.expect("resume carries the mode state");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "build");
             Ok(())
         })
         .await;
