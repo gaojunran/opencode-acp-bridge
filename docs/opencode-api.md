@@ -342,6 +342,30 @@ Heterogeneous array, discriminated by `type`, **newest first**:
    `session.execution.failed` → ACP `stop` (reason error, include error message).
 4. `POST …/interrupt` maps to ACP `session/cancel` → stop reason cancelled.
 
+### ACP prompt block → prompt body mapping (Release 0.3.1, official-adapter semantics)
+
+The prompt body is `{text, files, agents, skills, metadata}`; `files[]` entries
+are `{type: "file", url, filename, mime}`. Mapping per ACP `ContentBlock` (a
+block that cannot be mapped is DROPPED with a `warn` — it never kills the
+turn; only a prompt that ends up with BOTH empty text and no files is
+rejected):
+
+| ACP block | wire surface |
+|---|---|
+| `Text` | appended to `text` (multiple blocks concatenated) |
+| `Image` with base64 `data` | files entry `url: "data:{mime_type};base64,{data}"`, `filename: basename(uri) or "image"`, `mime: mime_type` |
+| `Image` uri-only (`data:`/`http(s)://`) | files entry `url: uri`, filename = basename(uri) or "image" |
+| `Image` with any other uri scheme | dropped |
+| `ResourceLink` (Zed @-mentions — the 0.3.1 bug) | files entry `url: link.uri` **verbatim** (the opencode server resolves `file://` locally), `filename: link.name or basename(uri) or "file"`, `mime: link.mime_type or "text/plain"` |
+| `Resource` text + `file://` uri (rare from Zed) | appended to `text` as `[<pathname>[:<line>]] <text>` (line from a `#L<digits>` uri fragment) |
+| `Resource` text + `data:` uri | files entry (`url: uri`, mime `text/plain` default) |
+| `Resource` blob + `file://`/`data:` uri | files entry (mime `application/octet-stream` default) |
+| `Resource` other uri schemes | dropped |
+| `Audio` and any future variant | dropped (no official mapping either) |
+
+`filename` derives from the uri basename (query/fragment stripped, `file://`
+scheme removed); `data:` uris have no basename → the fallback name.
+
 ## aft dialect (tool-call hoist, v0.58.0, wire-verified)
 
 The cortexkit/aft plugin replaces the registered tool implementations

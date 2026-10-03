@@ -143,13 +143,41 @@ pub type SkillInfo = Value;
 pub struct PromptRequest {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub files: Option<Vec<Value>>,
+    pub files: Option<Vec<PromptFile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+/// A `POST /api/session/{id}/prompt` `files[]` entry — the official 2.0.21
+/// adapter's shape `{type: "file", url, filename, mime}`. `url` is the ACP
+/// block's URI verbatim (`file://` is resolved by the opencode server
+/// locally, `data:` URIs are passed through); `mime` falls back to
+/// `text/plain` for resource links (the server ignores it for `file://`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PromptFile {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// REQUIRED wire key (server-validated, live-probed: 400 "Missing key
+    /// files[0][uri]" otherwise; `uri` accepted for file:// and data:
+    /// schemes, both HTTP 200).
+    pub uri: String,
+    pub filename: String,
+    pub mime: String,
+}
+
+impl PromptFile {
+    pub fn new(uri: impl Into<String>, filename: impl Into<String>, mime: impl Into<String>) -> Self {
+        Self {
+            kind: "file",
+            uri: uri.into(),
+            filename: filename.into(),
+            mime: mime.into(),
+        }
+    }
 }
 
 /// Prompt response payload — the enqueued user message. The turn itself plays

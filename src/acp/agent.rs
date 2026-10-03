@@ -47,9 +47,17 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     /// Create a new opencode session; returns its `ses_*` id.
     fn create_session(&self, cwd: &str) -> BoxFuture<'_, Result<String, anyhow::Error>>;
 
-    /// Enqueue a prompt (turn start). Returns once enqueued — the turn
-    /// itself plays out on the event stream.
-    fn prompt(&self, session_id: &str, text: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+    /// Enqueue a prompt (turn start). `files` are the official `files[]`
+    /// entries (`{type:"file", url, filename, mime}`) derived from the ACP
+    /// prompt's Image/ResourceLink/Resource blocks — `file://` urls are
+    /// resolved by the opencode server (co-located with the client). Returns
+    /// once enqueued — the turn itself plays out on the event stream.
+    fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[dto::PromptFile],
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 
     /// Interrupt a running turn (`session/cancel`).
     fn interrupt(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
@@ -959,21 +967,114 @@ impl AgentService {
             );
         };
 
-        // Only plain text prompts are supported in Wave 1.
+        // ACP prompt block → opencode prompt body mapping (official 2.0.21
+        // adapter semantics): Text appends to `text`; Image / ResourceLink /
+        // blob Resource become `files[]` entries; text file:// Resources
+        // append `[path] content` to `text`; anything unmappable (Audio,
+        // future variants) is dropped with a warning — a mappable block must
+        // never kill the turn.
         let mut text = String::new();
+        let mut files: Vec<dto::PromptFile> = Vec::new();
         for block in &req.prompt {
             match block {
                 acp::ContentBlock::Text(t) => text.push_str(&t.text),
+                acp::ContentBlock::Image(img) => {
+                    // Base64 data wins → a `data:` URL entry; otherwise the
+                    // uri passes through only for data:/http(s): schemes.
+                    if !img.data.is_empty() {
+                        files.push(dto::PromptFile::new(
+                            format!("data:{};base64,{}", img.mime_type, img.data),
+                            basename_of(img.uri.as_deref()).unwrap_or_else(|| "image".to_string()),
+                            img.mime_type.clone(),
+                        ));
+                    } else {
+                        match img.uri.as_deref() {
+                            Some(uri)
+                                if uri.starts_with("data:")
+                                    || uri.starts_with("http://")
+                                    || uri.starts_with("https://") =>
+                            {
+                                files.push(dto::PromptFile::new(
+                                    uri.to_string(),
+                                    basename_of(Some(uri)).unwrap_or_else(|| "image".to_string()),
+                                    img.mime_type.clone(),
+                                ));
+                            }
+                            other => {
+                                tracing::warn!(uri = ?other, "dropping image prompt block: unsupported uri scheme");
+                            }
+                        }
+                    }
+                }
+                acp::ContentBlock::ResourceLink(link) => {
+                    // The BUG: Zed @-mentions arrive as resource_link. The
+                    // uri goes into `url` verbatim — the opencode server
+                    // resolves file:// locally (server co-located with the
+                    // client).
+                    let filename = if link.name.is_empty() {
+                        basename_of(Some(&link.uri)).unwrap_or_else(|| "file".to_string())
+                    } else {
+                        link.name.clone()
+                    };
+                    files.push(dto::PromptFile::new(
+                        link.uri.clone(),
+                        filename,
+                        link.mime_type.clone().unwrap_or_else(|| "text/plain".to_string()),
+                    ));
+                }
+                acp::ContentBlock::Resource(res) => {
+                    // Rare from Zed (it prefers resource_link): text
+                    // file:// resources fold into `text` as `[path] content`
+                    // (official emits `[${path}${line? ":"+line : ""}]`),
+                    // data:/blob resources become files entries.
+                    match &res.resource {
+                        acp::EmbeddedResourceResource::TextResourceContents(t) => {
+                            let (path, line) = path_and_line(&t.uri);
+                            if t.uri.starts_with("file://") {
+                                let mut head = path.unwrap_or_default();
+                                if let Some(line) = line {
+                                    head.push(':');
+                                    head.push_str(&line);
+                                }
+                                text.push_str(&format!("[{head}] {}", t.text));
+                            } else if t.uri.starts_with("data:") {
+                                files.push(dto::PromptFile::new(
+                                    t.uri.clone(),
+                                    basename_of(Some(&t.uri))
+                                        .unwrap_or_else(|| "file".to_string()),
+                                    t.mime_type.clone().unwrap_or_else(|| "text/plain".to_string()),
+                                ));
+                            } else {
+                                tracing::warn!(uri = %t.uri, "dropping text resource prompt block: unsupported uri scheme");
+                            }
+                        }
+                        acp::EmbeddedResourceResource::BlobResourceContents(b) => {
+                            if b.uri.starts_with("file://") || b.uri.starts_with("data:") {
+                                files.push(dto::PromptFile::new(
+                                    b.uri.clone(),
+                                    basename_of(Some(&b.uri))
+                                        .unwrap_or_else(|| "file".to_string()),
+                                    b.mime_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                                ));
+                            } else {
+                                tracing::warn!(uri = %b.uri, "dropping blob resource prompt block: unsupported uri scheme");
+                            }
+                        }
+                        other => {
+                            // Future resource content kinds: drop, never fail
+                            // the turn.
+                            tracing::warn!(kind = ?other, "dropping unmappable resource prompt block");
+                        }
+                    }
+                }
                 other => {
-                    return responder.respond_with_error(
-                        AcpError::invalid_params().data(serde_json::json!({
-                            "message": format!("unsupported prompt content block: {other:?}")
-                        })),
-                    );
+                    // Audio and any future variant: no official mapping, a
+                    // dropped block must NOT kill the turn.
+                    tracing::warn!(kind = ?other, "dropping unmappable prompt content block");
                 }
             }
         }
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && files.is_empty() {
             return responder.respond_with_error(AcpError::invalid_params());
         }
 
@@ -983,10 +1084,13 @@ impl AgentService {
         }
 
         let backend = Arc::clone(&self.backend);
-        if let Err(e) = backend.prompt(&req.session_id.0, &text).await {
-            tracing::error!(error = %e, "backend prompt failed");
-            return responder.respond_with_internal_error(format!("prompt failed: {e}"));
-        }
+        // Subscribe BEFORE posting the prompt: the SSE stream has no replay
+        // (no Last-Event-ID), and a fast-failing turn — bad provider token,
+        // model outage — can emit its terminal `session.execution.failed`
+        // event within milliseconds of the POST, i.e. before a
+        // post-then-subscribe sequence connects. The loop would then wait
+        // forever and the ACP `session/prompt` response never arrives. A
+        // subscribe failure also leaves no orphaned turn server-side.
         let mut stream = match backend.event_stream(&req.session_id.0).await {
             Ok(s) => s,
             Err(e) => {
@@ -996,6 +1100,10 @@ impl AgentService {
                 ));
             }
         };
+        if let Err(e) = backend.prompt(&req.session_id.0, &text, &files).await {
+            tracing::error!(error = %e, "backend prompt failed");
+            return responder.respond_with_internal_error(format!("prompt failed: {e}"));
+        }
 
         let mut state = updates::MappingState::new().with_no_aft(self.no_aft);
         // Child (subagent) sessions of this session, registered from
@@ -1765,6 +1873,51 @@ fn last_assistant_agent(records: &[dto::MessageRecord]) -> Option<String> {
         .and_then(|r| r.agent.clone())
 }
 
+/// Release 0.3.1: basename of a URI for the `files[].filename` field —
+/// strips the query/fragment, then the `file://` scheme, and takes the part
+/// after the last `/`. `None` for `data:` content or scheme-less uris
+/// (callers fall back to their default name: "image"/"file"). Mirrors the
+/// official adapter's `basename(new URL(url).pathname)`.
+fn basename_of(uri: Option<&str>) -> Option<String> {
+    let uri = uri?;
+    if uri.starts_with("data:") {
+        return None;
+    }
+    let path = uri
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(uri)
+        .strip_prefix("file://")
+        .unwrap_or(uri);
+    path.rsplit('/').next().filter(|b| !b.is_empty()).map(str::to_string)
+}
+
+/// Release 0.3.1: `(pathname, line)` of a `file://` URI for the text
+/// resource folding `[path[:line]] content` — the pathname with the query
+/// stripped, the line from a `#L<digits>` (or `#<digits>`) fragment
+/// (official emits `[${path}${line? ":"+line : ""}]`). Non-`file://` uris
+/// yield `(None, None)`.
+fn path_and_line(uri: &str) -> (Option<String>, Option<String>) {
+    if !uri.starts_with("file://") {
+        return (None, None);
+    }
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    let (path_part, fragment) = match without_query.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (without_query, None),
+    };
+    let path = path_part.strip_prefix("file://");
+    let line = fragment.and_then(|f| {
+        let digits = f.strip_prefix('L').unwrap_or(f);
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            Some(digits.to_string())
+        } else {
+            None
+        }
+    });
+    (path.map(str::to_string), line)
+}
+
 /// Release 0.3.0: the last assistant message's `model` field (the model
 /// config-option current value source for load/resume when the session
 /// record carried none), or `None` when the session has no assistant message
@@ -1932,6 +2085,8 @@ mod tests {
         session_out: Mutex<Option<dto::SessionInfo>>,
         /// Release 0.3.0: session ids passed to `get_session`.
         get_session_calls: Mutex<Vec<String>>,
+        /// Release 0.3.1: every (session_id, text, files) passed to `prompt`.
+        prompt_bodies: Mutex<Vec<(String, String, Vec<dto::PromptFile>)>>,
         /// Release 0.3.0: every (session_id, model) passed to `set_model`.
         set_model_calls: Mutex<Vec<(String, dto::ModelRef)>>,
         /// Release 0.3.0: force `set_model` to fail (proves the error+push
@@ -1960,6 +2115,7 @@ mod tests {
                 agents_out: Mutex::new(None),
                 agents_fail: AtomicBool::new(false),
                 set_agent_calls: Mutex::new(Vec::new()),
+                prompt_bodies: Mutex::new(Vec::new()),
                 session_out: Mutex::new(None),
                 get_session_calls: Mutex::new(Vec::new()),
                 set_model_calls: Mutex::new(Vec::new()),
@@ -2010,6 +2166,10 @@ mod tests {
 
         fn recorded_set_agent_calls(&self) -> Vec<(String, String)> {
             self.set_agent_calls.lock().expect("set_agent lock").clone()
+        }
+
+        fn recorded_prompt_bodies(&self) -> Vec<(String, String, Vec<dto::PromptFile>)> {
+            self.prompt_bodies.lock().expect("prompt lock").clone()
         }
 
         /// Block the next `list_commands` call until the returned sender
@@ -2065,7 +2225,16 @@ mod tests {
             Box::pin(async { Ok("ses_mock_1".to_string()) })
         }
 
-        fn prompt(&self, _session_id: &str, _text: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        fn prompt(
+            &self,
+            session_id: &str,
+            text: &str,
+            files: &[dto::PromptFile],
+        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.prompt_bodies
+                .lock()
+                .expect("prompt lock")
+                .push((session_id.to_string(), text.to_string(), files.to_vec()));
             Box::pin(async { Ok(()) })
         }
 
@@ -4891,5 +5060,393 @@ mod tests {
         })
         .await;
         outcome.expect("client run ok");
+    }
+
+    // ================= Release 0.3.1: prompt block mapping =================
+
+    /// Canned turn completion so a prompt send resolves (the events are
+    /// buffered before the prompt call; the loop consumes them).
+    fn push_turn_end(backend: &Arc<MockBackend>, sid: &str) {
+        backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+            sessionID: sid.to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn prompt_resource_link_becomes_files_entry() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (a) THE bug: Zed @-mention — ResourceLink with explicit
+            // name + mime.
+            let link = acp::ResourceLink::new("opencode.jsonc", "file:///tmp/opencode.jsonc")
+                .mime_type(Some("application/json".to_string()));
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::ResourceLink(link)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(
+            backend.recorded_prompt_bodies(),
+            vec![(
+                "ses_mock_1".to_string(),
+                String::new(),
+                vec![dto::PromptFile::new(
+                    "file:///tmp/opencode.jsonc",
+                    "opencode.jsonc",
+                    "application/json",
+                )],
+            )],
+            "resource_link → files entry with the uri verbatim and its name"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_resource_link_defaults_name_and_mime() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // Empty name + no mime → basename(uri) + "text/plain".
+            let link = acp::ResourceLink::new("", "file:///tmp/notes.md");
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::ResourceLink(link)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].2, vec![dto::PromptFile::new(
+            "file:///tmp/notes.md",
+            "notes.md",
+            "text/plain",
+        )]);
+    }
+
+    #[tokio::test]
+    async fn prompt_image_data_becomes_data_url_entry() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (b) base64 data → `data:<mime>;base64,<data>` entry; the
+            // filename falls back to the uri basename.
+            let img = acp::ImageContent::new("aGVsbG8=", "image/png")
+                .uri(Some("file:///tmp/shot.png".to_string()));
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::Image(img)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].2, vec![dto::PromptFile::new(
+            "data:image/png;base64,aGVsbG8=",
+            "shot.png",
+            "image/png",
+        )]);
+
+        // uri-only image with a supported scheme (http) → the uri verbatim.
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let img = acp::ImageContent::new("", "image/png")
+                .uri(Some("https://example.com/a/b.png".to_string()));
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::Image(img)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].2, vec![dto::PromptFile::new(
+            "https://example.com/a/b.png",
+            "b.png",
+            "image/png",
+        )]);
+
+        // Unsupported uri scheme (ftp) → dropped, still a clean turn with
+        // empty text AND no files → the both-empty guard rejects it (this is
+        // the emptiness guard, not a per-block error: nothing at all would
+        // be sent).
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let img = acp::ImageContent::new("", "image/png")
+                .uri(Some("ftp://example.com/x.png".to_string()));
+            push_turn_end(&backend, &sid.0);
+            let err = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::Image(img)]))
+                .block_task()
+                .await
+                .expect_err("nothing mappable left → both-empty guard");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(backend.recorded_prompt_bodies().is_empty(), "no wire call for a dropped-only prompt");
+    }
+
+    #[tokio::test]
+    async fn prompt_mixed_text_and_resource_link_use_both_surfaces() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (c) text + link → text appended AND a files entry.
+            let blocks = vec![
+                acp::ContentBlock::Text(TextContent::new("look at ")),
+                acp::ContentBlock::ResourceLink(
+                    acp::ResourceLink::new("notes.md", "file:///tmp/notes.md"),
+                ),
+            ];
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, blocks))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].0, "ses_mock_1");
+        assert_eq!(bodies[0].1, "look at ");
+        assert_eq!(
+            bodies[0].2,
+            vec![dto::PromptFile::new("file:///tmp/notes.md", "notes.md", "text/plain")]
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_file_only_empty_text_is_accepted_and_both_empty_rejected() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (d) file-only mention: EMPTY text is legitimate with files.
+            let link = acp::ResourceLink::new("opencode.jsonc", "file:///tmp/opencode.jsonc");
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![acp::ContentBlock::ResourceLink(link)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // (e) both surfaces empty → still invalid params (also for
+            // whitespace-only text).
+            let err = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![]))
+                .block_task()
+                .await
+                .expect_err("empty prompt must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            let err = cx
+                .send_request(PromptRequest::new(
+                    sid,
+                    vec![acp::ContentBlock::Text(TextContent::new("   "))],
+                ))
+                .block_task()
+                .await
+                .expect_err("whitespace-only prompt must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies.len(), 1, "only the file-only prompt reached the wire");
+        assert_eq!(bodies[0].1, "");
+        assert_eq!(bodies[0].2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_audio_is_dropped_with_warning_not_an_error() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (f) audio has no official mapping: dropped, the turn survives.
+            let blocks = vec![
+                acp::ContentBlock::Audio(acp::AudioContent::new("QUJD", "audio/wav")),
+                acp::ContentBlock::Text(TextContent::new("transcribe this")),
+            ];
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, blocks))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].1, "transcribe this");
+        assert!(bodies[0].2.is_empty(), "audio must not produce a files entry");
+    }
+
+    #[tokio::test]
+    async fn prompt_text_resource_folds_into_text_others_into_files() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // (g) text file:// resource → `[path] content` appended.
+            let res = acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new("the file content", "file:///tmp/notes.md"),
+                ),
+            );
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::Resource(res)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].1, "[/tmp/notes.md] the file content");
+
+        // Line fragment → `[path:line]`.
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let res = acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new("line 12", "file:///tmp/notes.md#L12"),
+                ),
+            );
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![acp::ContentBlock::Resource(res)]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert_eq!(bodies[0].1, "[/tmp/notes.md:12] line 12");
+
+        // data: text resource → files entry; blob file:// resource → files
+        // entry (mime defaults).
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let blocks = vec![
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new("dGV4dA==", "data:text/plain;base64,dGV4dA=="),
+                    ),
+                )),
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::BlobResourceContents(
+                        acp::BlobResourceContents::new("QUJD", "file:///tmp/blob.bin"),
+                    ),
+                )),
+            ];
+            push_turn_end(&backend, &sid.0);
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, blocks))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let bodies = backend.recorded_prompt_bodies();
+        assert!(bodies[0].1.is_empty());
+        assert_eq!(
+            bodies[0].2,
+            vec![
+                dto::PromptFile::new("data:text/plain;base64,dGV4dA==", "file", "text/plain"),
+                dto::PromptFile::new("file:///tmp/blob.bin", "blob.bin", "application/octet-stream"),
+            ]
+        );
     }
 }

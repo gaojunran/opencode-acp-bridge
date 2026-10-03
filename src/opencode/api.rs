@@ -771,8 +771,10 @@ mod tests {
             .await
             .expect("prompt");
 
-        // Stream until this session's terminal event, 120 s cap.
-        let mut stream = event_stream(&client);
+        // Stream until this session's terminal event, 120 s cap. (Test
+        // sequence: prompt first, then subscribe — the turn's terminal fires
+        // seconds later, so the late subscriber still catches it.)
+        let mut stream = event_stream(client.clone()).await.expect("event stream");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let mut succeeded = false;
         let mut failed: Option<String> = None;

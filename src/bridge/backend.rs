@@ -47,11 +47,20 @@ impl OpenCodeBackend for HttpBackend {
         Box::pin(async move { Ok(self.client.create_session(&req).await?.id) })
     }
 
-    fn prompt(&self, session_id: &str, text: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+    fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[crate::dto::PromptFile],
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         let session_id = session_id.to_string();
         let req = crate::dto::PromptRequest {
             text: text.to_string(),
-            files: None,
+            files: if files.is_empty() {
+                None
+            } else {
+                Some(files.to_vec())
+            },
             agents: None,
             skills: None,
             metadata: None,
@@ -82,12 +91,17 @@ impl OpenCodeBackend for HttpBackend {
     fn event_stream(&self, _session_id: &str) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
         let client = self.client.clone();
         Box::pin(async move {
-            // `sse::event_stream` borrows its client; the task owns it and
-            // forwards every decoded event into the channel. Dropping the
-            // returned stream drops the receiver, which ends the task.
+            // EAGER connect (completes before this future resolves — and
+            // before the caller POSTs the prompt): the SSE subscriber is
+            // attached inside `sse::event_stream`, so every turn event
+            // emitted after that point is seen. A connect failure surfaces
+            // as an error here instead of a silently dead channel. The
+            // forwarding task then owns the connected, 'static stream and
+            // pumps decoded events into the channel. Dropping the returned
+            // stream drops the receiver, which ends the task.
+            let mut stream = crate::opencode::sse::event_stream(client).await?;
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
-                let mut stream = crate::opencode::sse::event_stream(&client);
                 while let Some(event) = stream.next().await {
                     if tx.send(event).is_err() {
                         break; // consumer dropped the stream
