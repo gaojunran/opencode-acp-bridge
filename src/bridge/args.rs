@@ -11,17 +11,21 @@ opencode-acp-bridge — ACP agent bridging Zed (and any ACP client) to a shared
 opencode server over its HTTP API.
 
 USAGE:
-    opencode-acp-bridge [--attach <url> | --attach] [--help] [--version]
+    opencode-acp-bridge [--attach <url>] [--help] [--version]
 
 OPTIONS:
     --attach <url>   Connect to the opencode server at <url>
-                     (e.g. http://127.0.0.1:44041). The password is read from
-                     the OPENCODE_PASSWORD or OPENCODE_SERVER_PASSWORD env.
-    --attach         Read the connection from ~/.config/opencode/service.json
-                     ({port, password, hostname} — written by `opencode serve`).
+                      (e.g. http://127.0.0.1:44041). The password is read from
+                      the OPENCODE_PASSWORD or OPENCODE_SERVER_PASSWORD env.
     --no-aft         Disable the aft tool-call hoist adaptations (File/image
-                     content passthrough). Diff extraction stays enabled —
-                     filediff/diff are dialect-neutral and work either way.
+                      content passthrough). Diff extraction stays enabled —
+                      filediff/diff are dialect-neutral and work either way.
+    --zed-git-add    Stage the agent's write/edit/apply_patch outputs from
+                     the previous turn at each new user prompt
+                     (`git add -- <paths>` per root session), so Zed's
+                     unstaged-changes view shows only the current turn's
+                     changes. Off by default — when off, no tracking and no
+                     git invocations happen.
     --version        Print the version and exit.
     --help           Print this help and exit.
 
@@ -46,8 +50,6 @@ pub const CONNECTION_EXAMPLES: &str = "\
 pub enum ConnectMode {
     /// `--attach <url>`: the explicit URL; the password must come from env.
     ExplicitUrl(String),
-    /// Bare `--attach`: read `~/.config/opencode/service.json`.
-    ServiceFile,
     /// No `--attach` (the default): try the service file first, then fall
     /// back to `OPENCODE_URL` (+ password env) when the file is absent.
     Default,
@@ -75,6 +77,10 @@ pub struct RunOptions {
     /// `--no-aft`: disable the aft hoist adaptations (File/image content
     /// passthrough in tool results; see `USAGE`).
     pub no_aft: bool,
+    /// `--zed-git-add`: turn-scoped staging of the agent's tool writes
+    /// (Release 0.7.0; see `USAGE`). Off by default — zero staging behavior
+    /// when off.
+    pub zed_git_add: bool,
 }
 
 /// Parse the argument list (argv[0] included, like `std::env::args()`).
@@ -83,7 +89,8 @@ pub struct RunOptions {
 /// - `--help` / `--version` win immediately (first one seen).
 /// - `--attach <url>`: the next token, when it does not start with `-`, is the
 ///   URL; otherwise (next flag or end of args) `--attach` is treated as bare.
-/// - `--no-aft`: boolean flag, may appear anywhere; rejected when repeated.
+/// - `--no-aft` / `--zed-git-add`: boolean flags, may appear anywhere;
+///   rejected when repeated.
 /// - any other token is a usage error; a repeated `--attach` is a usage error.
 pub fn parse_args<I>(args: I) -> ParseOutcome
 where
@@ -93,9 +100,12 @@ where
     let _prog = iter.next(); // argv[0]: program name
     let rest: Vec<String> = iter.collect();
 
-    // None = not seen; Some(Some(url)) = --attach with URL; Some(None) = bare.
+    // None = not seen; Some(Some(url)) = --attach with URL; Some(None) = bare
+    // (--attach without a URL — a usage error, deferred so --help/--version
+    // tokens elsewhere in the line still win).
     let mut attach: Option<Option<String>> = None;
     let mut no_aft = false;
+    let mut zed_git_add = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -109,6 +119,14 @@ where
                     );
                 }
                 no_aft = true;
+            }
+            "--zed-git-add" => {
+                if zed_git_add {
+                    return ParseOutcome::Error(
+                        "duplicate --zed-git-add (run with --help for usage)".to_string(),
+                    );
+                }
+                zed_git_add = true;
             }
             "--attach" => {
                 if attach.is_some() {
@@ -137,10 +155,15 @@ where
 
     let mode = match attach {
         Some(Some(url)) => ConnectMode::ExplicitUrl(url),
-        Some(None) => ConnectMode::ServiceFile,
+        Some(None) => {
+            return ParseOutcome::Error(
+                "--attach requires a URL — omit --attach to use the default resolution (~/.config/opencode/service.json, then OPENCODE_URL), or pass --attach <url> (run with --help for usage)"
+                    .to_string(),
+            )
+        }
         None => ConnectMode::Default,
     };
-    ParseOutcome::Run(RunOptions { mode, no_aft })
+    ParseOutcome::Run(RunOptions { mode, no_aft, zed_git_add })
 }
 
 #[cfg(test)]
@@ -164,29 +187,29 @@ mod tests {
     fn attach_with_url_is_explicit_mode() {
         assert_eq!(
             parse(&["prog", "--attach", "http://127.0.0.1:44041"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false, zed_git_add: false })
         );
     }
 
     #[test]
-    fn bare_attach_is_service_file_mode() {
-        assert_eq!(
-            parse(&["prog", "--attach"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::ServiceFile, no_aft: false })
-        );
-        // Followed by another flag: still the bare form.
-        assert_eq!(
-            parse(&["prog", "--attach", "--help"]),
-            ParseOutcome::Help,
-            "attach before an unrelated flag"
-        );
+    fn bare_attach_is_a_usage_error() {
+        match parse(&["prog", "--attach"]) {
+            ParseOutcome::Error(msg) => {
+                assert!(msg.contains("--attach requires a URL"), "got {msg}");
+                assert!(msg.contains("--help"), "message points at --help: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Help/version still win over the deferred bare-attach error.
+        assert_eq!(parse(&["prog", "--attach", "--help"]), ParseOutcome::Help);
+        assert_eq!(parse(&["prog", "--attach", "--version"]), ParseOutcome::Version);
     }
 
     #[test]
     fn no_attach_means_default_mode() {
         assert_eq!(
             parse(&["prog"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: false })
         );
     }
 
@@ -195,7 +218,7 @@ mod tests {
         // Bare --no-aft.
         assert_eq!(
             parse(&["prog", "--no-aft"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true, zed_git_add: false })
         );
         // With an explicit URL, in either order.
         assert_eq!(
@@ -203,18 +226,46 @@ mod tests {
             ParseOutcome::Run(RunOptions {
                 mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
                 no_aft: true,
+                zed_git_add: false,
             })
         );
-        assert_eq!(
-            parse(&["prog", "--attach", "--no-aft"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::ServiceFile, no_aft: true }),
-            "bare --attach followed by --no-aft"
-        );
+        // Bare --attach followed by --no-aft: the deferred usage error
+        // (help/version tokens would still win).
+        match parse(&["prog", "--attach", "--no-aft"]) {
+            ParseOutcome::Error(msg) => {
+                assert!(msg.contains("--attach requires a URL"), "got {msg}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
     fn duplicate_no_aft_is_rejected() {
         match parse(&["prog", "--no-aft", "--no-aft"]) {
+            ParseOutcome::Error(msg) => assert!(msg.contains("duplicate"), "got {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zed_git_add_flag_composes_with_any_attach_form() {
+        assert_eq!(
+            parse(&["prog", "--zed-git-add"]),
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: true })
+        );
+        assert_eq!(
+            parse(&["prog", "--no-aft", "--zed-git-add", "--attach", "http://127.0.0.1:44041"]),
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
+                no_aft: true,
+                zed_git_add: true,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_zed_git_add_is_rejected() {
+        match parse(&["prog", "--zed-git-add", "--zed-git-add"]) {
             ParseOutcome::Error(msg) => assert!(msg.contains("duplicate"), "got {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }

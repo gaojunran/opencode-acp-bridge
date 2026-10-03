@@ -104,8 +104,6 @@ pub enum ConfigError {
     NoConfig { examples: String },
     #[error("password missing for {mode}: set OPENCODE_PASSWORD or OPENCODE_SERVER_PASSWORD")]
     MissingPassword { mode: String },
-    #[error("cannot determine the home directory (HOME is not set); needed for the service file")]
-    MissingHome,
     #[error("service file {path} not found or unreadable: {source}")]
     ServiceFileIo { path: String, source: io::Error },
     #[error("service file {path} is not valid JSON: {source}")]
@@ -115,9 +113,7 @@ pub enum ConfigError {
 /// Resolve the connection for a mode.
 ///
 /// - `--attach <url>`: URL verbatim, password from env (mandatory).
-/// - bare `--attach`: `~/.config/opencode/service.json`; the file carries
-///   port/password/hostname, `0.0.0.0` is mapped to `127.0.0.1`. A missing
-///   file is an error (strict).
+/// - `--attach <url>`: explicit URL; the password comes from the password env.
 /// - default (no flags): try the service file; when it is *absent* (not found,
 ///   or HOME unset) fall back to `OPENCODE_URL` + password env. A present but
 ///   broken file is surfaced as-is — a corrupt registration must not be masked.
@@ -134,21 +130,11 @@ pub fn resolve_config(mode: &ConnectMode, env: &dyn EnvLike) -> Result<Connectio
             })
         }
 
-        ConnectMode::ServiceFile => match resolve_service_file(env) {
-            ServiceFileOutcome::Resolved(cfg) => Ok(cfg),
-            ServiceFileOutcome::NoHome => Err(ConfigError::MissingHome),
-            ServiceFileOutcome::Missing { path, source } => Err(ConfigError::ServiceFileIo {
-                path: path.display().to_string(),
-                source,
-            }),
-            ServiceFileOutcome::Failed(e) => Err(e),
-        },
-
         ConnectMode::Default => match resolve_service_file(env) {
             ServiceFileOutcome::Resolved(cfg) => Ok(cfg),
             // Absent (not found / HOME unset): the env fallback is the point
             // of the default mode.
-            ServiceFileOutcome::NoHome | ServiceFileOutcome::Missing { .. } => resolve_from_env(env),
+            ServiceFileOutcome::NoHome | ServiceFileOutcome::Missing => resolve_from_env(env),
             // Present but broken: surface it — do not mask a corrupt registration.
             ServiceFileOutcome::Failed(e) => Err(e),
         },
@@ -186,7 +172,7 @@ struct ServiceFile {
 }
 
 /// What the service-file lookup produced. The `Default` mode falls back to
-/// env on `NoHome`/`Missing`; bare `--attach` surfaces them as errors.
+/// env on `NoHome`/`Missing`.
 #[derive(Debug)]
 enum ServiceFileOutcome {
     /// Read and parsed; ready to use.
@@ -194,7 +180,7 @@ enum ServiceFileOutcome {
     /// HOME is unset, so the path cannot even be located.
     NoHome,
     /// The file does not exist (`io::ErrorKind::NotFound`).
-    Missing { path: PathBuf, source: io::Error },
+    Missing,
     /// The file exists but is unreadable or corrupt — must be surfaced.
     Failed(ConfigError),
 }
@@ -210,7 +196,7 @@ fn resolve_service_file(env: &dyn EnvLike) -> ServiceFileOutcome {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return ServiceFileOutcome::Missing { path, source };
+            return ServiceFileOutcome::Missing;
         }
         Err(source) => {
             return ServiceFileOutcome::Failed(ConfigError::ServiceFileIo {
@@ -398,7 +384,7 @@ mod tests {
         let home = temp_home("happy");
         let path = write_service_file(&home, r#"{"port":47779,"password":"pw","hostname":"0.0.0.0"}"#);
         let env = MapEnv::new([], Some(home.clone()));
-        let cfg = resolve_config(&ConnectMode::ServiceFile, &env).expect("resolves");
+        let cfg = resolve_config(&ConnectMode::Default, &env).expect("resolves");
         assert_eq!(cfg.base_url, "http://127.0.0.1:47779", "0.0.0.0 maps to loopback");
         assert_eq!(cfg.password, "pw");
         assert_eq!(cfg.source, path.display().to_string(), "source names the actual path");
@@ -410,24 +396,8 @@ mod tests {
         let home = temp_home("nohost");
         write_service_file(&home, r#"{"port":44041,"password":"pw"}"#);
         let env = MapEnv::new([], Some(home.clone()));
-        let cfg = resolve_config(&ConnectMode::ServiceFile, &env).expect("resolves");
+        let cfg = resolve_config(&ConnectMode::Default, &env).expect("resolves");
         assert_eq!(cfg.base_url, "http://127.0.0.1:44041");
-        std::fs::remove_dir_all(&home).expect("cleanup");
-    }
-
-    #[test]
-    fn service_file_missing_reports_the_path() {
-        let home = temp_home("missing");
-        let env = MapEnv::new([], Some(home.clone()));
-        let err = resolve_config(&ConnectMode::ServiceFile, &env).expect_err("file absent");
-        let msg = err.to_string();
-        let expected = home
-            .join(".config")
-            .join("opencode")
-            .join("service.json")
-            .display()
-            .to_string();
-        assert!(msg.contains(&expected), "error names the path:\n{msg}");
         std::fs::remove_dir_all(&home).expect("cleanup");
     }
 
@@ -436,7 +406,7 @@ mod tests {
         let home = temp_home("badjson");
         write_service_file(&home, "{not json");
         let env = MapEnv::new([], Some(home.clone()));
-        let err = resolve_config(&ConnectMode::ServiceFile, &env).expect_err("bad json");
+        let err = resolve_config(&ConnectMode::Default, &env).expect_err("bad json");
         let msg = err.to_string();
         assert!(msg.contains("service.json"), "{msg}");
         assert!(msg.contains("not valid JSON"), "{msg}");
@@ -448,17 +418,9 @@ mod tests {
         let home = temp_home("badshape");
         write_service_file(&home, r#"{"password":"pw"}"#);
         let env = MapEnv::new([], Some(home.clone()));
-        let err = resolve_config(&ConnectMode::ServiceFile, &env).expect_err("no port");
+        let err = resolve_config(&ConnectMode::Default, &env).expect_err("no port");
         let msg = err.to_string();
         assert!(msg.contains("missing field `port`"), "{msg}");
         std::fs::remove_dir_all(&home).expect("cleanup");
-    }
-
-    #[test]
-    fn service_file_requires_home() {
-        let env = MapEnv::new([], None);
-        let err = resolve_config(&ConnectMode::ServiceFile, &env).expect_err("no HOME");
-        let msg = err.to_string();
-        assert!(msg.contains("HOME"), "{msg}");
     }
 }

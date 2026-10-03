@@ -13,7 +13,7 @@ use opencode_acp_bridge::acp::agent::{AgentService, OpenCodeBackend};
 use opencode_acp_bridge::bridge::args::{ConnectMode, ParseOutcome, USAGE, parse_args};
 use opencode_acp_bridge::bridge::backend::HttpBackend;
 use opencode_acp_bridge::bridge::config::{
-    SERVICE_FILE_STALE_HINT, resolve_config,
+    ConfigError, SERVICE_FILE_STALE_HINT, resolve_config,
 };
 use opencode_acp_bridge::bridge::probe::{ProbeError, probe_server};
 use opencode_acp_bridge::opencode::api::{ApiError, OpencodeClient};
@@ -34,18 +34,24 @@ async fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::from(2)
         }
-        ParseOutcome::Run(opts) => run(opts.mode, opts.no_aft).await,
+        ParseOutcome::Run(opts) => run(opts.mode, opts.no_aft, opts.zed_git_add).await,
     }
 }
 
-async fn run(mode: ConnectMode, no_aft: bool) -> ExitCode {
+async fn run(mode: ConnectMode, no_aft: bool, zed_git_add: bool) -> ExitCode {
     init_tracing();
 
     let cfg = match resolve_config(&mode, &opencode_acp_bridge::bridge::config::RealEnv) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("error: {e}");
-            if matches!(mode, ConnectMode::ServiceFile) {
+            // The stale-registration hint applies when a PRESENT but broken
+            // service file is the cause (Release 0.7.0: bare `--attach` is
+            // gone; gate on the error, not the mode).
+            if matches!(
+                e,
+                ConfigError::ServiceFileIo { .. } | ConfigError::ServiceFileJson { .. }
+            ) {
                 eprintln!("{SERVICE_FILE_STALE_HINT}");
             }
             return ExitCode::FAILURE;
@@ -93,7 +99,11 @@ async fn run(mode: ConnectMode, no_aft: bool) -> ExitCode {
     tracing::info!("probe ok — serving ACP on stdio");
 
     let backend: Arc<dyn OpenCodeBackend> = Arc::new(HttpBackend::new(client));
-    let service = Arc::new(AgentService::new(backend).with_no_aft(no_aft));
+    let service = Arc::new(
+        AgentService::new(backend)
+            .with_no_aft(no_aft)
+            .with_zed_git_add(zed_git_add),
+    );
 
     // Runs until the stdio connection closes (stdin EOF → clean exit).
     match service.serve(Stdio::new()).await {

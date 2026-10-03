@@ -87,6 +87,11 @@ pub struct SessionInfo {
     pub version: Option<Value>,
     #[serde(default)]
     pub subpath: Option<Value>,
+    /// Parent (subagent) session id — present on CHILD sessions.
+    /// Release 0.7.0: a loaded child's own prompt must never trigger
+    /// turn-scoped staging (`--zed-git-add`).
+    #[serde(default)]
+    pub parentID: Option<String>,
     #[serde(default)]
     pub location: Option<Location>,
     #[serde(default)]
@@ -391,7 +396,7 @@ pub struct StructuredError {
 /// VERIFIED (single-file `write`): `filediff` object + `diff` string + `title`.
 /// UNVERIFIED: multi-file tools (apply_patch) — may carry a different layout;
 /// if a live probe shows one, extend with a `filediffs: Vec<FileDiff>` field.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ToolMetadata {
     /// Unified patch (SVN-style `Index:` header) as a single string.
     #[serde(default)]
@@ -417,7 +422,7 @@ pub struct ToolMetadata {
 /// `type`, `patch`, `additions`, `deletions` — live-verified from a real
 /// apply_patch capture; `movePath` exists in the dev-clone source but was
 /// NOT observed on the wire).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     /// Absolute path of the file — the AUTHORITATIVE path (the diff mapping

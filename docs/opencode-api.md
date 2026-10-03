@@ -748,3 +748,94 @@ child's total entry count from its own history (Zed caps the embedded
 display to the trailing 8). Loading a CHILD id uses the existing generic
 load path (child history replays as child-id notifications — correct by
 construction).
+
+## Turn-scoped staging (--zed-git-add, Release 0.7.0)
+
+The bridge-native port of the `opencode-git-add` plugin's v2 staging lane —
+gated behind the `--zed-git-add` CLI flag (default OFF; with the flag off
+NO tracking happens and NO git subprocess is ever spawned — every staging
+entry point returns before touching state).
+
+### Semantics (plugin parity + bridge deltas)
+
+The plugin's settled semantics, ported 1:1 where the wire allows:
+
+- Track ONLY completed tool calls (`session.tool.success`; `ToolFailed`
+  events are never wired — the plugin's `status == "completed"` gate).
+- `write` / `edit`: `input.path` (from the mapping's per-call input cache —
+  success events carry no input on the wire; a call whose input was missed
+  (mid-attach) is skipped, like a draft without an input).
+- `apply_patch`: `result.metadata.files[].filePath` is AUTHORITATIVE when
+  present (even `files: []` falls back); otherwise parse `input.patchText`
+  headers exactly like the plugin's regexes:
+  `*** Update File: <p>` / `*** Add File: <p>` / `*** Delete File: <p>` /
+  `*** Move to: <p>` and `*** Rename File: <a> to <b>` with BOTH sides
+  (greedy ` to ` split = last separator). Garbage patchText (bogus ops,
+  empty paths, CRLF lines) tracks nothing.
+- Resolution + containment: cwd-relative paths resolve against the session
+  cwd; absolute paths pass through; `..` segments are normalized in BOTH
+  forms (the plugin only normalizes relative paths — an absolute `..` path
+  leaks its startsWith check; we close that) and anything escaping the
+  session cwd is never tracked.
+- Staging at the next user prompt, `git -C <cwd> add -- <deduped absolute
+  paths>` — EXACTLY the tracked paths (never `git add .` / `-A`: only
+  what the agent touched is staged, so the user's own edits and untracked
+  scaffolding are never swept in). No shell, no globs, `--` stops option
+  parsing.
+- Failure policy: any pre-check failure or `git add` failure (after 3
+  retries, 500 ms apart — the plugin's budget) logs a warning and RETAINS
+  the pending set; the next prompt retries. A git failure never kills the
+  user's message.
+- Log at info on success: session, path count, first path.
+
+Bridge deltas (by design, settled upstream):
+
+- Pending is keyed by ROOT SESSION, not project directory. A subagent
+  child's edits (events carrying the child's session id, resolved via the
+  Release 0.6.0 child tracker / `child_parents` map) accumulate under the
+  PARENT's pending set, and the PARENT's next prompt stages them together
+  with its own. A child's own prompt NEVER stages (`parent_id` is captured
+  at session/load from `GET /api/session/{id}`'s `parentID`).
+- Topology guards for the split-machine case (bridge and server may run on
+  different machines — tool-event paths are SERVER-side): every path must
+  EXIST on the bridge's local filesystem, and the session cwd must be
+  inside a git work tree (`git rev-parse --is-inside-work-tree`). Any
+  failure skips staging entirely (never a partial batch) and retains.
+  Note: a DELETED file (apply_patch `Delete File`) therefore never stages
+  (exists() fails → retained, like any pre-check failure) — the plugin,
+  which has no such guard, stages deletions via git.
+- Two triggers, one shared `stage_pending(root)`:
+  - LOCAL prompt: in the `session/prompt` handler, BEFORE the prompt POST.
+  - REMOTE prompt: the background listener's `session.inbox.enqueued`
+    handler for user items that are NOT the local turn's own suppressed
+    inbox id (local prompts were already staged by the handler).
+- Dedup: the plugin's message-id dedup is unnecessary here — a prompt
+  reaches exactly one trigger (the handler XOR the listener, since the
+  listener consumes the local inbox id).
+
+### Wires & state
+
+- `session.tool.success` `metadata.files[].filePath` — already decoded
+  (`dto::FileEntry`); no wire extension needed for staging.
+- `GET /api/session/{id}` `parentID` — added to `dto::SessionInfo` (serde
+  default; governance lane-add) for the loaded-child gate.
+- `git_add.rs` owns the pure logic (header parsing, containment, staging
+  with retries) — unit-tested against real temp git repos; `SessionEntry`
+  carries `git_add: Mutex<GitAddState>` (pending set) plus `parent_id`.
+
+### Verification (as shipped)
+
+- 13 `git_add.rs` unit tests (real temp git repos): header forms incl.
+  rename both sides, garbage patchText, metadata-over-headers priority,
+  empty-metadata fallback, CRLF skip, containment incl. `..` and
+  sibling-prefix escapes, exact-path staging (manual edits untouched),
+  pre-check retains (non-repo + missing path), retry-then-recover under
+  `.git/index.lock`.
+- 6 agent-level tests (MockBackend + real git repos): previous-turn staging
+  at the next prompt, metadata path staging, child-edit-under-parent, flag
+  OFF never stages (identical traffic, nothing staged), failure retains
+  then recovers, remote prompt stages the previous remote turn.
+- Live server check: see the scratch-server recipe — a session whose cwd is
+  a temp git project, prompted to edit a file, stages the file at the
+  SECOND prompt (visible in `git diff --cached` from the temp project, and
+  in the bridge's `zed-git-add: staged` info log with RUST_LOG=info).

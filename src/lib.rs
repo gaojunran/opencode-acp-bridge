@@ -11,4 +11,5 @@
 pub mod acp;
 pub mod bridge;
 pub mod dto;
+pub mod git_add;
 pub mod opencode;
