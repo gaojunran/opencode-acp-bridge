@@ -107,49 +107,66 @@ enum State {
 /// disconnects trigger backoff + reconnect, newly delivered `server.connected`
 /// frames re-appear as `None` (unconsumed kind, skipped by
 /// [`dto::decode_event`]). Callers should filter events by `sessionID`.
-pub fn event_stream(client: &OpencodeClient) -> Pin<Box<dyn Stream<Item = SessionEvent> + Send + '_>> {
-    let client = client;
+///
+/// EAGER CONNECT: this is async and performs the HTTP request before
+/// returning. `stream::unfold` is lazy — a sync constructor would leave the
+/// connection pending until the caller's first `next()`, so a caller that
+/// POSTs a prompt first and polls second would race the SSE subscriber
+/// attach: the turn's events are emitted before the subscriber exists and
+/// lost forever (the stream has no replay). Awaiting the connection here
+/// makes "subscribe, then POST" a real ordering guarantee.
+pub async fn event_stream(
+    client: OpencodeClient,
+) -> Result<Pin<Box<dyn Stream<Item = SessionEvent> + Send>>, ApiError> {
+    let inner = open_event_stream(&client).await?;
+    info!("connected to opencode event stream");
     // unfold produces Option<SessionEvent>; None fills "no event this step"
-    // (connect/reconnect progress, skipped frames) and is filtered below.
-    Box::pin(stream::unfold(State::Connect { attempt: 0 }, move |state| async move {
-        {
-            let (next_state, item) = match state {
-                State::Connect { attempt } => {
-                    if attempt > 0 {
-                        let delay = backoff(attempt);
-                        warn!(attempt, delay_ms = delay.as_millis(), "event stream reconnect");
-                        sleep(delay).await;
-                    }
-                    match open_event_stream(client).await {
-                        Ok(inner) => {
-                            info!("connected to opencode event stream");
-                            (State::Streaming { inner }, None)
+    // (reconnect progress, skipped frames) and is filtered below.
+    Ok(Box::pin(
+        stream::unfold(State::Streaming { inner }, move |state| {
+            // The closure is `FnMut` (invoked per step) and cannot move the
+            // captured client into each future — clone per invocation
+            // (Arc-cheap; only the reconnect arm even uses it).
+            let client = client.clone();
+            async move {
+                let (next_state, item) = match state {
+                    State::Connect { attempt } => {
+                        if attempt > 0 {
+                            let delay = backoff(attempt);
+                            warn!(attempt, delay_ms = delay.as_millis(), "event stream reconnect");
+                            sleep(delay).await;
                         }
-                        Err(e) => {
-                            warn!(attempt, error = %e, "event stream connect failed");
-                            (State::Connect { attempt: attempt + 1 }, None)
+                        match open_event_stream(&client).await {
+                            Ok(inner) => {
+                                info!("connected to opencode event stream");
+                                (State::Streaming { inner }, None)
+                            }
+                            Err(e) => {
+                                warn!(attempt, error = %e, "event stream connect failed");
+                                (State::Connect { attempt: attempt + 1 }, None)
+                            }
                         }
                     }
-                }
-                State::Streaming { mut inner } => match inner.next().await {
-                    Some(Ok(frame)) => {
-                        let item = decode_frame_traced(&frame.data);
-                        (State::Streaming { inner }, item)
-                    }
-                    Some(Err(e)) => {
-                        warn!(error = %e, "event stream error, reconnecting");
-                        (State::Connect { attempt: 1 }, None)
-                    }
-                    None => {
-                        warn!("event stream closed, reconnecting");
-                        (State::Connect { attempt: 1 }, None)
-                    }
-                },
-            };
-            Some((item, next_state))
-        }
-    })
-    .filter_map(|item| async move { item }))
+                    State::Streaming { mut inner } => match inner.next().await {
+                        Some(Ok(frame)) => {
+                            let item = decode_frame_traced(&frame.data);
+                            (State::Streaming { inner }, item)
+                        }
+                        Some(Err(e)) => {
+                            warn!(error = %e, "event stream error, reconnecting");
+                            (State::Connect { attempt: 1 }, None)
+                        }
+                        None => {
+                            warn!("event stream closed, reconnecting");
+                            (State::Connect { attempt: 1 }, None)
+                        }
+                    },
+                };
+                Some((item, next_state))
+            }
+        })
+        .filter_map(|item| async move { item }),
+    ))
 }
 
 // ============================================================
