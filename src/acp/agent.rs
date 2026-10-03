@@ -311,62 +311,53 @@ impl AgentService {
         self
     }
 
-    /// Release 0.7.0 (`--zed-git-add`): record ONE completed tool call's
-    /// touched paths under the ROOT session's pending set. Only
-    /// `ToolSuccess` events reach this hook — `ToolFailed` is never wired
-    /// (the plugin's `status == "completed"` gate), and the tool name comes
-    /// from the mapping's title cache (success events carry no name).
-    /// No-op unless the flag is on.
-    fn track_tool_success(
+    /// Release 0.8.0 (`--zed-git-add`): merge ONE `step.ended` snapshot
+    /// diff's paths (RAW worktree-TOP-relative strings — resolved against
+    /// the LOCAL worktree top at staging time; the bridge and the server
+    /// may run on different machines) into the ROOT session's pending set.
+    /// Interrupted steps carry no `files` (server-side boundary, accepted)
+    /// — nothing to collect. No-op unless the flag is on.
+    fn collect_step_files(
         &self,
         root_sid: &str,
         event: &dto::SessionEvent,
-        state: &updates::MappingState,
         entry: &Arc<SessionEntry>,
     ) {
         if !self.zed_git_add {
             return;
         }
-        let dto::SessionEvent::ToolSuccess(success) = event else {
+        let dto::SessionEvent::StepEnded(step) = event else {
             return;
         };
-        let Some(name) = state.tool_title(&success.base.id) else {
-            return; // name unknown (mid-attach window) — nothing to verify
+        let Some(files) = &step.files else {
+            return;
         };
-        if !crate::git_add::is_tracked_tool(name) {
-            return;
-        }
-        let input = state.tool_input(&success.base.id);
-        let touched = crate::git_add::extract_touched(
-            name,
-            std::path::Path::new(&entry.cwd),
-            input,
-            success.metadata.as_ref(),
-        );
-        if touched.is_empty() {
-            return;
-        }
         let mut pending = entry.git_add.lock().expect("git_add lock");
-        for t in touched {
-            let rel = t.abs.strip_prefix(&entry.cwd).unwrap_or(&t.abs);
-            tracing::debug!(
-                session = root_sid,
-                tool = name,
-                source = t.source,
-                path = %rel.display(),
-                "zed-git-add: tracked"
-            );
-            pending.add(t.abs);
+        for f in files {
+            tracing::debug!(session = root_sid, file = %f, "zed-git-add: tracked (step snapshot diff)");
+            pending.add(f.clone());
         }
     }
 
-    /// Release 0.7.0 (`--zed-git-add`): stage the ROOT session's pending
+    /// Release 0.8.0 (`--zed-git-add`): stage the ROOT session's pending
     /// set — called BEFORE each local prompt POST and on each REMOTE user
     /// inbox (background listener), so Zed's unstaged-changes view shows
     /// only the in-progress turn's changes. Idempotent: the set clears on
     /// success; any failure (pre-check or git) retains it for the next
-    /// prompt (no data loss). Child prompts never stage.
-    async fn stage_pending(&self, root_sid: &acp::SessionId) {
+    /// prompt (no data loss).
+    ///
+    /// Only a USER-initiated prompt stages. A CHILD session's own prompt
+    /// never does (its steps accumulate under the ROOT's set) — childhood
+    /// via the registry entry's `parent_id` (a child loaded from its
+    /// subagent card) OR the child map the background listener keeps
+    /// (`child_parents`, learned from `session.created`); a registered
+    /// child's LATER continuation dispatch (input `sessionID`, no
+    /// `session.created`) would otherwise look like a root prompt.
+    async fn stage_pending(
+        &self,
+        root_sid: &acp::SessionId,
+        child_parents: Option<&HashMap<String, (String, String)>>,
+    ) {
         if !self.zed_git_add {
             return;
         }
@@ -379,9 +370,11 @@ impl AgentService {
         else {
             return;
         };
-        // A CHILD session's own prompt never stages (its edits accumulate
+        // A CHILD session's own prompt never stages (its steps accumulate
         // under the ROOT's set, not its own).
-        if entry.parent_id.is_some() {
+        if entry.parent_id.is_some()
+            || child_parents.is_some_and(|m| m.contains_key(root_sid.0.as_ref()))
+        {
             return;
         }
         let paths = {
@@ -392,15 +385,14 @@ impl AgentService {
             pending.pending()
         };
         let cwd = std::path::PathBuf::from(&entry.cwd);
-        let set: std::collections::HashSet<std::path::PathBuf> =
-            paths.iter().cloned().collect();
+        let set: std::collections::HashSet<String> = paths.iter().cloned().collect();
         match crate::git_add::stage_paths(&cwd, &set).await {
             crate::git_add::StagingOutcome::Staged => {
                 entry.git_add.lock().expect("git_add lock").clear();
                 tracing::info!(
                     session = %root_sid,
                     count = paths.len(),
-                    first = %paths[0].display(),
+                    first = %paths[0],
                     "zed-git-add: staged"
                 );
             }
@@ -1496,7 +1488,7 @@ impl AgentService {
         // tracked tool writes BEFORE the prompt POST — Zed's
         // unstaged-changes view then shows only the in-progress turn's
         // changes. Idempotent; child prompts never stage.
-        self.stage_pending(&req.session_id).await;
+        self.stage_pending(&req.session_id, None).await;
 
         let backend = Arc::clone(&self.backend);
         // Subscribe BEFORE posting the prompt: the SSE stream has no replay
@@ -1912,9 +1904,9 @@ impl AgentService {
                     } else {
                         updates::to_updates(&event, &mut state)
                     };
-                    // Release 0.7.0 (`--zed-git-add`): completed tool writes
-                    // join the ROOT session's pending set.
-                    self.track_tool_success(parent_sid, &event, &state, &entry);
+                    // Release 0.8.0 (`--zed-git-add`): the step's snapshot
+                    // diff joins the ROOT session's pending set.
+                    self.collect_step_files(parent_sid, &event, &entry);
                     for update in updates {
                         cx.send_notification(acp::SessionNotification::new(
                             req.session_id.clone(),
@@ -2029,11 +2021,11 @@ impl AgentService {
         let child_state = child_states
             .entry(child_id.to_string())
             .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
-        // Release 0.7.0 (`--zed-git-add`): a CHILD's completed writes
+        // Release 0.8.0 (`--zed-git-add`): a CHILD's step snapshot diffs
         // accumulate under the ROOT (this prompt's session) pending set —
         // the child's own prompt never stages, the parent's next prompt
         // stages the child's edits together with its own.
-        self.track_tool_success(&req.session_id.0, event, child_state, entry);
+        self.collect_step_files(&req.session_id.0, event, entry);
         let (child_updates, card) = {
             let mut tracker = entry.subagents.lock().expect("subagents lock");
             match tracker.child_mut(child_id) {
@@ -2730,7 +2722,7 @@ impl AgentService {
             // already staged by the prompt handler before the POST — this
             // branch is unreachable for them: the local inbox id above is
             // consumed on match).
-            self.stage_pending(&session_id).await;
+            self.stage_pending(&session_id, Some(&child_parents)).await;
             tracing::debug!(session = %session_id, "remote turn: user message chunk");
             // Release 0.7.2: the server forwards the prompt's `files` in the
             // inbox payload (live-verified) — RE-EMIT them as ResourceLink
@@ -2797,10 +2789,10 @@ impl AgentService {
         let state = projectors
             .entry(session_id.clone())
             .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
-        // Release 0.7.0 (`--zed-git-add`): completed tool writes of REMOTE
-        // turns join the session's pending set too (staged on the session's
-        // next user prompt — local or remote).
-        self.track_tool_success(&session_id.0, event, state, &entry);
+        // Release 0.8.0 (`--zed-git-add`): REMOTE turns' step snapshot diffs
+        // join the session's pending set too (staged on the session's next
+        // user prompt — local or remote).
+        self.collect_step_files(&session_id.0, event, &entry);
         let updates = if completion_meta.is_some() {
             updates::to_updates_annotated(event, state, completion_meta.as_ref().map(|(_, m)| m))
         } else {
@@ -2849,12 +2841,12 @@ impl AgentService {
         let child_state = projectors
             .entry(child_sid.clone())
             .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
-        // Release 0.7.0 (`--zed-git-add`): a background CHILD's completed
-        // writes accumulate under the ROOT parent's pending set (the card
-        // branch below resolves the parent session id — do the same for the
-        // pending, only when the flag is on and the event is a success).
+        // Release 0.8.0 (`--zed-git-add`): a background CHILD's step
+        // snapshot diffs accumulate under the ROOT parent's pending set
+        // (the card branch below resolves the parent session id — do the
+        // same for the pending, only when the flag is on).
         if self.zed_git_add {
-            if matches!(event, dto::SessionEvent::ToolSuccess(_)) {
+            if matches!(event, dto::SessionEvent::StepEnded(_)) {
                 let root_sid = self
                     .sessions
                     .lock()
@@ -2863,7 +2855,7 @@ impl AgentService {
                     .find(|(_, e)| Arc::ptr_eq(e, parent_entry))
                     .map(|(sid, _)| sid.0.clone());
                 if let Some(root_sid) = root_sid {
-                    self.track_tool_success(&root_sid, event, child_state, parent_entry);
+                    self.collect_step_files(&root_sid, event, parent_entry);
                 }
             }
         }
@@ -4715,29 +4707,20 @@ mod tests {
 
     /// The write-tool event triple (started/called/success) for one tracked
     /// write on any session, with `name` as the wire tool name.
-    fn write_events(session: &str, msg: &str, call: &str, name: &str, path: serde_json::Value) -> Vec<dto::SessionEvent> {
-        let base = dto::ToolRef {
-            sessionID: session.into(),
+    /// A `session.step.ended` with the snapshot-diff `files` lane (Release
+    /// 0.8.0 — the `--zed-git-add` data source; None = interrupted step /
+    /// failed capture, nothing collected).
+    fn step_ended(session: &str, msg: &str, files: Option<Vec<&str>>) -> dto::SessionEvent {
+        dto::SessionEvent::StepEnded(dto::StepEnded {
+            session: dto::SessionRef { sessionID: session.into() },
             assistantMessageID: msg.into(),
-            id: call.into(),
-        };
-        vec![
-            dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
-                base: base.clone(),
-                name: name.into(),
-            }),
-            dto::SessionEvent::ToolCalled(dto::ToolCalled {
-                base: base.clone(),
-                input: serde_json::json!({ "path": path }),
-                executed: Some(false),
-            }),
-            dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
-                base,
-                content: None,
-                metadata: None,
-                executed: None,
-            }),
-        ]
+            finish: Some("end_turn".into()),
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            snapshot: None,
+            files: files.map(|f| f.into_iter().map(str::to_string).collect()),
+        })
     }
 
     #[tokio::test]
@@ -4762,10 +4745,10 @@ mod tests {
             let sid = ns.session_id.clone();
             let parent = sid.0.as_ref().to_string();
 
-            // Turn 1: the agent writes notes.txt (write tool, completed).
-            for ev in write_events(&parent, "msg_1", "call_w1", "write", serde_json::json!("notes.txt")) {
-                backend.push(ev);
-            }
+            // Turn 1: the agent's step snapshots list notes.txt (twice —
+            // two steps touching the same file; the pending set dedups).
+            backend.push(step_ended(&parent, "msg_1", Some(vec!["notes.txt"])));
+            backend.push(step_ended(&parent, "msg_2", Some(vec!["notes.txt"])));
             std::fs::write(repo.join("notes.txt"), "hello2").unwrap();
             backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: parent.clone(),
@@ -4807,7 +4790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zed_git_add_apply_patch_metadata_paths_stage() {
+    async fn zed_git_add_interrupted_step_without_files_stages_nothing() {
         let (_guard, repo) = make_git_repo("zed-git-add-2");
         std::fs::write(repo.join("notes.txt"), "hello").unwrap();
         let backend = MockBackend::new();
@@ -4828,41 +4811,10 @@ mod tests {
             let sid = ns.session_id.clone();
             let parent = sid.0.as_ref().to_string();
 
-            // apply_patch completed with metadata.files[] — the AUTHORITATIVE
-            // path list (the patchText header naming a DIFFERENT path must
-            // be ignored).
-            let base = dto::ToolRef {
-                sessionID: parent.clone(),
-                assistantMessageID: "msg_1".into(),
-                id: "call_ap1".into(),
-            };
-            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
-                base: base.clone(),
-                name: "apply_patch".into(),
-            }));
-            backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
-                base: base.clone(),
-                input: serde_json::json!({"patchText": "*** Begin Patch\n*** Update File: ignored-header.txt\n+x\n*** End Patch"}),
-                executed: Some(false),
-            }));
-            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
-                base,
-                content: None,
-                metadata: Some(dto::ToolMetadata {
-                    files: Some(vec![dto::FileEntry {
-                        file_path: repo.join("notes.txt").to_string_lossy().to_string(),
-                        relative_path: Some("notes.txt".into()),
-                        r#type: Some("update".into()),
-                        patch: String::new(),
-                        additions: None,
-                        deletions: None,
-                        move_path: None,
-                    }]),
-                    ..dto::ToolMetadata::default()
-                }),
-                executed: None,
-            }));
-            std::fs::write(repo.join("notes.txt"), "hello\nx").unwrap();
+            // An INTERRUPTED step (no finish/failure) carries no `files`
+            // (server-side boundary, accepted) — nothing is collected, even
+            // though the payload of the step touched the file.
+            backend.push(step_ended(&parent, "msg_1", None));
             backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: parent.clone(),
             }));
@@ -4883,7 +4835,10 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-            assert_eq!(staged_files(&repo), vec!["notes.txt"], "metadata files[] wins");
+            assert!(
+                staged_files(&repo).is_empty(),
+                "interrupted step ⇒ no files ⇒ nothing staged"
+            );
             Ok(())
         })
         .await;
@@ -4931,9 +4886,7 @@ mod tests {
                 executed: Some(false),
             }));
             backend.push(child_created(&parent));
-            for ev in write_events("ses_child_1", "msg_c1", "call_c1", "write", serde_json::json!("child.txt")) {
-                backend.push(ev);
-            }
+            backend.push(step_ended("ses_child_1", "msg_c1", Some(vec!["child.txt"])));
             std::fs::write(repo.join("child.txt"), "b").unwrap();
             backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: "ses_child_1".into(),
@@ -5001,9 +4954,7 @@ mod tests {
             let sid = ns.session_id.clone();
             let parent = sid.0.as_ref().to_string();
 
-            for ev in write_events(&parent, "msg_1", "call_w1", "write", serde_json::json!("notes.txt")) {
-                backend.push(ev);
-            }
+            backend.push(step_ended(&parent, "msg_1", Some(vec!["notes.txt"])));
             std::fs::write(repo.join("notes.txt"), "hello2").unwrap();
             backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: parent.clone(),
@@ -5056,9 +5007,7 @@ mod tests {
             let sid = ns.session_id.clone();
             let parent = sid.0.as_ref().to_string();
 
-            for ev in write_events(&parent, "msg_1", "call_w1", "write", serde_json::json!("a.txt")) {
-                backend.push(ev);
-            }
+            backend.push(step_ended(&parent, "msg_1", Some(vec!["a.txt"])));
             std::fs::write(repo.join("a.txt"), "hello2").unwrap();
             backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: parent.clone(),
@@ -5128,22 +5077,13 @@ mod tests {
             let _sid = ns.session_id;
             wait_for_listener(&backend).await;
 
-            // A REMOTE frontend's turn 1: the model writes r.txt.
-            for ev in write_events("ses_mock_1", "msg_r1", "call_r1", "write", serde_json::json!("r.txt")) {
-                backend.remote_push(ev);
-            }
+            // A REMOTE frontend's turn 1: the model's step snapshot diff
+            // lists r.txt (the listener routes it into the pending set).
+            backend.remote_push(step_ended("ses_mock_1", "msg_r1", Some(vec!["r.txt"])));
             std::fs::write(repo.join("r.txt"), "hello2").unwrap();
             backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
                 sessionID: "ses_mock_1".into(),
             }));
-            // Wait for the remote tool card to be fully projected.
-            wait_for(&collected, |n| {
-                n.iter().any(|x| {
-                    matches!(&x.update, acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_r1"
-                        && u.fields.status == Some(acp::ToolCallStatus::Completed))
-                })
-            })
-            .await;
 
             // The remote user's NEXT prompt (inbox user, not the local
             // suppressed id) stages the pending set before projecting.
@@ -5169,6 +5109,98 @@ mod tests {
                 staged_files(&repo),
                 vec!["r.txt"],
                 "remote prompt stages the previous remote turn's writes"
+            );
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    /// The v0.8.0 guard that makes staging USER-initiated-only: a CHILD
+    /// session registered via `session/load` from its subagent card (the
+    /// registry entry carries `parent_id`) is later re-dispatched by a
+    /// CONTINUATION (input `sessionID`, NO `session.created`) — the
+    /// listener never learned it is a child, its step snapshot diff lands
+    /// in its OWN registry entry's pending set, and the continuation
+    /// inbox would look like a root user prompt. It must NOT stage:
+    /// without the parent_id guard, c.txt WOULD be staged.
+    #[tokio::test]
+    async fn zed_git_add_registered_child_continuation_inbox_never_stages() {
+        let (_guard, repo) = make_git_repo("zed-git-add-7");
+        std::fs::write(repo.join("c.txt"), "hello").unwrap();
+        let backend = MockBackend::new();
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                .with_zed_git_add(true),
+        );
+        let cwd2 = repo.to_string_lossy().to_string();
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // The CLIENT session (used to keep the connection open).
+            let _ns = cx
+                .send_request(NewSessionRequest::new(&cwd2))
+                .block_task()
+                .await?;
+            // Register the CHILD via `session/load`: `get_session` reports
+            // the parent id → the registry entry knows childhood.
+            backend.set_session(dto::SessionInfo {
+                id: "ses_child_1".into(),
+                projectID: None,
+                title: Some("child card".into()),
+                version: None,
+                subpath: None,
+                parentID: Some("ses_parent".into()),
+                location: None,
+                agent: None,
+                model: None,
+                summary: None,
+                cost: None,
+                tokens: None,
+                time: None,
+            });
+            backend.set_messages(vec![]);
+            let _resp = cx
+                .send_request(LoadSessionRequest::new("ses_child_1", &cwd2))
+                .block_task()
+                .await?;
+            wait_for_listener(&backend).await;
+
+            // A REMOTE continuation turn ON the child: the step snapshot
+            // diff collects under the CHILD's registry entry (the listener
+            // never saw a `session.created` — continuation dispatch does
+            // not emit one).
+            backend.remote_push(step_ended("ses_child_1", "msg_c1", Some(vec!["c.txt"])));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_child_1".into(),
+            }));
+            // The agent-initiated continuation DISPATCH arrives as an inbox
+            // user item for the child — with the child registered, the
+            // listener's dispatch lookup HITS; the parent_id guard must
+            // veto the staging.
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_dispatch".into(),
+                sessionID: Some("ses_child_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("continue".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| {
+                    matches!(&x.update, acp::SessionUpdate::UserMessageChunk(c)
+                        if c.message_id.as_ref().map(|m| m.0.as_ref()) == Some("msg_dispatch"))
+                })
+            })
+            .await;
+            assert!(
+                staged_files(&repo).is_empty(),
+                "a child continuation dispatch never stages — without the parent_id guard, c.txt would be staged"
             );
             Ok(())
         })

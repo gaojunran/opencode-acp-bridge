@@ -610,8 +610,47 @@ pub struct StepEnded {
     pub tokens: Option<Usage>,
     #[serde(default)]
     pub snapshot: Option<Value>,
-    #[serde(default)]
-    pub files: Option<Value>,
+    /// Release 0.8.0: the snapshot diff against the step's start snapshot —
+    /// worktree-TOP-relative paths (`git diff --name-only --no-renames` of
+    /// the two trees). `[]` when startSnapshot == snapshot; absent when the
+    /// snapshot capture failed or the step was interrupted (no finish /
+    /// failure — server-side boundary). Decoded defensively: anything that
+    /// is not a string array reads as `None` (one warn) rather than failing
+    /// the whole event.
+    #[serde(default, deserialize_with = "step_ended_files")]
+    pub files: Option<Vec<String>>,
+}
+
+/// Defensive decoder for [`StepEnded::files`]: a future dialect change in
+/// the lane must never break the whole step decode — non-string-array
+/// shapes degrade to `None` (missing) with a single warn.
+fn step_ended_files<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) => out.push(s),
+                    _ => {
+                        tracing::warn!(
+                            "step.ended files: non-string entry — treating the lane as absent"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => {
+            tracing::warn!("step.ended files: unexpected shape — treating the lane as absent");
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1244,6 +1283,50 @@ mod tests {
         assert!(created_with_parent >= 2, "children announced with parentID: {created_with_parent}");
         assert!(child_tool_events >= 4, "child tool events ride their own sessionID");
         assert!(saw_model_updated && saw_provider_updated, "catalog reload events present");
+    }
+
+    /// Release 0.8.0: `step.ended.files` decodes defensively — a string
+    /// array decodes, anything else degrades to `None` (never breaks the
+    /// whole event decode).
+    #[test]
+    fn step_ended_files_decode_defensively() {
+        // The real wire shape: a string array of worktree-relative paths.
+        let good: StepEnded = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_x",
+            "assistantMessageID": "msg_1",
+            "finish": "end_turn",
+            "files": ["notes.txt", "sub/a.txt"],
+        }))
+        .expect("string-array files decode");
+        assert_eq!(
+            good.files,
+            Some(vec!["notes.txt".to_string(), "sub/a.txt".to_string()])
+        );
+
+        // A future dialect change must not break the event: non-array →
+        // None, non-string entries → None, absent → None.
+        let bad: StepEnded = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_x",
+            "assistantMessageID": "msg_1",
+            "files": {"a": "b"},
+        }))
+        .expect("object files degrade instead of failing the decode");
+        assert_eq!(bad.files, None, "non-array files lane reads as absent");
+
+        let mixed: StepEnded = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_x",
+            "assistantMessageID": "msg_1",
+            "files": ["ok.txt", 42],
+        }))
+        .expect("mixed entries degrade instead of failing the decode");
+        assert_eq!(mixed.files, None, "non-string entry voids the lane");
+
+        let absent: StepEnded = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_x",
+            "assistantMessageID": "msg_1",
+        }))
+        .expect("absent files lane decodes");
+        assert_eq!(absent.files, None);
     }
 
     /// Wave 4: the live-captured compaction turn (POST /api/session/…/compact)

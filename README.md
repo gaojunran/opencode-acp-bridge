@@ -21,9 +21,9 @@ PR #52075). This bridge attaches to a single shared server instead:
 - **session styling tuned for the Zed thread UI** — subagents render as
   Zed's native subagent cards (status, live activity, embedded transcript)
   instead of foreign tool-card spam
-- **per-turn diffs for Zed** — with `--zed-git-add` (opt-in), each prompt
-  stages the previous turn's edits so Zed's unstaged-changes panel shows
-  exactly the current turn's diff
+- **per-turn diffs for Zed** — with `--zed-git-add` (opt-in), each user
+  prompt stages the previous turn's edits so Zed's unstaged-changes panel
+  shows exactly the current turn's diff
 
 ## Install
 
@@ -90,7 +90,7 @@ To pin a specific server instead, pass the URL and password explicitly:
 | *(none — default)* | `~/.config/opencode/service.json` (`{port, password, hostname}`, `0.0.0.0` → `127.0.0.1`); if the file is absent, the `OPENCODE_URL` env var | from the file, or `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
 | `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
 | `--no-aft` | *(composes with any connection mode)* | disables the aft tool-call hoist adaptations: File/image content passthrough in tool results; diff extraction stays enabled |
-| `--zed-git-add` | *(composes with any connection mode)* | turn-scoped staging: at each user prompt, `git add --` exactly the paths the agent's write/edit/apply_patch tools touched since the last staging (see Features) |
+| `--zed-git-add` | *(composes with any connection mode)* | turn-scoped staging: at each user prompt, `git add --` exactly the paths of the previous turn's native snapshot diff (`step.ended.files` — write/edit/apply_patch AND bash, see Features); accepted premise: no concurrent edits in the same directory during the turn |
 
 The server is probed at startup (`GET /api/config`) and failures are
 classified — unreachable, credentials rejected, HTTP status — with the
@@ -134,16 +134,24 @@ usage error.
   card, the closing meta slices the completed transcript, continuations
   re-slice, and background children outliving the parent turn stay visible
   (the v0.5.0 listener gap)
-- **Turn-scoped staging** (Release 0.7.0, `--zed-git-add`) — the
-  `opencode-git-add` plugin's staging semantics natively: completed
-  write/edit/apply_patch calls are tracked per ROOT session (a subagent's
-  edits accumulate under its parent), and the next user prompt — local or
-  remote — runs `git add -- <exact paths>` before the turn starts. Zed's
+- **Turn-scoped staging** (Release 0.8.0, `--zed-git-add`) — the
+  `opencode-git-add` plugin's staging semantics natively, with the server's
+  NATIVE snapshot diff as the data source: each finished step's
+  `step.ended.files` (`git diff --name-only` of the step's snapshot trees)
+  is collected per ROOT session (a subagent's steps accumulate under its
+  parent), and the next USER-initiated prompt — local or remote — runs
+  `git add -- <exact paths>` before the turn starts. Covers write / edit /
+  apply_patch AND bash (any on-disk change in the session dir), and only
+  USER prompts stage (a child-session dispatch never does). Zed's
   unstaged-changes view then always shows only the current turn's changes,
-  and the user's own working-tree edits are never touched. Topology guards
-  (paths must exist locally, cwd inside a git work tree) retain the set
-  instead of staging partial batches; `git add` failures retry 3× and
-  retain for the next prompt. Off by default — with the flag off, no
+  and the user's own working-tree edits are never touched. Accepted
+  premise: the snapshot has no tool attribution — concurrent
+  manual/other-session edits in the same directory within the turn window
+  are staged too (assumed: one session at a time); interrupted steps carry
+  no files and are not chased. Topology guards (paths resolve against the
+  local worktree top, must exist and stay inside the session dir) retain
+  the set instead of staging partial batches; `git add` failures retry 3×
+  and retain for the next prompt. Off by default — with the flag off, no
   tracking and no git invocations
 - **aft plugin compatible** — image reads map to ACP image content blocks;
   `--no-aft` opts out of the hoist adaptations

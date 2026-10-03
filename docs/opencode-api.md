@@ -163,8 +163,15 @@ reject); "always" sends `{"decision":"always"}` — server derives the rule from
 
 - `session.tool.progress {sessionID, assistantMessageID, id, metadata}` — fires
   when a tool resumes after permission and during execution.
-- `session.step.started` / `session.step.ended {assistantMessageID, finish?}` —
-  step boundaries; `session.step.streamed` at stream completion.
+- `session.step.started` / `session.step.ended {assistantMessageID, finish?,
+  snapshot, files: string[]}` — step boundaries; `session.step.streamed` at
+  stream completion. Release 0.8.0: on finish/failure `step.ended` carries
+  the step's snapshot diff — `files` is `git diff --name-only --no-renames`
+  between the step's start and end snapshot trees, as WORKTREE-TOP-relative
+  paths within the session dir's scope (untracked files ≤ 2 MiB included;
+  ignored files and paths outside the session dir excluded). `files: []`
+  when startSnapshot == snapshot; `files` ABSENT when the capture failed
+  (or the step was interrupted — no finish/failure => no capture at all).
 - `session.reasoning.started/ended`, `session.text.started/ended` — block
   boundaries around the delta streams.
 - `session.renamed {sessionID, title}` — auto title generation.
@@ -774,14 +781,102 @@ display to the trailing 8). Loading a CHILD id uses the existing generic
 load path (child history replays as child-id notifications — correct by
 construction).
 
-## Turn-scoped staging (--zed-git-add, Release 0.7.0)
+## Turn-scoped staging (--zed-git-add, Release 0.8.0)
 
 The bridge-native port of the `opencode-git-add` plugin's v2 staging lane —
-gated behind the `--zed-git-add` CLI flag (default OFF; with the flag off
-NO tracking happens and NO git subprocess is ever spawned — every staging
-entry point returns before touching state).
+gated behind the `--zed-git-add` CLI flag (default OFF; with the flag off NO
+tracking happens and NO git subprocess is ever spawned — every staging entry
+point returns before touching state).
 
-### Semantics (plugin parity + bridge deltas)
+Release 0.8.0 replaced the data source: instead of collecting paths from
+tool-call results, the bridge consumes the server's NATIVE snapshot diff —
+each finished `session.step.ended`'s `files` lane — so `write` / `edit` /
+`apply_patch` AND `bash` (any on-disk change within the session dir) are
+covered by construction, with zero tool-name bookkeeping.
+
+### Semantics
+
+- Collect RAW `files` strings (worktree-TOP-relative — the server emits
+  `git diff --name-only` paths) into the ROOT session's pending set at four
+  hook sites mirroring the old tool-success hooks: the local turn loop, the
+  local child route, the background listener's registered-session path, and
+  the background child route (a subagent's steps accumulate under its
+  PARENT's pending set, exactly like before).
+- Staging at the next USER-INITIATED prompt: `git -C <cwd> add -- <resolved>`
+  (the `--` stops option parsing — no shell, no globs). Paths stay raw until
+  staging, then resolve against the LOCAL worktree top:
+  `git -C <cwd> rev-parse --show-toplevel` (one invocation replaces
+  `--is-inside-work-tree` — the top IS the guard). `..` segments normalize
+  in both relative and absolute forms; anything escaping the worktree top or
+  the session cwd is never staged.
+- Staging triggers (Release 0.7.0 shape, unchanged): the LOCAL
+  `session/prompt` handler BEFORE the POST, and the background listener's
+  `session.inbox.enqueued` handler for user items that are NOT the local
+  turn's own suppressed inbox id.
+- **User-initiated guard (Release 0.8.0):** a prompt that is NOT user-
+  initiated never stages. A CHILD session's own prompt never stages — its
+  steps already accumulated under the ROOT's set — detected via EITHER the
+  registry entry's `parent_id` (`session/load` of a child card captures
+  `GET /api/session/{id}`'s `parentID`) OR the listener's `child_parents`
+  map. The `parent_id` half matters for the continuation-dispatch hole: a
+  child loaded from its card is registered, and its later agent-initiated
+  continuation (input `sessionID`, no `session.created`) arrives as an
+  inbox user item — without the guard its own snapshot diff would be staged
+  as if a user had prompted it.
+- Failure policy (unchanged): any pre-check failure (worktree top
+  unresolvable, a path missing locally, containment) or `git add` failure
+  (after 3 retries, 500 ms apart — the plugin's budget) logs a warning and
+  RETAINS the whole pending set; the next prompt retries. Never a partial
+  batch, never a killed message. Log at info on success: session, path
+  count, first path.
+
+### Accepted premises (user-decided)
+
+- The snapshot diff has NO tool attribution: anything the agent changed on
+  disk inside the session dir lands in `files` — `bash` included (the old
+  tool-based source missed it; this is the headline fix). Consequence,
+  accepted: a concurrent manual or other-session edit inside the same
+  directory within the turn window is staged too — the bridge assumes one
+  session edits the same directory at a time.
+- An interrupted step (no finish/failure) carries no `files` — its changes
+  are not chased; they appear when a later step's diff includes them (or
+  not at all if the work was discarded).
+- Ignored files, paths outside the session dir, and non-git projects are
+  outside the server's snapshot scope, hence never staged.
+
+### Wires & state
+
+- `session.step.ended` `files` — `dto::StepEnded.files: Option<Vec<String>>`,
+  decoded DEFENSIVELY (a non-string-array shape degrades to `None` with one
+  warn — a future dialect change never breaks the whole event decode).
+- `GET /api/session/{id}` `parentID` — `dto::SessionInfo.parentID` (serde
+  default; governance lane-add), the loaded-child staging gate.
+- `git_add.rs` owns the pure logic (worktree-top resolution, containment,
+  staging with retries) — unit-tested against real temp git repos;
+  `SessionEntry` carries `git_add: Mutex<GitAddState>` (raw-string pending
+  set) plus `parent_id`.
+
+### Verification (as shipped)
+
+- 6 `git_add.rs` unit tests (real temp git repos): top-relative resolution
+  (including from a session whose cwd is a worktree SUBDIR), `..` escape
+  rejection in both forms, raw-string dedup, exact-path staging (manual
+  edits untouched), pre-check retains (non-repo, missing path, outside-the-
+  session-dir path), retry-then-recover under `.git/index.lock`.
+- 8 agent-level tests (MockBackend + real git repos): previous-turn staging
+  at the next prompt with multi-step merge+dedup, interrupted step (no
+  files) stages nothing, child-step-under-parent, REGISTERED child +
+  continuation dispatch never stages (the parent_id guard; without it the
+  child's own diff would be staged), flag OFF never stages (identical
+  traffic, nothing staged), failure retains then recovers, remote prompt
+  stages the previous remote turn.
+- Live server check: see the scratch-server recipe — a session whose cwd is
+  a temp git project, prompted (including a BASH write) to edit a file,
+  stages the file at the SECOND prompt (visible in `git diff --cached`
+  from the temp project, and in the bridge's `zed-git-add: staged` info
+  log with RUST_LOG=info).
+
+## Semantics (plugin parity + bridge deltas)
 
 The plugin's settled semantics, ported 1:1 where the wire allows:
 
