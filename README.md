@@ -96,6 +96,9 @@ usage error.
   list, delete; every window sees the same sessions on the same server
 - **Streaming turns** — text, reasoning, and tool-call events; cancel maps to
   interrupt with a bounded drain of in-flight tools
+- **Editor attachments** — `@`-file references and pasted images travel to
+  the server as opencode attachments; unmapped block types degrade to a
+  warning, never an error
 - **Diff blocks on every edit path** — `edit`, `write`, `apply_patch`, and
   plugin-hoisted tools alike, derived from server-side result metadata
   (`filediff` / `files[]`) instead of reconstructed tool inputs
