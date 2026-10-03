@@ -166,4 +166,36 @@ impl OpenCodeBackend for HttpBackend {
             Ok(())
         })
     }
+
+    // Release 0.3.0: config-options support — the model catalog, the session
+    // record (authoritative agent/model for load/resume) and the model
+    // switch wire (the model config-option resolution).
+
+    fn list_models(&self) -> BoxFuture<'_, Option<Vec<crate::dto::ModelInfo>>> {
+        let client = self.client.clone();
+        Box::pin(async move { client.models().await.ok() })
+    }
+
+    fn get_session(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<crate::dto::SessionInfo, anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move { Ok(client.get_session(&session_id).await?) })
+    }
+
+    fn set_model(
+        &self,
+        session_id: &str,
+        model: &crate::dto::ModelRef,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        let model = model.clone();
+        Box::pin(async move {
+            client.set_model(&session_id, &model).await?;
+            Ok(())
+        })
+    }
 }

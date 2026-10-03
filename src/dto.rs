@@ -773,6 +773,17 @@ pub struct SessionAgentSelected {
     pub agent: String,
 }
 
+/// Payload of the `session.model.selected` SSE event (wire shape captured in
+/// tests/fixtures/perm-asked.sse.jsonl): the model running a session changed.
+/// Emitted after `POST /api/session/{id}/model` (own-switch echo) and on
+/// remote switches; the ACP layer drives the model config-option state from
+/// it, with the own-switch echo suppressed via the tracked model.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionModelSelected {
+    pub sessionID: String,
+    pub model: ModelRef,
+}
+
 /// Typed decoding of the event kinds the bridge maps to ACP updates.
 ///
 /// The `permission.*` pair is verified on the wire (both fixtures in
@@ -844,6 +855,11 @@ pub enum SessionEvent {
     /// layer: the agent layer consumes it for `current_mode_update`
     /// tracking (with echo suppression).
     AgentSelected(SessionAgentSelected),
+    /// `session.model.selected` — the session's model changed (own-switch
+    /// echo or remote switch). Not mapped to an ACP update by the mapping
+    /// layer: the agent layer consumes it for the model config-option state
+    /// (with echo suppression).
+    ModelSelected(SessionModelSelected),
 }
 
 fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
@@ -887,6 +903,7 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.renamed" => parse(data).map(SessionEvent::Renamed),
         "session.created" => parse(data).map(SessionEvent::SessionCreated),
         "session.agent.selected" => parse(data).map(SessionEvent::AgentSelected),
+        "session.model.selected" => parse(data).map(SessionEvent::ModelSelected),
         _ => None,
     }
 }

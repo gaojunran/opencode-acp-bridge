@@ -122,6 +122,23 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     fn set_agent(&self, _session_id: &str, _agent: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         Box::pin(async { Err(anyhow::anyhow!("set_agent not available on this backend")) })
     }
+
+    /// Release 0.3.0: the session record (`GET /api/session/{id}`) — the
+    /// authoritative `agent` / `model` fields for load/resume config-option
+    /// current values (includes post-switch state). Default: unavailable
+    /// (mock override + live `HttpBackend`); a failure degrades to the
+    /// last-assistant-message / catalog fallbacks, never fails the lifecycle.
+    fn get_session(&self, _session_id: &str) -> BoxFuture<'_, Result<dto::SessionInfo, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("get_session not available on this backend")) })
+    }
+
+    /// Release 0.3.0: switch the model running a session (`POST
+    /// /api/session/{id}/model` → 204 — the model config-option wire for
+    /// `session/set_config_option`). Default: unavailable; live override on
+    /// `HttpBackend`.
+    fn set_model(&self, _session_id: &str, _model: &dto::ModelRef) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("set_model not available on this backend")) })
+    }
 }
 
 /// The ACP agent service: state + handler wiring.
@@ -135,6 +152,13 @@ pub struct AgentService {
     /// `--no-aft`: disable the aft hoist adaptations (File/image content
     /// passthrough). Diff extraction stays (dialect-neutral).
     no_aft: bool,
+    /// Release 0.3.0: whether the client declared the session config-options
+    /// capability (`clientCapabilities.session.configOptions` non-null) in
+    /// its initialize request. Gates the `config_options` payload in
+    /// lifecycle responses AND every `config_option_update` push. The
+    /// service is per-connection (one stdio ACP session), so a single flag
+    /// is the per-connection store.
+    config_options_supported: AtomicBool,
 }
 
 struct SessionEntry {
@@ -153,6 +177,15 @@ struct SessionEntry {
     /// value actually changes — which is what suppresses the own-switch
     /// SSE echo.
     mode: Mutex<Option<String>>,
+    /// Release 0.3.0: tracked session model (the `ModelRef` the server runs
+    /// the session with). Established by the lifecycle responses (newSession
+    /// → `None` — the default model is not discoverable pre-first-turn;
+    /// load/resume → `get_session.model`, else the last assistant message's
+    /// model); updated by `session/set_config_option` (model id), the
+    /// `session.model.selected` SSE event and (self-heal) mismatched
+    /// `step.started` models. `config_option_update` pushes fire only on an
+    /// ACTUAL change — which suppresses the own-switch SSE echo.
+    model: Mutex<Option<dto::ModelRef>>,
 }
 
 impl AgentService {
@@ -162,6 +195,7 @@ impl AgentService {
             sessions: Mutex::new(HashMap::new()),
             drain_window: std::time::Duration::from_secs(5),
             no_aft: false,
+            config_options_supported: AtomicBool::new(false),
         }
     }
 
@@ -247,6 +281,20 @@ impl AgentService {
                 },
                 on_receive_request!(),
             )
+            // ---------- setConfigOption (Release 0.3.0) ----------
+            // `session/set_config_option` — the model/agent pickers (Zed
+            // renders these via configOptions, mutually exclusive with the
+            // modes dropdown). Shares `set_mode`'s wire for the agent id;
+            // the model id routes to `POST /api/session/{id}/model`.
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::SetSessionConfigOptionRequest, responder, cx| {
+                        svc.set_config_option(req, responder, cx).await
+                    }
+                },
+                on_receive_request!(),
+            )
             // ---------- loadSession ----------
             .on_receive_request(
                 {
@@ -304,6 +352,21 @@ impl AgentService {
                 .delete(acp::SessionDeleteCapabilities::new())
                 .resume(acp::SessionResumeCapabilities::new()),
         );
+        // Release 0.3.0: the config-options capability gate. Zed declares
+        // `clientCapabilities.session.configOptions` → it renders the model
+        // picker ONLY via configOptions (mutually exclusive with the modes
+        // dropdown); other clients keep receiving `modes`. Storing the flag
+        // per connection is exact because the service serves exactly one ACP
+        // connection.
+        let config_options_supported = req
+            .client_capabilities
+            .session
+            .as_ref()
+            .and_then(|s| s.config_options.as_ref())
+            .is_some();
+        self.config_options_supported
+            .store(config_options_supported, Ordering::SeqCst);
+        tracing::debug!(config_options_supported, "initialize: client capabilities");
         let info = acp::Implementation::new(
             "opencode-acp-bridge",
             concat!("opencode ", env!("CARGO_PKG_VERSION")),
@@ -351,6 +414,15 @@ impl AgentService {
         };
         let modes = to_session_modes(&agents);
         let current = default_mode_id(&agents);
+        // Release 0.3.0: the model catalog for the model config option,
+        // fetched ONLY when the client declared the capability (no point in
+        // the round-trip otherwise). `None` (fetch failure or no catalog
+        // access) omits the model option from the payload.
+        let models = if self.config_options_supported.load(Ordering::SeqCst) {
+            self.backend.list_models().await
+        } else {
+            None
+        };
         let session_id = acp::SessionId::from(session_id);
         self.sessions.lock().expect("sessions lock").insert(
             session_id.clone(),
@@ -358,19 +430,42 @@ impl AgentService {
                 cancel: AtomicBool::new(false),
                 cwd: cwd.clone(),
                 mode: Mutex::new(current.clone()),
+                // newSession cannot know the model: session creation sends no
+                // model (the server assigns the config default), the create
+                // response and GET /api/session/{id} carry none pre-first-
+                // turn, and config documents have no default-model field.
+                // UNKNOWN is surfaced as the synthetic "__default__" option.
+                model: Mutex::new(None),
             }),
         );
         tracing::info!(%session_id, modes = %modes.len(), current_mode = ?current, "ACP newSession -> opencode session");
-        match current {
+        let mut response = match &current {
             // The derived default is in the filtered list by construction.
-            Some(id) => responder.respond(
-                acp::NewSessionResponse::new(session_id.clone())
-                    .modes(acp::SessionModeState::new(id, modes)),
-            )?,
+            Some(id) => acp::NewSessionResponse::new(session_id.clone())
+                .modes(acp::SessionModeState::new(id.clone(), modes)),
             // No pickable modes: omit the payload — Zed renders no picker
             // instead of an unmatched "Unknown" current mode.
-            None => responder.respond(acp::NewSessionResponse::new(session_id.clone()))?,
+            None => acp::NewSessionResponse::new(session_id.clone()),
+        };
+        // Release 0.3.0: config options = agent picker + model picker. Only
+        // when the client declared the capability; per-option degrade: one
+        // catalog fetch failed → that option is omitted. The model's current
+        // value is UNKNOWN here → "__default__" plus the synthetic Default
+        // option (an unmatched current value would render "Unknown" in Zed;
+        // once a concrete model is known there is no server API to unset it,
+        // so Default is listed only while unknown).
+        if self.config_options_supported.load(Ordering::SeqCst) {
+            let options = build_config_options(
+                &agents,
+                models.as_deref().unwrap_or(&[]),
+                current.as_deref(),
+                None,
+            );
+            if !options.is_empty() {
+                response = response.config_options(options);
+            }
         }
+        responder.respond(response)?;
         // Wave 6a: initial `available_commands_update` push, AFTER the
         // response, spawned so the fetch can never gate session creation.
         self.spawn_commands_push(&session_id, &cx);
@@ -443,10 +538,35 @@ impl AgentService {
             }
         };
         let agents = self.fetch_agents(&req.cwd.to_string_lossy()).await;
+        // Release 0.3.0: the session record carries the authoritative
+        // current agent + model (includes post-switch state); a fetch
+        // failure or absent fields fall back to the message/catalog data
+        // (never fails the lifecycle).
+        let session_info = match self.backend.get_session(&req.session_id.0).await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                tracing::warn!(error = %e, session = %req.session_id, "resume: get_session failed (agent/model fall back to messages/catalog)");
+                None
+            }
+        };
+        let models = if self.config_options_supported.load(Ordering::SeqCst) {
+            self.backend.list_models().await
+        } else {
+            None
+        };
         // The honest last-assistant agent wins even when it drifted out of
         // the catalog (step.started self-heals); otherwise the derived
-        // default (first visible primary in wire order).
-        let current = last_assistant_agent(&records).or_else(|| default_mode_id(&agents));
+        // default (first visible primary in wire order). The session record's
+        // agent is authoritative over both.
+        let current = session_info
+            .as_ref()
+            .and_then(|i| i.agent.clone())
+            .or_else(|| last_assistant_agent(&records))
+            .or_else(|| default_mode_id(&agents));
+        let current_model = session_info
+            .as_ref()
+            .and_then(|i| i.model.clone())
+            .or_else(|| last_assistant_model(&records));
         let modes = to_session_modes(&agents);
         // Register unconditionally — the client may resume a session this
         // bridge never loaded, and the next prompt must still route.
@@ -456,18 +576,32 @@ impl AgentService {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
                 mode: Mutex::new(current.clone()),
+                model: Mutex::new(current_model.clone()),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
         // instead of an unmatched "Unknown" current mode).
-        let response = if modes.is_empty() {
+        let mut response = if modes.is_empty() {
             acp::ResumeSessionResponse::new()
         } else {
             acp::ResumeSessionResponse::new().modes(acp::SessionModeState::new(
-                current.expect("modes non-empty ⇒ a derived default exists"),
+                current.clone().expect("modes non-empty ⇒ a derived default exists"),
                 modes,
             ))
         };
+        // Release 0.3.0: config options (agent + model pickers), capability
+        // gated and per-option degraded exactly like newSession.
+        if self.config_options_supported.load(Ordering::SeqCst) {
+            let options = build_config_options(
+                &agents,
+                models.as_deref().unwrap_or(&[]),
+                current.as_deref(),
+                current_model.as_ref(),
+            );
+            if !options.is_empty() {
+                response = response.config_options(options);
+            }
+        }
         tracing::info!(session = %req.session_id, "ACP session/resume (no replay)");
         responder.respond(response)?;
         // Wave 6a: initial `available_commands_update` push, after the
@@ -515,6 +649,178 @@ impl AgentService {
             req.session_id.clone(),
             acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(mode)),
         ))?;
+        // Release 0.3.0: keep the config-options surface honest too — Zed
+        // renders the agent picker from the config option, so a mode switch
+        // from another client must refresh it. Tracked-first means the
+        // server's own-switch SSE echo diffs to zero.
+        self.push_config_options(&req.session_id, &entry, &cx).await;
+        Ok(())
+    }
+
+    /// Release 0.3.0 `session/set_config_option`: the model/agent pickers.
+    ///
+    /// `config_id "model"` — value `"<provider>/<model>"` (split on the
+    /// FIRST `/`): looked up in the model catalog, switched via the existing
+    /// `POST /api/session/{id}/model` wire, then the tracked model is updated
+    /// and the full config-options state goes into the response AND a
+    /// `config_option_update` push. `"__default__"` is a no-op success (there
+    /// is no server API to unset a model) that echoes the current state. A
+    /// value not in the catalog (e.g. a stale Zed-persisted default like
+    /// `codebuddy/gpt-6-sol`) or a failed switch is an invalid-value error
+    /// followed by a current-state push — the client self-corrects.
+    ///
+    /// `config_id "agent"` — value = agent id: the EXACT `set_mode` path
+    /// (`set_agent` + tracked mode + remote-echo suppression), with the
+    /// response/push carrying the full config-options state.
+    ///
+    /// Unknown config ids are invalid-params errors.
+    async fn set_config_option(
+        self: &Arc<Self>,
+        req: acp::SetSessionConfigOptionRequest,
+        responder: Responder<acp::SetSessionConfigOptionResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let Some(entry) = self
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .get(&req.session_id)
+            .cloned()
+        else {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "message": "set_config_option: unknown session"
+                })),
+            );
+        };
+        let value = req.value.as_value_id().map(|v| v.0.as_ref()).unwrap_or("");
+        match req.config_id.0.as_ref() {
+            "model" => match value {
+                // No server API to unset a model: accept the synthetic
+                // default as a no-op and echo the current state (the
+                // "__default__" option stays listed while the model is
+                // unknown).
+                "__default__" => {
+                    tracing::info!(session = %req.session_id, "set_config_option(model=__default__) no-op");
+                    let state = self.current_config_options(&entry).await;
+                    responder.respond(acp::SetSessionConfigOptionResponse::new(state.clone()))?;
+                    self.push_config_options(&req.session_id, &entry, &cx).await;
+                }
+                v => {
+                    // Split on the FIRST `/`: provider ids may contain
+                    // slashes, model ids may not (the value scheme is the
+                    // CLI's `<provider>/<model>`).
+                    let Some((provider, model_id)) = v.split_once('/') else {
+                        return self
+                            .reject_config_value(
+                                &req,
+                                responder,
+                                &entry,
+                                &cx,
+                                format!("invalid model value {v:?}: expected \"<provider>/<model>\""),
+                            )
+                            .await;
+                    };
+                    // Catalog lookup: the value is a verbatim echo of what
+                    // we pushed, so it must be present.
+                    let models = self.backend.list_models().await.unwrap_or_default();
+                    let found = models
+                        .iter()
+                        .find(|m| m.providerID == provider && m.id == model_id)
+                        .cloned();
+                    let Some(model) = found else {
+                        return self
+                            .reject_config_value(
+                                &req,
+                                responder,
+                                &entry,
+                                &cx,
+                                format!("unknown model {v:?}: not in the model catalog"),
+                            )
+                            .await;
+                    };
+                    let model_ref = dto::ModelRef {
+                        id: model.id.clone(),
+                        providerID: model.providerID.clone(),
+                        variant: None,
+                    };
+                    if let Err(e) = self.backend.set_model(&req.session_id.0, &model_ref).await {
+                        tracing::error!(error = %e, session = %req.session_id, model = %value, "set_model failed");
+                        return self
+                            .reject_config_value(
+                                &req,
+                                responder,
+                                &entry,
+                                &cx,
+                                format!("model switch failed: {e}"),
+                            )
+                            .await;
+                    }
+                    // Track BEFORE responding: the server's own-switch echo
+                    // (`session.model.selected`) then diffs to zero against
+                    // the tracked model and stays suppressed.
+                    *entry.model.lock().expect("model lock") = Some(model_ref);
+                    tracing::info!(session = %req.session_id, model = %value, "set_config_option(model) -> opencode");
+                    let fresh = self.current_config_options(&entry).await;
+                    responder.respond(acp::SetSessionConfigOptionResponse::new(fresh))?;
+                    self.push_config_options(&req.session_id, &entry, &cx).await;
+                }
+            },
+            "agent" => {
+                if value.is_empty() {
+                    return self
+                        .reject_config_value(&req, responder, &entry, &cx, "invalid agent value: empty".into())
+                        .await;
+                }
+                if let Err(e) = self.backend.set_agent(&req.session_id.0, value).await {
+                    tracing::error!(error = %e, session = %req.session_id, mode = %value, "set_agent failed");
+                    return responder.respond_with_internal_error(format!(
+                        "opencode agent switch failed: {e}"
+                    ));
+                }
+                let mode = value.to_string();
+                *entry.mode.lock().expect("mode lock") = Some(mode.clone());
+                tracing::info!(session = %req.session_id, mode, "set_config_option(agent) -> opencode agent");
+                let fresh = self.current_config_options(&entry).await;
+                responder.respond(acp::SetSessionConfigOptionResponse::new(fresh))?;
+                // Same semantics as set_mode: current_mode_update for the
+                // modes surface + the config-options push for the pickers.
+                cx.send_notification(acp::SessionNotification::new(
+                    req.session_id.clone(),
+                    acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(mode)),
+                ))?;
+                self.push_config_options(&req.session_id, &entry, &cx).await;
+            }
+            other => {
+                return responder.respond_with_error(
+                    AcpError::invalid_params().data(serde_json::json!({
+                        "message": format!("set_config_option: unknown config option {other:?}")
+                    })),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Error response for an invalid config-option value, followed by a
+    /// current-state push — the client self-corrects (e.g. a stale
+    /// Zed-persisted default no longer in the catalog renders its value
+    /// again instead of leaving the picker stuck).
+    async fn reject_config_value(
+        self: &Arc<Self>,
+        req: &acp::SetSessionConfigOptionRequest,
+        responder: Responder<acp::SetSessionConfigOptionResponse>,
+        entry: &SessionEntry,
+        cx: &ConnectionTo<Client>,
+        message: String,
+    ) -> Result<(), AcpError> {
+        responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({ "message": message })))?;
+        let state = self.current_config_options(entry).await;
+        if !state.is_empty() {
+            let update =
+                acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(state));
+            let _ = cx.send_notification(acp::SessionNotification::new(req.session_id.clone(), update));
+        }
         Ok(())
     }
 
@@ -567,10 +873,33 @@ impl AgentService {
         // message yet → the derived default (first visible primary in wire
         // order). Mode list + default both come from the one catalog fetch.
         let agents = self.fetch_agents(&req.cwd.to_string_lossy()).await;
+        // Release 0.3.0: the session record's agent/model are authoritative
+        // (post-switch state); failures/absent fields fall back to the
+        // message/catalog data (never fails the lifecycle).
+        let session_info = match self.backend.get_session(&req.session_id.0).await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                tracing::warn!(error = %e, session = %req.session_id, "load: get_session failed (agent/model fall back to messages/catalog)");
+                None
+            }
+        };
+        let models = if self.config_options_supported.load(Ordering::SeqCst) {
+            self.backend.list_models().await
+        } else {
+            None
+        };
         // The honest last-assistant agent wins even when it drifted out of
         // the catalog (step.started self-heals); otherwise the derived
         // default.
-        let current = last_assistant_agent(&records).or_else(|| default_mode_id(&agents));
+        let current = session_info
+            .as_ref()
+            .and_then(|i| i.agent.clone())
+            .or_else(|| last_assistant_agent(&records))
+            .or_else(|| default_mode_id(&agents));
+        let current_model = session_info
+            .as_ref()
+            .and_then(|i| i.model.clone())
+            .or_else(|| last_assistant_model(&records));
         let modes = to_session_modes(&agents);
         // Refresh state so a subsequent prompt on this session works.
         self.sessions.lock().expect("sessions lock").insert(
@@ -579,18 +908,32 @@ impl AgentService {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
                 mode: Mutex::new(current.clone()),
+                model: Mutex::new(current_model.clone()),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
         // instead of an unmatched "Unknown" current mode).
-        let response = if modes.is_empty() {
+        let mut response = if modes.is_empty() {
             acp::LoadSessionResponse::new()
         } else {
             acp::LoadSessionResponse::new().modes(acp::SessionModeState::new(
-                current.expect("modes non-empty ⇒ a derived default exists"),
+                current.clone().expect("modes non-empty ⇒ a derived default exists"),
                 modes,
             ))
         };
+        // Release 0.3.0: config options (agent + model pickers), capability
+        // gated and per-option degraded exactly like newSession.
+        if self.config_options_supported.load(Ordering::SeqCst) {
+            let options = build_config_options(
+                &agents,
+                models.as_deref().unwrap_or(&[]),
+                current.as_deref(),
+                current_model.as_ref(),
+            );
+            if !options.is_empty() {
+                response = response.config_options(options);
+            }
+        }
         responder.respond(response)?;
         // Wave 6a: initial `available_commands_update` push, after the
         // response (spawned — never gate the load).
@@ -742,17 +1085,19 @@ impl AgentService {
                 );
             }
 
-            // ---------- mode tracking (Wave 6b) ----------
-            // `session.agent.selected` (own-switch echo + remote switches)
-            // and `step.started.agent` (self-heal: the server ran a
-            // different agent than tracked — e.g. a config default change)
-            // drive the tracked mode; `current_mode_update` fires only on
-            // an ACTUAL change. Own-switch echo suppression falls out of
-            // this: set_mode updated the tracked value first, so the echo
-            // diffs to zero. Only the parent session's events are tracked
-            // (children's ride their own sessionID and are dropped by the
-            // session filter above; during the cancel drain mode pushes
-            // are muted).
+            // ---------- mode/model tracking (Wave 6b + 0.3.0) ----------
+            // `session.agent.selected` / `session.model.selected` (own-switch
+            // echo + remote switches) and `step.started.agent` /
+            // `step.started.model` (self-heal: the server ran a different
+            // agent/model than tracked — e.g. a config default change) drive
+            // the tracked values; `current_mode_update` fires only on an
+            // ACTUAL agent change and the `config_option_update` push fires
+            // only on an actual change of either. Own-switch echo
+            // suppression falls out of this: set_mode/set_config_option
+            // updated the tracked values first, so the echo diffs to zero.
+            // Only the parent session's events are tracked (children's ride
+            // their own sessionID and are dropped by the session filter
+            // above; during the cancel drain pushes are muted).
             if !draining {
                 let event_agent: Option<&str> = match &event {
                     dto::SessionEvent::AgentSelected(sel)
@@ -767,6 +1112,20 @@ impl AgentService {
                     }
                     _ => None,
                 };
+                let event_model: Option<&dto::ModelRef> = match &event {
+                    dto::SessionEvent::ModelSelected(sel)
+                        if sel.sessionID == req.session_id.0.as_ref() =>
+                    {
+                        Some(&sel.model)
+                    }
+                    dto::SessionEvent::StepStarted(s)
+                        if s.session.sessionID == req.session_id.0.as_ref() =>
+                    {
+                        s.model.as_ref()
+                    }
+                    _ => None,
+                };
+                let mut any_changed = false;
                 if let Some(agent) = event_agent {
                     let changed = {
                         let mut mode = entry.mode.lock().expect("mode lock");
@@ -778,6 +1137,7 @@ impl AgentService {
                         }
                     };
                     if changed {
+                        any_changed = true;
                         tracing::info!(session = %req.session_id, agent, "current mode -> {agent}");
                         cx.send_notification(acp::SessionNotification::new(
                             req.session_id.clone(),
@@ -792,12 +1152,51 @@ impl AgentService {
                             "agent echo suppressed (tracked mode unchanged)"
                         );
                     }
-                    // `AgentSelected` has no ACP update mapping — consume
-                    // it here; `StepStarted` continues to the mapping below
-                    // (retry-clear bookkeeping).
-                    if matches!(event, dto::SessionEvent::AgentSelected(_)) {
-                        continue;
+                }
+                if let Some(model) = event_model {
+                    let changed = {
+                        let mut tracked = entry.model.lock().expect("model lock");
+                        if tracked
+                            .as_ref()
+                            .map(|m| (m.providerID.as_str(), m.id.as_str()))
+                            != Some((model.providerID.as_str(), model.id.as_str()))
+                        {
+                            *tracked = Some(model.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        any_changed = true;
+                        tracing::info!(
+                            session = %req.session_id,
+                            model = %format!("{}/{}", model.providerID, model.id),
+                            "current model -> {}/{}",
+                            model.providerID,
+                            model.id
+                        );
+                    } else {
+                        tracing::debug!(
+                            session = %req.session_id,
+                            model = %format!("{}/{}", model.providerID, model.id),
+                            "model echo suppressed (tracked model unchanged)"
+                        );
                     }
+                }
+                if any_changed {
+                    // Full config-options push (both options, current
+                    // values) so the model/agent pickers stay honest.
+                    self.push_config_options(&req.session_id, &entry, &cx).await;
+                }
+                // `AgentSelected` / `ModelSelected` have no ACP update
+                // mapping — consume them here; `StepStarted` continues to
+                // the mapping below (retry-clear bookkeeping).
+                if matches!(
+                    event,
+                    dto::SessionEvent::AgentSelected(_) | dto::SessionEvent::ModelSelected(_)
+                ) {
+                    continue;
                 }
             }
 
@@ -912,7 +1311,7 @@ impl AgentService {
                         &event,
                         dto::SessionEvent::ModelUpdated(_) | dto::SessionEvent::ProviderUpdated(_)
                     ) {
-                        self.push_catalog_updates(&req, &cx).await;
+                        self.push_config_options(&req.session_id, &entry, &cx).await;
                     }
                     // Wave 4: step-level error taxonomy (log-only — v1 has
                     // no per-step failure update; the turn outcome arrives
@@ -1183,44 +1582,54 @@ impl AgentService {
         let _ = cx.send_notification(acp::SessionNotification::new(session_id.clone(), update));
     }
 
-    /// Wave 4: push `config_option_update` (the model catalog as options)
-    /// after a catalog reload (`model.updated` / `provider.updated` — both
-    /// carry `{}`; the catalog is re-fetched). Skipped when the backend has
-    /// no catalog access (default trait impl — the live bridge does not
-    /// override yet; see [`OpenCodeBackend::list_models`]).
-    async fn push_catalog_updates(
+    /// Release 0.3.0: fetch the catalogs (agents for the session's cwd +
+    /// the model catalog) and build the full config-options state — BOTH
+    /// options with their current values. Capability-gated; per-option
+    /// degrade: a catalog that failed to fetch or came back empty omits its
+    /// option (never a blank/unmatched current value).
+    async fn current_config_options(self: &Arc<Self>, entry: &SessionEntry) -> Vec<acp::SessionConfigOption> {
+        if !self.config_options_supported.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let agents = match self.backend.agents(&entry.cwd).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "config options: agents fetch failed — agent option omitted");
+                Vec::new()
+            }
+        };
+        let models = self.backend.list_models().await;
+        let mode = entry.mode.lock().expect("mode lock").clone();
+        let model = entry.model.lock().expect("model lock").clone();
+        build_config_options(
+            &agents,
+            models.as_deref().unwrap_or(&[]),
+            mode.as_deref(),
+            model.as_ref(),
+        )
+    }
+
+    /// Release 0.3.0: push `config_option_update` (the FULL state — agent +
+    /// model options with current values) after any tracked-value change:
+    /// catalog reloads (`model.updated` / `provider.updated` — both carry
+    /// `{}`; the catalogs are re-fetched), `session.model.selected` remote
+    /// switches, `step.started` self-heals and set_mode / set_config_option.
+    /// Skipped when the capability is absent, both catalogs are unavailable
+    /// or the current agent drifted out of the visible list (the option
+    /// would render "Unknown").
+    async fn push_config_options(
         self: &Arc<Self>,
-        req: &acp::PromptRequest,
+        session_id: &acp::SessionId,
+        entry: &SessionEntry,
         cx: &ConnectionTo<Client>,
     ) {
-        let Some(models) = self.backend.list_models().await else {
-            tracing::debug!(session = %req.session_id, "catalog push skipped: no model catalog");
-            return;
-        };
-        if models.is_empty() {
+        let options = self.current_config_options(entry).await;
+        if options.is_empty() {
             return;
         }
-        // The option value scheme is `<provider>/<model>` (CLI notation); the
-        // client echoes it back verbatim in set_config_option — a future wave
-        // resolving the selection must split on the first '/'.
-        let options: Vec<acp::SessionConfigSelectOption> = models
-            .iter()
-            .map(|m| {
-                let name = m
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| m.modelID.clone().unwrap_or_else(|| m.id.clone()));
-                acp::SessionConfigSelectOption::new(
-                    format!("{}/{}", m.providerID, m.id),
-                    name,
-                )
-            })
-            .collect();
-        let update = acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(vec![
-            acp::SessionConfigOption::select("model", "Model", "", options),
-        ]));
-        tracing::info!(session = %req.session_id, options = models.len(), "catalog reload push");
-        let _ = cx.send_notification(acp::SessionNotification::new(req.session_id.clone(), update));
+        let update = acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(options));
+        tracing::info!(session = %session_id, "config_option_update push");
+        let _ = cx.send_notification(acp::SessionNotification::new(session_id.clone(), update));
     }
 
     async fn cancel(
@@ -1356,13 +1765,128 @@ fn last_assistant_agent(records: &[dto::MessageRecord]) -> Option<String> {
         .and_then(|r| r.agent.clone())
 }
 
+/// Release 0.3.0: the last assistant message's `model` field (the model
+/// config-option current value source for load/resume when the session
+/// record carried none), or `None` when the session has no assistant message
+/// yet.
+fn last_assistant_model(records: &[dto::MessageRecord]) -> Option<dto::ModelRef> {
+    records
+        .iter()
+        .rev()
+        .find(|r| r.kind == "assistant")
+        .and_then(|r| r.model.clone())
+}
+
+/// Release 0.3.0: build the ACP `config_options` payload — the agent picker
+/// (category Mode, ungrouped, the same visible-agent filter as
+/// [`to_session_modes`], current = the tracked agent id) and the model
+/// picker (category Model, grouped by provider, value scheme
+/// `<provider>/<model>`, current = the tracked model).
+///
+/// Degrade contract (mirrors the modes payload): an empty agents catalog —
+/// fetch failure or no pickable agents — omits the agent option; an empty
+/// models catalog omits the model option; neither present → empty vec
+/// (callers omit the field). A config option is NEVER emitted with a
+/// blank/unmatched current value: the agent option additionally requires the
+/// current agent to be among the listed values.
+///
+/// The model's UNKNOWN state (`current_model == None`, e.g. newSession — the
+/// default model is not discoverable pre-first-turn) surfaces as the
+/// synthetic value `"__default__"` with a `"Default"` option PREPENDED to the
+/// first group. There is no server API to unset a model, so once the model is
+/// concrete the Default option is not listed.
+fn build_config_options(
+    agents: &[dto::AgentInfo],
+    models: &[dto::ModelInfo],
+    current_agent: Option<&str>,
+    current_model: Option<&dto::ModelRef>,
+) -> Vec<acp::SessionConfigOption> {
+    let mut options = Vec::with_capacity(2);
+
+    // ---- agent option (category Mode) ----
+    let visible: Vec<&dto::AgentInfo> = agents
+        .iter()
+        .filter(|a| !a.hidden && matches!(a.mode.as_deref(), Some("primary") | Some("all")))
+        .collect();
+    if let Some(current) = current_agent {
+        if visible.iter().any(|a| a.id == current) {
+            let select_options: Vec<acp::SessionConfigSelectOption> = visible
+                .iter()
+                .map(|a| acp::SessionConfigSelectOption::new(a.id.clone(), a.name.clone()))
+                .collect();
+            options.push(
+                acp::SessionConfigOption::select(
+                    "agent",
+                    "Agent",
+                    current.to_string(),
+                    acp::SessionConfigSelectOptions::Ungrouped(select_options),
+                )
+                .category(acp::SessionConfigOptionCategory::Mode),
+            );
+        }
+    }
+
+    // ---- model option (category Model) ----
+    if !models.is_empty() {
+        // Grouped by providerID, first-seen order (the catalog is ordered).
+        let mut groups: Vec<acp::SessionConfigSelectGroup> = Vec::new();
+        for m in models {
+            let entry = groups
+                .iter_mut()
+                .find(|g| g.group.0.as_ref() == m.providerID);
+            let name = m
+                .name
+                .clone()
+                .unwrap_or_else(|| m.modelID.clone().unwrap_or_else(|| m.id.clone()));
+            let option = acp::SessionConfigSelectOption::new(
+                format!("{}/{}", m.providerID, m.id),
+                name,
+            );
+            match entry {
+                Some(group) => group.options.push(option),
+                None => groups.push(acp::SessionConfigSelectGroup::new(
+                    m.providerID.clone(),
+                    m.providerID.clone(),
+                    vec![option],
+                )),
+            }
+        }
+        let current = current_model
+            .map(|m| format!("{}/{}", m.providerID, m.id))
+            .unwrap_or_else(|| "__default__".to_string());
+        if current_model.is_none() {
+            // UNKNOWN current model: list the synthetic Default option FIRST
+            // so the current value is a listed option (an unmatched value
+            // renders "Unknown" in Zed).
+            if let Some(first) = groups.first_mut() {
+                first.options.insert(
+                    0,
+                    acp::SessionConfigSelectOption::new("__default__", "Default"),
+                );
+            }
+        }
+        options.push(
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                current,
+                acp::SessionConfigSelectOptions::Grouped(groups),
+            )
+            .category(acp::SessionConfigOptionCategory::Model),
+        );
+    }
+
+    options
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-        PromptRequest, SessionNotification, TextContent,
+        CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+        InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+        SessionConfigOptionsCapabilities, SessionNotification, TextContent,
     };
     use tokio::sync::{broadcast, oneshot};
 
@@ -1403,6 +1927,16 @@ mod tests {
         agents_fail: AtomicBool,
         /// Wave 6b: every (session_id, agent) passed to `set_agent`.
         set_agent_calls: Mutex<Vec<(String, String)>>,
+        /// Release 0.3.0: canned session record for `get_session` (the
+        /// authoritative agent/model sources for load/resume).
+        session_out: Mutex<Option<dto::SessionInfo>>,
+        /// Release 0.3.0: session ids passed to `get_session`.
+        get_session_calls: Mutex<Vec<String>>,
+        /// Release 0.3.0: every (session_id, model) passed to `set_model`.
+        set_model_calls: Mutex<Vec<(String, dto::ModelRef)>>,
+        /// Release 0.3.0: force `set_model` to fail (proves the error+push
+        /// degrade path).
+        set_model_fail: AtomicBool,
     }
 
     impl MockBackend {
@@ -1426,6 +1960,10 @@ mod tests {
                 agents_out: Mutex::new(None),
                 agents_fail: AtomicBool::new(false),
                 set_agent_calls: Mutex::new(Vec::new()),
+                session_out: Mutex::new(None),
+                get_session_calls: Mutex::new(Vec::new()),
+                set_model_calls: Mutex::new(Vec::new()),
+                set_model_fail: AtomicBool::new(false),
             })
         }
 
@@ -1501,6 +2039,24 @@ mod tests {
 
         fn set_models(&self, models: Vec<dto::ModelInfo>) {
             *self.models.lock().expect("models lock") = Some(models);
+        }
+
+        fn set_session(&self, info: dto::SessionInfo) {
+            *self.session_out.lock().expect("session lock") = Some(info);
+        }
+
+        fn recorded_get_session_calls(&self) -> Vec<String> {
+            self.get_session_calls.lock().expect("get_session lock").clone()
+        }
+
+        fn recorded_set_model_calls(&self) -> Vec<(String, dto::ModelRef)> {
+            self.set_model_calls.lock().expect("set_model lock").clone()
+        }
+
+        /// Make every `set_model` call fail (the set_config_option error
+        /// path must still push the current state).
+        fn fail_set_model(&self) {
+            self.set_model_fail.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1640,6 +2196,39 @@ mod tests {
                 .expect("set_agent lock")
                 .push((session_id.to_string(), agent.to_string()));
             Box::pin(async { Ok(()) })
+        }
+
+        fn get_session(
+            &self,
+            session_id: &str,
+        ) -> BoxFuture<'_, Result<dto::SessionInfo, anyhow::Error>> {
+            self.get_session_calls
+                .lock()
+                .expect("get_session lock")
+                .push(session_id.to_string());
+            let out = self.session_out.lock().expect("session lock").clone();
+            Box::pin(async move {
+                out.ok_or_else(|| anyhow::anyhow!("mock get_session not configured"))
+            })
+        }
+
+        fn set_model(
+            &self,
+            session_id: &str,
+            model: &dto::ModelRef,
+        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.set_model_calls
+                .lock()
+                .expect("set_model lock")
+                .push((session_id.to_string(), model.clone()));
+            let fail = self.set_model_fail.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(anyhow::anyhow!("mock set_model failure"))
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
@@ -2768,104 +3357,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_reload_pushes_config_option_update() {
+    async fn catalog_reload_pushes_full_config_option_state() {
         let backend = MockBackend::new();
-        backend.set_models(vec![
-            dto::ModelInfo {
-                id: "GLM-5.3-astra".into(),
-                modelID: Some("GLM-5.3-astra".into()),
-                providerID: "astra".into(),
-                name: Some("GLM 5.3".into()),
-            },
-            dto::ModelInfo {
-                id: "deepseek_v4_flash_code".into(),
-                modelID: None,
-                providerID: "astra".into(),
-                name: None,
-            },
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
         ]);
+        backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
-        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
-        let agent_task = tokio::spawn({
-            let svc = Arc::clone(&svc);
-            async move { let _ = svc.serve(agent_side).await; }
-        });
-        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
 
-        let outcome: Result<(), AcpError> = Client.builder()
-            .name("acp-test-client")
-            .on_receive_notification(
-                {
-                    let collected = Arc::clone(&collected);
-                    async move |notif: SessionNotification, _cx| {
-                        collected.lock().expect("collected lock").push(notif);
-                        Ok(())
-                    }
-                },
-                on_receive_notification!(),
-            )
-            .connect_with(client_side, {
-                let backend = Arc::clone(&backend);
-                async move |cx| {
-                    let _ = cx
-                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                        .block_task()
-                        .await?;
-                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
-                    let sid = ns.session_id.clone();
+            // Catalog reload signal (wire shape: `{}`) arrives mid-turn; the
+            // catalogs are re-fetched and the FULL state (agent + model
+            // options with real current values) is pushed.
+            backend.push(dto::SessionEvent::ModelUpdated(dto::ModelOrProviderUpdated {}));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
 
-                    // Catalog reload signal (wire shape: `{}`) arrives
-                    // mid-turn; the catalog is re-fetched and pushed.
-                    backend.push(dto::SessionEvent::ModelUpdated(
-                        dto::ModelOrProviderUpdated {},
-                    ));
-                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
-                        sessionID: "ses_mock_1".into(),
-                    }));
-
-                    let prompt_req = cx
-                        .send_request(PromptRequest::new(
-                            sid.clone(),
-                            vec![ContentBlock::Text(TextContent::new("hi"))],
-                        ))
-                        .block_task()
-                        .await?;
-                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
-                    Ok(())
-                }
-            })
-            .await;
-
-        agent_task.abort();
+            let prompt_req = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("hi"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
         outcome.expect("client run ok");
 
-        // One ConfigOptionUpdate with the mocked models as select options.
+        // Exactly ONE ConfigOptionUpdate: the catalog-reload push (the
+        // lifecycle response carries the state, it is not a push).
         let notifications = collected.lock().expect("collected lock");
-        let configs: Vec<&acp::ConfigOptionUpdate> = notifications
-            .iter()
-            .filter_map(|n| match &n.update {
-                acp::SessionUpdate::ConfigOptionUpdate(c) => Some(c),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(configs.len(), 1, "one catalog push");
+        let configs = config_option_pushes(&notifications);
+        assert_eq!(configs.len(), 1, "one catalog reload push");
         let options = &configs[0].config_options;
-        assert_eq!(options.len(), 1);
-        let option = options[0].clone();
-        assert_eq!(option.id.0.as_ref(), "model");
-        assert_eq!(option.name.as_str(), "Model");
-        let acp::SessionConfigKind::Select(select) = option.kind else {
-            panic!("expected a select option");
-        };
-        assert_eq!(select.current_value.0.as_ref(), "");
-        let acp::SessionConfigSelectOptions::Ungrouped(values) = select.options else {
-            panic!("expected select options");
-        };
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].value.0.as_ref(), "astra/GLM-5.3-astra");
-        assert_eq!(values[0].name.as_str(), "GLM 5.3");
-        assert_eq!(values[1].value.0.as_ref(), "astra/deepseek_v4_flash_code");
-        assert_eq!(values[1].name.as_str(), "deepseek_v4_flash_code");
+        // Both options, real current values (no blank "" anywhere).
+        let agent = option_by_id(options, "agent");
+        assert_eq!(agent.category, Some(acp::SessionConfigOptionCategory::Mode));
+        assert_eq!(as_select(agent).current_value.0.as_ref(), "orchestrator");
+        let model = option_by_id(options, "model");
+        assert_eq!(model.category, Some(acp::SessionConfigOptionCategory::Model));
+        // The tracked model is still UNKNOWN (no step yet) → the synthetic
+        // Default option is listed and the current value is "__default__".
+        assert_eq!(as_select(model).current_value.0.as_ref(), "__default__");
+        let groups = grouped(as_select(model));
+        assert_eq!(groups[0].options[0].value.0.as_ref(), "__default__");
+        assert_eq!(groups[0].options[0].name.as_str(), "Default");
     }
 
     // ======================= Wave 6a: session management =======================
@@ -3288,6 +3834,102 @@ mod tests {
             .collect()
     }
 
+    // ============ Release 0.3.0: config options helpers ============
+
+    /// `initialize` declaring `clientCapabilities.session.configOptions` —
+    /// exactly what Zed sends (the config-options capability gate).
+    fn init_with_config_options() -> InitializeRequest {
+        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().session(
+                ClientSessionCapabilities::new().config_options(
+                    SessionConfigOptionsCapabilities::new(),
+                ),
+            ),
+        )
+    }
+
+    /// The canned model catalog used across the config-options tests: two
+    /// providers, one model without a display name (falls back to id).
+    fn catalog_models() -> Vec<dto::ModelInfo> {
+        vec![
+            dto::ModelInfo {
+                id: "GLM-5.3-astra".into(),
+                modelID: Some("GLM-5.3-astra".into()),
+                providerID: "astra".into(),
+                name: Some("GLM 5.3".into()),
+            },
+            dto::ModelInfo {
+                id: "deepseek_v4_flash_code".into(),
+                modelID: None,
+                providerID: "astra".into(),
+                name: None,
+            },
+            dto::ModelInfo {
+                id: "gpt-6".into(),
+                modelID: None,
+                providerID: "openai".into(),
+                name: Some("GPT-6".into()),
+            },
+        ]
+    }
+
+    fn config_option_pushes(n: &[SessionNotification]) -> Vec<&acp::ConfigOptionUpdate> {
+        n.iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::ConfigOptionUpdate(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn option_by_id<'a>(options: &'a [acp::SessionConfigOption], id: &str) -> &'a acp::SessionConfigOption {
+        options
+            .iter()
+            .find(|o| o.id.0.as_ref() == id)
+            .unwrap_or_else(|| panic!("config option {id:?} missing"))
+    }
+
+    fn as_select(option: &acp::SessionConfigOption) -> &acp::SessionConfigSelect {
+        match &option.kind {
+            acp::SessionConfigKind::Select(s) => s,
+            _ => panic!("expected a select option, got {:?}", option.kind),
+        }
+    }
+
+    fn grouped(select: &acp::SessionConfigSelect) -> &[acp::SessionConfigSelectGroup] {
+        match &select.options {
+            acp::SessionConfigSelectOptions::Grouped(g) => g,
+            _ => panic!("expected grouped options"),
+        }
+    }
+
+    fn model_selected(sid: &str, provider: &str, id: &str) -> dto::SessionEvent {
+        dto::SessionEvent::ModelSelected(dto::SessionModelSelected {
+            sessionID: sid.into(),
+            model: dto::ModelRef {
+                id: id.into(),
+                providerID: provider.into(),
+                variant: None,
+            },
+        })
+    }
+
+    fn wire_msg_model(kind: &str, agent: Option<&str>, model: Option<dto::ModelRef>) -> dto::MessageRecord {
+        dto::MessageRecord {
+            kind: kind.into(),
+            id: format!("{kind}-rec"),
+            text: None,
+            agent: agent.map(str::to_string),
+            model,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        }
+    }
+
     #[tokio::test]
     async fn new_session_responds_with_filtered_modes_and_default_mode() {
         let backend = MockBackend::new();
@@ -3649,6 +4291,602 @@ mod tests {
                 .await?;
             let modes = resume.modes.expect("resume carries the mode state");
             assert_eq!(modes.current_mode_id.0.as_ref(), "build");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    // ================ Release 0.3.0: config options ================
+
+    #[tokio::test]
+    async fn new_session_config_options_both_pickers_capability_gated() {
+        // Capability NOT declared → no config_options in the lifecycle
+        // response (the modes payload keeps working for other clients).
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            assert!(ns.modes.is_some(), "modes payload stays for non-declaring clients");
+            assert!(ns.config_options.is_none(), "no capability → no config options");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        // Capability declared (Zed) → both pickers, real current values.
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let options = ns.config_options.expect("config options present");
+            assert_eq!(options.len(), 2, "agent + model options");
+
+            // Agent option: category Mode, ungrouped visible agents, current
+            // = the derived default (first visible primary).
+            let agent = option_by_id(&options, "agent");
+            assert_eq!(agent.category, Some(acp::SessionConfigOptionCategory::Mode));
+            assert_eq!(agent.name, "Agent");
+            let select = as_select(agent);
+            assert_eq!(select.current_value.0.as_ref(), "orchestrator");
+            let acp::SessionConfigSelectOptions::Ungrouped(values) = &select.options else {
+                panic!("agent options must be ungrouped");
+            };
+            let ids: Vec<&str> = values.iter().map(|v| v.value.0.as_ref()).collect();
+            assert_eq!(ids, vec!["orchestrator", "build"]);
+
+            // Model option: category Model, grouped by provider (first-seen
+            // order), value scheme <provider>/<model>, display name falls
+            // back to modelID then id. newSession model is UNKNOWN →
+            // current "__default__" with Default PREPENDED to the first
+            // group.
+            let model = option_by_id(&options, "model");
+            assert_eq!(model.category, Some(acp::SessionConfigOptionCategory::Model));
+            assert_eq!(model.name, "Model");
+            let select = as_select(model);
+            assert_eq!(select.current_value.0.as_ref(), "__default__");
+            let groups = grouped(select);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].group.0.as_ref(), "astra");
+            assert_eq!(groups[0].name, "astra");
+            assert_eq!(groups[1].group.0.as_ref(), "openai");
+            assert_eq!(groups[1].name, "openai");
+            let astra: Vec<(String, String)> = groups[0]
+                .options
+                .iter()
+                .map(|o| (o.value.0.as_ref().to_string(), o.name.clone()))
+                .collect();
+            assert_eq!(
+                astra,
+                vec![
+                    ("__default__".to_string(), "Default".to_string()),
+                    ("astra/GLM-5.3-astra".to_string(), "GLM 5.3".to_string()),
+                    (
+                        "astra/deepseek_v4_flash_code".to_string(),
+                        "deepseek_v4_flash_code".to_string()
+                    ),
+                ]
+            );
+            assert_eq!(groups[1].options.len(), 1);
+            assert_eq!(groups[1].options[0].value.0.as_ref(), "openai/gpt-6");
+            assert_eq!(groups[1].options[0].name, "GPT-6");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn config_options_degrade_per_option_and_together() {
+        // Model catalog unavailable (fetch failed/absent) → agent option
+        // only.
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let options = ns.config_options.expect("agent option present");
+            assert_eq!(options.len(), 1);
+            assert_eq!(options[0].id.0.as_ref(), "agent");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        // Agents fetch failed → model option only (Default listed: unknown
+        // current model).
+        let backend = MockBackend::new();
+        backend.set_models(catalog_models());
+        backend.fail_agents();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let options = ns.config_options.expect("model option present");
+            assert_eq!(options.len(), 1);
+            let model = option_by_id(&options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "__default__");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        // Both unavailable → no config_options field at all.
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            assert!(ns.config_options.is_none(), "nothing to render → omit the field");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn set_config_option_model_calls_wire_and_tracks() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // Unknown session → invalid_params, no wire call.
+            let err = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    "ses_unknown",
+                    "model",
+                    "astra/GLM-5.3-astra",
+                ))
+                .block_task()
+                .await
+                .expect_err("unknown session must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            // "astra/GLM-5.3-astra" → set_model wire; the response carries the
+            // full state with the concrete current model and NO Default
+            // option anymore (once concrete, Default is not listed).
+            let resp = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "astra/GLM-5.3-astra",
+                ))
+                .block_task()
+                .await?;
+            let model = option_by_id(&resp.config_options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "astra/GLM-5.3-astra");
+            let groups = grouped(as_select(model));
+            let first = &groups[0].options[0];
+            assert_ne!(
+                first.value.0.as_ref(),
+                "__default__",
+                "concrete model → Default option is gone"
+            );
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let calls = backend.recorded_set_model_calls();
+        assert_eq!(calls.len(), 1, "exactly one wire model switch");
+        assert_eq!(calls[0].0, "ses_mock_1");
+        assert_eq!(calls[0].1.id, "GLM-5.3-astra");
+        assert_eq!(calls[0].1.providerID, "astra");
+        assert!(calls[0].1.variant.is_none());
+        // The handler pushes the full state (both options).
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = config_option_pushes(&notifications);
+        assert_eq!(pushes.len(), 1, "one config_option_update after the switch");
+    }
+
+    #[tokio::test]
+    async fn set_config_option_default_noop_and_invalid_values_push_state() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            // "__default__" → success no-op (no set-model wire), current
+            // state echoed (Default still listed while unknown).
+            let resp = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "__default__",
+                ))
+                .block_task()
+                .await?;
+            let model = option_by_id(&resp.config_options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "__default__");
+            assert_eq!(
+                grouped(as_select(model))[0].options[0].value.0.as_ref(),
+                "__default__"
+            );
+            // Unmatched value (stale Zed-persisted default) → invalid-params
+            // error, but the current state is still pushed (self-corrects).
+            let err = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "codebuddy/gpt-6-sol",
+                ))
+                .block_task()
+                .await
+                .expect_err("value not in the catalog must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            // Malformed value (no '/') → same reject path.
+            let err = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid.clone(),
+                    "model",
+                    "not-a-model-ref",
+                ))
+                .block_task()
+                .await
+                .expect_err("malformed value must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            // Unknown config id → invalid_params.
+            let err = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid,
+                    "bogus_config_id",
+                    "x",
+                ))
+                .block_task()
+                .await
+                .expect_err("unknown config id must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(
+            backend.recorded_set_model_calls().is_empty(),
+            "__default__ is a no-op; invalid values never reach the wire"
+        );
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = config_option_pushes(&notifications);
+        assert_eq!(
+            pushes.len(),
+            3,
+            "no-op + two rejects each push the current state (self-correction)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_option_agent_reuses_set_mode_semantics() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let resp = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(sid, "agent", "build"))
+                .block_task()
+                .await?;
+            let agent = option_by_id(&resp.config_options, "agent");
+            assert_eq!(as_select(agent).current_value.0.as_ref(), "build");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(
+            backend.recorded_set_agent_calls(),
+            vec![("ses_mock_1".to_string(), "build".to_string())]
+        );
+        let notifications = collected.lock().expect("collected lock");
+        let updates = mode_updates(&notifications);
+        assert_eq!(updates.len(), 1, "same current_mode_update semantics as set_mode");
+        assert_eq!(updates[0].current_mode_id.0.as_ref(), "build");
+        assert_eq!(config_option_pushes(&notifications).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_model_failure_rejects_and_pushes_current_state() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        backend.fail_set_model();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let err = cx
+                .send_request(acp::SetSessionConfigOptionRequest::new(
+                    sid,
+                    "model",
+                    "astra/GLM-5.3-astra",
+                ))
+                .block_task()
+                .await
+                .expect_err("wire failure must surface as an error");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(backend.recorded_set_model_calls().len(), 1, "wire was attempted");
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = config_option_pushes(&notifications);
+        assert_eq!(pushes.len(), 1, "current state pushed after the failed switch");
+        // The tracked model stayed UNKNOWN → Default still listed.
+        let model = option_by_id(&pushes[0].config_options, "model");
+        assert_eq!(as_select(model).current_value.0.as_ref(), "__default__");
+    }
+
+    #[tokio::test]
+    async fn model_selected_and_step_started_track_and_push_with_echo_suppression() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let exec_started = || {
+                dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                    sessionID: sid.0.to_string(),
+                })
+            };
+            let exec_succeeded = || {
+                dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: sid.0.to_string(),
+                })
+            };
+            // Turn 1: step.started carries a model different from the
+            // tracked UNKNOWN → self-heal push (agent matches the tracked
+            // default, so no mode noise).
+            backend.push(exec_started());
+            backend.push(dto::SessionEvent::StepStarted(dto::StepStarted {
+                session: dto::SessionRef { sessionID: sid.0.to_string() },
+                agent: Some("orchestrator".into()),
+                model: Some(dto::ModelRef {
+                    id: "GLM-5.3-astra".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                }),
+                assistantMessageID: "msg_1".into(),
+                snapshot: None,
+                started: None,
+            }));
+            backend.push(exec_succeeded());
+            let prompt = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // Turn 2: same model again → no change, no push (echo suppressed).
+            backend.push(exec_started());
+            backend.push(dto::SessionEvent::StepStarted(dto::StepStarted {
+                session: dto::SessionRef { sessionID: sid.0.to_string() },
+                agent: Some("orchestrator".into()),
+                model: Some(dto::ModelRef {
+                    id: "GLM-5.3-astra".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                }),
+                assistantMessageID: "msg_2".into(),
+                snapshot: None,
+                started: None,
+            }));
+            backend.push(exec_succeeded());
+            let prompt = cx
+                .send_request(PromptRequest::new(sid.clone(), vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // Turn 3: `session.model.selected` remote switch → one push with
+            // the new current value, Default gone again (concrete model).
+            backend.push(exec_started());
+            backend.push(model_selected(&sid.0, "openai", "gpt-6"));
+            backend.push(exec_succeeded());
+            let prompt = cx
+                .send_request(PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new("hi"))]))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = config_option_pushes(&notifications);
+        assert_eq!(pushes.len(), 2, "turn 1 self-heal + turn 3 remote switch");
+        // Turn 1 push: concrete model tracked from the step, Default listed
+        // no more.
+        let model = option_by_id(&pushes[0].config_options, "model");
+        assert_eq!(as_select(model).current_value.0.as_ref(), "astra/GLM-5.3-astra");
+        let groups = grouped(as_select(model));
+        assert_ne!(groups[0].options[0].value.0.as_ref(), "__default__");
+        // Turn 3 push: the remote model won.
+        let model = option_by_id(&pushes[1].config_options, "model");
+        assert_eq!(as_select(model).current_value.0.as_ref(), "openai/gpt-6");
+    }
+
+    #[tokio::test]
+    async fn load_and_resume_use_session_record_agent_and_model() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        // The session record is authoritative (includes post-switch state):
+        // agent build (not the derived default orchestrator) + a model.
+        let mut info = wire_session("ses_mock_1", None, Some("/tmp/opencode/acp-fixture-project"), None);
+        info.agent = Some("build".into());
+        info.model = Some(dto::ModelRef {
+            id: "GLM-5.3-astra".into(),
+            providerID: "astra".into(),
+            variant: None,
+        });
+        backend.set_session(info);
+        backend.set_messages(vec![wire_msg("user", None), wire_msg("assistant", Some("orchestrator"))]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let load = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let options = load.config_options.expect("config options present");
+            let agent = option_by_id(&options, "agent");
+            assert_eq!(as_select(agent).current_value.0.as_ref(), "build");
+            let model = option_by_id(&options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "astra/GLM-5.3-astra");
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let options = resume.config_options.expect("config options present");
+            let agent = option_by_id(&options, "agent");
+            assert_eq!(as_select(agent).current_value.0.as_ref(), "build");
+            let model = option_by_id(&options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "astra/GLM-5.3-astra");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(
+            backend.recorded_get_session_calls(),
+            vec!["ses_mock_1".to_string(), "ses_mock_1".to_string()],
+            "load + resume each fetch the session record"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_falls_back_to_last_assistant_model_and_omits_drifted_agent_option() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![
+            wire_agent("orchestrator", "primary", false, None),
+            wire_agent("build", "primary", false, None),
+        ]);
+        backend.set_models(catalog_models());
+        // get_session unconfigured → mock failure; the fallback chain is the
+        // last assistant message's agent + model.
+        backend.set_messages(vec![
+            wire_msg("user", None),
+            wire_msg_model(
+                "assistant",
+                Some("ghost-agent"),
+                Some(dto::ModelRef {
+                    id: "deepseek_v4_flash_code".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                }),
+            ),
+        ]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let load = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let options = load.config_options.expect("model option present");
+            let model = option_by_id(&options, "model");
+            assert_eq!(
+                as_select(model).current_value.0.as_ref(),
+                "astra/deepseek_v4_flash_code",
+                "last assistant message's model"
+            );
+            // The last assistant agent drifted out of the visible list: the
+            // agent option is omitted (never an unmatched current value).
+            assert!(
+                !options.iter().any(|o| o.id.0.as_ref() == "agent"),
+                "drifted current agent must omit the agent option"
+            );
+            // No model in the messages at all → UNKNOWN → __default__ +
+            // Default option.
+            backend.set_messages(vec![wire_msg("user", None)]);
+            let resume = cx
+                .send_request(acp::ResumeSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
+                .block_task()
+                .await?;
+            let options = resume.config_options.expect("options present");
+            let model = option_by_id(&options, "model");
+            assert_eq!(as_select(model).current_value.0.as_ref(), "__default__");
+            assert_eq!(
+                grouped(as_select(model))[0].options[0].value.0.as_ref(),
+                "__default__"
+            );
             Ok(())
         })
         .await;
