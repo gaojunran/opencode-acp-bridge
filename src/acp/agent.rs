@@ -1585,6 +1585,7 @@ impl AgentService {
                             &child_id,
                             &call_id,
                             meta,
+                            &mut state,
                             &mut child_states,
                             &entry,
                             &req,
@@ -1801,6 +1802,7 @@ impl AgentService {
                     &child_id,
                     &call_id,
                     meta,
+                    &mut state,
                     &mut child_states,
                     &entry,
                     &req,
@@ -1947,11 +1949,38 @@ impl AgentService {
         child_id: &str,
         call_id: &str,
         meta: serde_json::Map<String, serde_json::Value>,
+        state: &mut updates::MappingState,
         child_states: &mut HashMap<String, updates::MappingState>,
         entry: &Arc<SessionEntry>,
         req: &acp::PromptRequest,
         cx: &ConnectionTo<Client>,
     ) -> Result<(), AcpError> {
+        // Release 0.7.1: with the spawner declaration deferred to
+        // `tool.input.ended`, a pairing that lands BEFORE the input stream
+        // ends (created before ended/called — synthetic orderings; the real
+        // wire always delivers the input first) would announce on an
+        // undeclared card. Declare the card NOW — title: the dispatch
+        // `description` if the input already arrived, else the tool name —
+        // so the announce targets a card the client knows.
+        if !state.is_introduced(call_id) {
+            let name = state
+                .tool_title(call_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| "subagent".to_string());
+            let title = updates::spawner_display_title(&name, state.tool_input(call_id));
+            if let Some(decl) = state.introduce_tool(
+                call_id,
+                title,
+                acp::ToolKind::Other,
+                acp::ToolCallStatus::Pending,
+                None,
+            ) {
+                cx.send_notification(acp::SessionNotification::new(
+                    req.session_id.clone(),
+                    decl,
+                ))?;
+            }
+        }
         let update = acp::ToolCallUpdate::new(
             call_id.to_string(),
             acp::ToolCallUpdateFields::new(),
@@ -2874,28 +2903,54 @@ impl AgentService {
     }
 
     /// Release 0.6.0: send the subagent announce update on the parent
-    /// stream (background path). Guarded: the client must already know the
-    /// task call (declared in the parent's projector) or the update would
-    /// target an unknown card. Returns `false` when the client is gone.
+    /// stream (background path). The task call is declared first when the
+    /// pairing landed before the input stream ended (Release 0.7.1 —
+    /// synthetic orderings; the real wire delivers the input first) so the
+    /// update never targets an unknown card. Returns `false` when the
+    /// client is gone.
     fn background_announce(
         &self,
         parent_sid: &acp::SessionId,
         call_id: &str,
         meta: serde_json::Map<String, serde_json::Value>,
-        projectors: &HashMap<acp::SessionId, updates::MappingState>,
+        projectors: &mut HashMap<acp::SessionId, updates::MappingState>,
         cx: &ConnectionTo<Client>,
     ) -> bool {
-        let declared = projectors
-            .get(parent_sid)
-            .map(|s| s.is_introduced(call_id))
-            .unwrap_or(false);
-        if !declared {
+        let Some(state) = projectors.get_mut(parent_sid) else {
             tracing::warn!(
                 session = %parent_sid,
                 call = %call_id,
-                "subagent announce skipped: task call not declared to the client"
+                "subagent announce skipped: parent session has no projector"
             );
             return true;
+        };
+        // Release 0.7.1: with the spawner declaration deferred to
+        // `tool.input.ended`, a pairing landing before the input stream ends
+        // (created before ended/called — synthetic orderings; the real wire
+        // always delivers the input first) would announce on an undeclared
+        // card. Declare the card NOW (title: the dispatch description if the
+        // input already arrived, else the tool name) so the announce targets
+        // a card the client knows.
+        if !state.is_introduced(call_id) {
+            let name = state
+                .tool_title(call_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| "subagent".to_string());
+            let title = updates::spawner_display_title(&name, state.tool_input(call_id));
+            if let Some(decl) = state.introduce_tool(
+                call_id,
+                title,
+                acp::ToolKind::Other,
+                acp::ToolCallStatus::Pending,
+                None,
+            ) {
+                if cx
+                    .send_notification(acp::SessionNotification::new(parent_sid.clone(), decl))
+                    .is_err()
+                {
+                    return false;
+                }
+            }
         }
         let update = acp::ToolCallUpdate::new(
             call_id.to_string(),
@@ -5120,13 +5175,25 @@ mod tests {
                 },
                 name: "subagent".into(),
             }));
+            // Release 0.7.1: the deferred declaration happens at
+            // `input.ended` (the input carries the dispatch description the
+            // card's title comes from).
+            backend.push(dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
+                },
+                text: "{\"agent\": \"explorer\", \"description\": \"List the repo\", \"prompt\": \"go\"}"
+                    .to_string(),
+            }));
             backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
                 base: dto::ToolRef {
                     sessionID: parent.clone(),
                     assistantMessageID: "msg_p1".into(),
                     id: "call_task_1".into(),
                 },
-                input: serde_json::json!({"agent": "explorer", "prompt": "go"}),
+                input: serde_json::json!({"agent": "explorer", "description": "List the repo", "prompt": "go"}),
                 executed: Some(false),
             }));
             backend.push(child_created(&parent));
@@ -5195,6 +5262,29 @@ mod tests {
         outcome.expect("client run ok");
 
         let notifications = collected.lock().expect("collected lock");
+
+        // 0. Release 0.7.1: the spawner card DECLARES with the dispatch
+        //    description as title (not the tool name), and the declaration
+        //    precedes the announce.
+        let decl_idx = notifications
+            .iter()
+            .position(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCall(c)
+                            if c.tool_call_id.0.as_ref() == "call_task_1"
+                    )
+            })
+            .expect("spawner card declaration on the parent session");
+        let acp::SessionUpdate::ToolCall(decl) = &notifications[decl_idx].update else {
+            unreachable!()
+        };
+        assert_eq!(
+            decl.title, "List the repo",
+            "the spawner card carries the dispatch description as title"
+        );
+        assert_eq!(decl.status, acp::ToolCallStatus::Pending);
 
         // 1. The announce: a parent-addressed tool_call_update for the
         //    spawner call carrying the open subagent meta — landing BEFORE
@@ -8504,6 +8594,25 @@ mod tests {
         outcome.expect("client run ok");
 
         let notifications = collected.lock().expect("collected lock");
+        // Release 0.7.1: the pairing landed before any input event, so the
+        // announce DECLARES the card itself — the fallback title (the tool
+        // name — no input/description is on hand) on a Pending declaration.
+        let decl_idx = notifications
+            .iter()
+            .position(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCall(c)
+                            if c.tool_call_id.0.as_ref() == "call_task_1"
+                    )
+            })
+            .expect("the announce declares the spawner card");
+        let acp::SessionUpdate::ToolCall(decl) = &notifications[decl_idx].update else {
+            unreachable!()
+        };
+        assert_eq!(decl.title, "subagent", "no description on hand → tool name fallback");
+        assert_eq!(decl.status, acp::ToolCallStatus::Pending);
         // The announce rode the parent's stream BEFORE any child traffic.
         let announce_idx = notifications
             .iter()
@@ -8517,6 +8626,7 @@ mod tests {
                     )
             })
             .expect("announce on the parent stream");
+        assert!(decl_idx < announce_idx, "the card is declared before the announce");
         let first_child_idx = notifications
             .iter()
             .position(|n| n.session_id.0.as_ref() == "ses_child_1")

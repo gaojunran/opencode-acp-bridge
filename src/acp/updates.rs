@@ -79,7 +79,7 @@ impl MappingState {
     }
 
     /// The display title (tool name) indexed for a tool call id, if seen
-    /// this turn (`tool.input.started`).
+    /// (from `session.tool.input.started`).
     pub(crate) fn tool_title(&self, tool_call_id: &str) -> Option<&str> {
         self.tool_titles.get(tool_call_id).map(String::as_str)
     }
@@ -321,6 +321,39 @@ pub const SUBAGENT_META_KEY: &str = "subagent_session_info";
 /// production server — wire-verified in both captures).
 pub fn is_spawner_name(name: &str) -> bool {
     matches!(name, "task" | "subagent")
+}
+
+/// Release 0.7.1: the display title for a subagent-SPAWNER tool call.
+///
+/// Zed's own `spawn_agent` card labels itself with the dispatch
+/// `description`; the bridge aligns the spawner card title to the same
+/// convention: the input's `description` (trimmed), truncated to 80
+/// characters + "…" on the wire (the renderer truncates via CSS too, but
+/// the wire must not carry unbounded strings), falling back to the tool
+/// name.
+pub(crate) fn spawner_display_title(name: &str, input: Option<&serde_json::Value>) -> String {
+    let description = input
+        .and_then(|i| i.get("description"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match description {
+        Some(d) => truncate_title(d),
+        None => name.to_string(),
+    }
+}
+
+/// Cap the wire title at 80 chars + "…" — char-boundary safe (descriptions
+/// may be non-ASCII; slicing at byte 80 could split a multi-byte char).
+fn truncate_title(s: &str) -> String {
+    let count = s.chars().count();
+    if count <= 80 {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(80).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// The `_meta.subagent_session_info` object: `message_end_index` None → the
@@ -923,6 +956,18 @@ fn to_tool_updates(
             let id = t.base.id.clone();
             state.tool_titles.insert(id.clone(), t.name.clone());
             state.open_tool(id.clone());
+            // Release 0.7.1: a subagent-SPAWNER call's declaration is DEFERRED
+            // to `tool.input.ended` — its card title is the dispatch
+            // `description` (Zed's spawn_agent convention), which only exists
+            // in the input, and the input has not arrived yet. Declaring here
+            // would paint the card with the bare tool name ("subagent") until
+            // a later retitle; declaring once at input.ended (same emission as
+            // the raw input) makes the FIRST sight of the call carry the
+            // description title — no flash, no retitle update. Non-spawner
+            // tools declare exactly as before.
+            if is_spawner_name(&t.name) {
+                return Vec::new();
+            }
             // Release 0.3.2: the initial `ToolCall` declaration rides the
             // first emission (the client must see the call before any update).
             let mut out = Vec::with_capacity(2);
@@ -951,18 +996,39 @@ fn to_tool_updates(
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
                 state.tool_inputs.insert(id.clone(), parsed);
             }
-            // Degenerate introduced-here case (input.started skipped): no
-            // name on the event — the id itself is the only truthful title;
-            // the raw JSON input rides the declaration.
+            // Release 0.7.1: the spawner's deferred declaration lands here —
+            // the parsed input is now on hand, so the card's FIRST
+            // declaration carries the dispatch `description` as title
+            // (fallback: the tool name), with Pending + the raw JSON input.
+            // Degenerate introduced-here case (input.started skipped, or a
+            // non-spawner tool): no name on the event — the id itself is the
+            // only truthful title; the raw JSON input rides the declaration.
             let mut out = Vec::with_capacity(2);
-            if let Some(decl) = state.introduce_tool(
-                &id,
-                id.clone(),
-                ToolKind::Other,
-                ToolCallStatus::Pending,
-                Some(serde_json::Value::String(t.text.clone())),
-            ) {
-                out.push(decl);
+            let raw_input = Some(serde_json::Value::String(t.text.clone()));
+            match state.tool_titles.get(&id) {
+                Some(name) if is_spawner_name(name) => {
+                    let title = spawner_display_title(name, state.tool_input(&id));
+                    if let Some(decl) = state.introduce_tool(
+                        &id,
+                        title,
+                        tool_kind(name),
+                        ToolCallStatus::Pending,
+                        raw_input,
+                    ) {
+                        out.push(decl);
+                    }
+                }
+                _ => {
+                    if let Some(decl) = state.introduce_tool(
+                        &id,
+                        id.clone(),
+                        ToolKind::Other,
+                        ToolCallStatus::Pending,
+                        raw_input,
+                    ) {
+                        out.push(decl);
+                    }
+                }
             }
             out.push(tool_update(
                 &id,
@@ -975,14 +1041,35 @@ fn to_tool_updates(
             let id = t.base.id.clone();
             state.tool_inputs.insert(id.clone(), t.input.clone());
             let mut out = Vec::with_capacity(2);
-            if let Some(decl) = state.introduce_tool(
-                &id,
-                id.clone(),
-                ToolKind::Other,
-                ToolCallStatus::InProgress,
-                Some(t.input.clone()),
-            ) {
-                out.push(decl);
+            // Release 0.7.1: introduce-with-input for a spawner whose input
+            // events were skipped uses the same description title as the
+            // deferred declaration (the input is on hand here) — fallback:
+            // the tool name. Non-spawner degenerate introductions keep the
+            // id-as-title behavior (never a truthful name on this event).
+            match state.tool_titles.get(&id) {
+                Some(name) if is_spawner_name(name) => {
+                    let title = spawner_display_title(name, Some(&t.input));
+                    if let Some(decl) = state.introduce_tool(
+                        &id,
+                        title,
+                        tool_kind(name),
+                        ToolCallStatus::InProgress,
+                        Some(t.input.clone()),
+                    ) {
+                        out.push(decl);
+                    }
+                }
+                _ => {
+                    if let Some(decl) = state.introduce_tool(
+                        &id,
+                        id.clone(),
+                        ToolKind::Other,
+                        ToolCallStatus::InProgress,
+                        Some(t.input.clone()),
+                    ) {
+                        out.push(decl);
+                    }
+                }
             }
             out.push(tool_update(
                 &id,
@@ -1013,7 +1100,18 @@ fn to_tool_updates(
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             if let Some(meta) = &t.metadata {
                 if let Some(title) = &meta.title {
-                    fields = fields.title(title.clone());
+                    // Release 0.7.1: a spawner's terminal title stays
+                    // consistent with its declared card title (the dispatch
+                    // description, same fallback chain) when the server
+                    // carries one; non-spawner terminal titles (e.g. the
+                    // edited file's name) are untouched.
+                    match state.tool_titles.get(&id) {
+                        Some(name) if is_spawner_name(name) => {
+                            let spawner_title = spawner_display_title(name, state.tool_input(&id));
+                            fields = fields.title(spawner_title);
+                        }
+                        _ => fields = fields.title(title.clone()),
+                    }
                 }
             }
             if let Some(content) = &t.content {
@@ -2520,6 +2618,243 @@ mod tests {
         assert!(cards > 0, "card lines appear on child tool boundaries");
         let track = tracker.child(child).expect("child tracked");
         assert_eq!(track.entries as u64, end, "end index = total child entries");
+    }
+
+    /// The full 0.6.0 fixture through the PARENT mapping: the spawner cards
+    /// declare with the dispatch `description` as title (not the tool name).
+    #[test]
+    fn native_fixture_spawner_cards_declare_description_title() {
+        let mut state = MappingState::new();
+        let declares: Vec<(String, String)> = decode_native_fixture()
+            .iter()
+            .flat_map(|ev| to_updates(ev, &mut state))
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCall(c) => {
+                    Some((c.tool_call_id.0.as_ref().to_string(), c.title.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The two spawner calls (fresh + continuation) declare with their
+        // descriptions; the child tool calls with their tool names.
+        let spawner_titles: Vec<&str> = declares
+            .iter()
+            .filter(|(id, _)| id.starts_with("call_"))
+            .map(|(_, t)| t.as_str())
+            .filter(|t| *t != "grep" && *t != "read" && *t != "glob" && *t != "bash" && *t != "ctx_reduce")
+            .collect();
+        assert_eq!(
+            spawner_titles,
+            vec!["Read and report README.md", "Check for txt files"],
+            "spawner declarations carry the dispatch descriptions"
+        );
+    }
+
+    /// Release 0.7.1: the spawner declaration is deferred from
+    /// `input.started` to `input.ended` (the input must arrive before the
+    /// description title exists), with Pending + the raw JSON input on the
+    /// declaration — and no tool-name flash beforehand.
+    #[test]
+    fn spawner_declares_description_at_input_ended() {
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            name: "subagent".into(),
+        });
+        // input.started emits NOTHING for a spawner (non-spawner tools
+        // declare here — covered by the other mapping tests).
+        assert_eq!(to_updates(&started, &mut state).len(), 0);
+
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            text: "{\"agent\":\"explorer\",\"description\":\"Read and report README.md\",\"prompt\":\"go\"}"
+                .to_string(),
+        });
+        let updates = to_updates(&ended, &mut state);
+        assert_eq!(updates.len(), 2, "declaration + raw_input update");
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("first emission must be the declaration")
+        };
+        assert_eq!(c.tool_call_id.0.as_ref(), "call_spawn");
+        assert_eq!(c.status, acp::ToolCallStatus::Pending);
+        assert_eq!(c.title, "Read and report README.md");
+        // The raw JSON input rides the declaration (the input.ended arm
+        // passes the raw text through verbatim).
+        assert!(c.raw_input.as_ref().is_some());
+        let SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
+            panic!("second emission must be the raw_input update")
+        };
+        assert!(u.fields.raw_input.is_some(), "raw input update follows");
+
+        // called: in-progress update, no re-declaration.
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            input: serde_json::json!({"agent": "explorer", "description": "Read and report README.md"}),
+            executed: None,
+        });
+        let updates = to_updates(&called, &mut state);
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(&updates[0], SessionUpdate::ToolCallUpdate(u)
+            if u.fields.status == Some(acp::ToolCallStatus::InProgress)));
+    }
+
+    /// The `task` alias gets the same treatment; long descriptions are
+    /// truncated to 80 chars + "…" at char boundaries (never a mid-char
+    /// split on non-ASCII input).
+    #[test]
+    fn spawner_task_alias_truncates_long_description_char_boundary_safe() {
+        let mut state = MappingState::new();
+        let long_desc = "x".repeat(100);
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_task_1"),
+            name: "task".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_p", "msg_p", "call_task_1"),
+            text: format!("{{\"description\":\"{long_desc}\"}}"),
+        });
+        let updates = to_updates(&ended, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert_eq!(c.title.chars().count(), 81, "80 chars + the ellipsis");
+        assert!(c.title.ends_with('…'));
+
+        // Multi-byte (Chinese) description: byte slicing would split a char;
+        // the char-boundary truncation must not.
+        let mut state = MappingState::new();
+        let chinese = "描述".repeat(60); // 120 chars, 240 bytes
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_task_2"),
+            name: "task".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_p", "msg_p", "call_task_2"),
+            text: format!("{{\"description\":\"{chinese}\"}}"),
+        });
+        let updates = to_updates(&ended, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert_eq!(c.title.chars().count(), 81, "80 chars + the ellipsis");
+        assert!(c.title.is_char_boundary(c.title.len()), "no mid-char split");
+    }
+
+    /// Fallback chain: a missing, empty, or whitespace-only `description`
+    /// falls back to the tool name ("subagent"/"task" — the pre-0.7.1
+    /// title).
+    #[test]
+    fn spawner_blank_description_falls_back_to_tool_name() {
+        for (text, name, expected) in [
+            ("{\"agent\":\"explorer\",\"prompt\":\"go\"}", "subagent", "subagent"),
+            (
+                "{\"agent\":\"explorer\",\"description\":\"\",\"prompt\":\"go\"}",
+                "subagent",
+                "subagent",
+            ),
+            (
+                "{\"agent\":\"explorer\",\"description\":\"   \",\"prompt\":\"go\"}",
+                "task",
+                "task",
+            ),
+        ] {
+            let mut state = MappingState::new();
+            let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_p", "msg_p", "call_z"),
+                name: name.into(),
+            });
+            let _ = to_updates(&started, &mut state);
+            let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+                base: tool_ref("ses_p", "msg_p", "call_z"),
+                text: text.to_string(),
+            });
+            let updates = to_updates(&ended, &mut state);
+            let SessionUpdate::ToolCall(c) = &updates[0] else {
+                panic!("declaration expected for {text}")
+            };
+            assert_eq!(c.title, expected, "fallback for {text}");
+        }
+    }
+
+    /// `input.ended` skipped entirely: `called` introduces with the same
+    /// description title (the input is on hand there).
+    #[test]
+    fn spawner_called_introduces_description_when_ended_missed() {
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            name: "subagent".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            input: serde_json::json!({"agent": "explorer", "description": "List the repo"}),
+            executed: None,
+        });
+        let updates = to_updates(&called, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("called-first must declare the spawner card")
+        };
+        assert_eq!(c.title, "List the repo");
+        assert_eq!(c.status, acp::ToolCallStatus::InProgress);
+    }
+
+    /// A spawner's TERMINAL update stays consistent with the declared card
+    /// title: when the server metadata carries a `title`, a spawner uses
+    /// the description-derived title instead; non-spawner tools keep the
+    /// server title (e.g. the edited file's name).
+    #[test]
+    fn spawner_terminal_title_syncs_to_description_when_metadata_title_present() {
+        // Spawner: metadata.title present → replaced by the description.
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            name: "subagent".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            text: "{\"description\":\"Read the repo\"}".to_string(),
+        });
+        let _ = to_updates(&ended, &mut state);
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_p", "msg_p", "call_spawn"),
+            content: None,
+            metadata: Some(dto::ToolMetadata {
+                title: Some("server-side-title".into()),
+                ..dto::ToolMetadata::default()
+            }),
+            executed: None,
+        });
+        let updates = to_updates(&success, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("completion update expected")
+        };
+        assert_eq!(u.fields.title.as_deref(), Some("Read the repo"));
+
+        // Non-spawner: metadata.title passes through untouched.
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_p", "msg_p", "call_edit"),
+            name: "edit".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_p", "msg_p", "call_edit"),
+            content: None,
+            metadata: Some(dto::ToolMetadata {
+                title: Some("notes.txt".into()),
+                ..dto::ToolMetadata::default()
+            }),
+            executed: None,
+        });
+        let updates = to_updates(&success, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("completion update expected")
+        };
+        assert_eq!(u.fields.title.as_deref(), Some("notes.txt"));
     }
 
     #[test]

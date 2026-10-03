@@ -677,6 +677,15 @@ continuation). Wire facts the pairing relies on:
   `input.ended`) and fire NO `session.created` — paired directly by the input
   field (verified: second prompt on the same child, input
   `{"agent": "explorer", "prompt": "...", "sessionID": "ses_..."}`).
+- **The spawner card's title is the dispatch `description`** (Zed's own
+  `spawn_agent` cards label with it; Release 0.7.1). The declaration is
+  DEFERRED from `input.started` to `input.ended` — the description only
+  exists in the input — so the card's first sight carries it (no "subagent"
+  flash, no retitle update). Fallback chain: the trimmed `description`
+  (truncated to 80 chars + "…", char-boundary safe on non-ASCII) → the tool
+  name. A pairing that lands before the input stream ends (synthetic
+  orderings; the real wire delivers the input ~17 ms before `session.created`)
+  declares the card at announce time with the fallback name instead.
 - **The persisted task tool part carries NO child id in `state.metadata`** —
   the child id appears inside the result content
   (`<subagent sessionID="..." state="completed">`) and in the success

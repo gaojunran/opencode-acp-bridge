@@ -147,6 +147,10 @@ usage error.
   tracking and no git invocations
 - **aft plugin compatible** — image reads map to ACP image content blocks;
   `--no-aft` opts out of the hoist adaptations
+- **Native subagent cards label with the dispatch description** (Release
+  0.7.1) — a spawner card's title is the subagent task's `description`
+  (truncated to 80 chars + "…"), matching Zed's own `spawn_agent` cards
+  instead of the bare `subagent`/`task` tool name
 
 ## Compared to the official `opencode acp`
 
