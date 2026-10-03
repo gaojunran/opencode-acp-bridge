@@ -206,6 +206,14 @@ pub struct InboxUserMessage {
 pub struct InboxPayload {
     #[serde(default)]
     pub text: Option<String>,
+    /// Attachments of the enqueued message — the server FORWARDS the
+    /// prompt's `files` here (live-verified 2026-10-03: `POST
+    /// /api/session/{id}/prompt` with a `files` body echoes them in the
+    /// `session.inbox.enqueued` payload, same shape as message-record
+    /// `files[]`). Released 0.7.2: the background listener projects them
+    /// as ResourceLink chunks for REMOTE prompts.
+    #[serde(default)]
+    pub files: Option<Vec<AttachmentFile>>,
 }
 
 /// `session.inbox.enqueued` — a message entered the session's inbox
@@ -264,6 +272,15 @@ pub struct MessageRecord {
     #[serde(rename = "type")]
     pub kind: String,
     pub id: String,
+    /// User-message attachments (`files[]` — a.k.a. the @-mention / chip
+    /// entries). Same wire shape as `InboxPayload.files` (live-verified
+    /// 2026-10-03 on 2.0.21): `{data(base64), mime, source:{type,uri},
+    /// name}`. Only the LINK fields are decoded — `data` is deliberately
+    /// NOT declared so serde skips the base64 payload (the transient bytes
+    /// stay inside the JSON parse only, never in a decoded struct).
+    /// Release 0.7.2: replayed user records restore the attachments.
+    #[serde(default)]
+    pub files: Option<Vec<AttachmentFile>>,
     // user
     #[serde(default)]
     pub text: Option<String>,
@@ -284,6 +301,27 @@ pub struct MessageRecord {
     pub tokens: Option<Usage>,
     #[serde(default)]
     pub time: Option<Value>,
+}
+
+/// One user-message attachment entry (`files[]` on user message records and
+/// on `session.inbox.enqueued` payloads — identical wire shape).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachmentFile {
+    /// Display name (the chip label, e.g. `notes.txt`).
+    pub name: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub source: Option<AttachmentSource>,
+}
+
+/// The attachment's `source` object: `{"type": "uri", "uri": "file://…"}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachmentSource {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
 }
 
 /// Assistant part, discriminated by `type`. `Unknown` swallows part kinds the

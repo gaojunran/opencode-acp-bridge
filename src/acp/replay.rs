@@ -7,11 +7,11 @@
 //! content and are skipped.
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ContentBlock, ContentChunk, ResourceLink, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 
-use crate::dto::{MessageRecord, Part, ToolState};
+use crate::dto::{AttachmentFile, MessageRecord, Part, ToolState};
 
 use super::updates::tool_result_blocks;
 
@@ -52,6 +52,15 @@ pub fn replay_updates(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
                         .message_id(record.id.as_str()),
                 ));
+                // Release 0.7.2: restore the @-attachment chips — one
+                // ResourceLink chunk per file, SAME message id (Zed merges
+                // adjacent chunks by messageId into one user message).
+                // Text first, files after — deterministic order.
+                for file in record.files.iter().flatten() {
+                    if let Some(update) = user_file_link(file, &record.id) {
+                        out.push(update);
+                    }
+                }
             }
             "assistant" => {
                 for part in record.content.iter().flatten() {
@@ -66,6 +75,27 @@ pub fn replay_updates(
         }
     }
     out
+}
+
+/// One user-message attachment → an ACP `ResourceLink` user chunk (link
+/// semantics — the bridge never decodes the base64 `data`). `None` when the
+/// file carries no usable uri (missing source / empty uri): a link without
+/// a target is worse than no link.
+pub(crate) fn user_file_link(
+    file: &AttachmentFile,
+    message_id: &str,
+) -> Option<SessionUpdate> {
+    let uri = file.source.as_ref().and_then(|s| s.uri.as_deref())?;
+    if uri.is_empty() {
+        return None;
+    }
+    let mut link = ResourceLink::new(file.name.clone(), uri.to_string());
+    if let Some(mime) = &file.mime {
+        link = link.mime_type(Some(mime.clone()));
+    }
+    Some(SessionUpdate::UserMessageChunk(
+        ContentChunk::new(ContentBlock::ResourceLink(link)).message_id(message_id),
+    ))
 }
 
 fn assistant_part(
@@ -227,7 +257,7 @@ impl HasInput for ToolState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dto::{MessagesEnvelope, StructuredError};
+    use crate::dto::{AttachmentSource, MessagesEnvelope, StructuredError};
 
     fn fixture_records() -> Vec<MessageRecord> {
         let raw = include_str!("../../tests/fixtures/messages-tool-turn.json");
@@ -364,6 +394,7 @@ mod tests {
         MessageRecord {
             kind: "assistant".into(),
             id: "msg_synthetic".into(),
+            files: None,
             text: None,
             agent: Some("build".into()),
             model: None,
@@ -435,6 +466,101 @@ mod tests {
             .unwrap();
         assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
         assert_eq!(info["message_end_index"], serde_json::json!(5));
+    }
+
+    fn link_file(name: &str, uri: Option<&str>, mime: Option<&str>) -> AttachmentFile {
+        AttachmentFile {
+            name: name.into(),
+            mime: mime.map(str::to_string),
+            source: uri.map(|u| AttachmentSource {
+                kind: Some("uri".into()),
+                uri: Some(u.into()),
+            }),
+        }
+    }
+
+    /// Release 0.7.2: a user record with `files` replays as the text chunk
+    /// followed by ONE ResourceLink chunk per file — same message id (Zed
+    /// merges adjacent chunks by messageId into one user message). Files
+    /// without a usable uri (missing source / empty uri) project nothing.
+    #[test]
+    fn user_record_with_files_replays_text_then_resource_links() {
+        let record = MessageRecord {
+            kind: "user".into(),
+            id: "msg_u_files".into(),
+            files: Some(vec![
+                link_file("notes.txt", Some("file:///tmp/notes.txt"), Some("text/plain")),
+                link_file("empty.ts", None, None),
+                link_file("README.md", Some(""), Some("text/markdown")),
+            ]),
+            text: Some("read these".into()),
+            agent: None,
+            model: None,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        let updates = replay_updates(&[record], false, &[]);
+
+        // Text first, then exactly ONE link chunk (the two degenerate files
+        // project nothing).
+        assert_eq!(updates.len(), 2, "text + one usable link");
+        let SessionUpdate::UserMessageChunk(text_chunk) = &updates[0] else {
+            panic!("first update is the text chunk");
+        };
+        assert!(matches!(
+            &text_chunk.content,
+            ContentBlock::Text(t) if t.text == "read these"
+        ));
+        let SessionUpdate::UserMessageChunk(link_chunk) = &updates[1] else {
+            panic!("second update is the link chunk");
+        };
+        let ContentBlock::ResourceLink(link) = &link_chunk.content else {
+            panic!("content is a resource link");
+        };
+        assert_eq!(link.name, "notes.txt");
+        assert_eq!(link.uri, "file:///tmp/notes.txt");
+        assert_eq!(link.mime_type.as_deref(), Some("text/plain"));
+        for chunk in [text_chunk, link_chunk] {
+            assert_eq!(
+                chunk.message_id.as_ref().map(|m| m.0.as_ref()),
+                Some("msg_u_files"),
+                "text and links share the user message id"
+            );
+        }
+    }
+
+    /// The live 2.0.21 wire shape (captured 2026-10-03): the record carries
+    /// the base64 `data` — the bridge does NOT decode it (serde skips the
+    /// unknown field) and replays only the link fields.
+    #[test]
+    fn user_record_decodes_files_and_skips_base64_data() {
+        let raw = r#"{"id":"msg_att","time":{"created":0,"updated":0},
+            "text":"capture attachment shape",
+            "files":[{"data":"aGVsbG8gYXR0YWNobWVudA==","mime":"text/plain",
+                      "source":{"type":"uri","uri":"file:///tmp/acr-attach/notes.txt"},
+                      "name":"notes.txt"}],
+            "type":"user"}"#;
+        let rec: MessageRecord = serde_json::from_str(raw).expect("decode");
+        let files = rec.files.as_ref().expect("files decoded");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "notes.txt");
+        assert_eq!(files[0].mime.as_deref(), Some("text/plain"));
+        assert_eq!(
+            files[0].source.as_ref().and_then(|s| s.uri.as_deref()),
+            Some("file:///tmp/acr-attach/notes.txt")
+        );
+
+        // The decoded record replays as text + link, like the live user saw
+        // before reload.
+        let updates = replay_updates(&[rec], false, &[]);
+        assert_eq!(updates.len(), 2, "text chunk + resource link chunk");
+        let SessionUpdate::UserMessageChunk(c) = &updates[1] else { panic!() };
+        assert!(matches!(&c.content, ContentBlock::ResourceLink(_)));
+        assert_eq!(c.message_id.as_ref().map(|m| m.0.as_ref()), Some("msg_att"));
     }
 
     /// Unmatched calls carry no meta; an EMPTY child list replays the parent

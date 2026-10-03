@@ -151,6 +151,11 @@ usage error.
   0.7.1) — a spawner card's title is the subagent task's `description`
   (truncated to 80 chars + "…"), matching Zed's own `spawn_agent` cards
   instead of the bare `subagent`/`task` tool name
+- **@-attachments survive reload** (Release 0.7.2) — user message `files[]`
+  (the `@`-mention chips) are replayed as ACP `ResourceLink` chunks (and a
+  remote frontend's prompt attachments are re-emitted by the background
+  listener), so reloading an agent keeps the file chips instead of showing
+  bare text
 
 ## Compared to the official `opencode acp`
 

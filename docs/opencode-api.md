@@ -743,6 +743,22 @@ subagents outliving the parent turn stay visible — the exact v0.5.0 gap) +
 drive the parent's task card while the spawner call is still declared. Remote
 (TUI) turns announce/pair/close exactly like local ones.
 
+### User-message attachments (`@`-files, Release 0.7.2)
+
+The server's user message records (`GET …/message`) and the remote
+`session.inbox.enqueued` payloads carry a `files[]` array — the `@`-mention
+chip entries (live-verified 2026-10-03: a `POST /api/session/{id}/prompt`
+with a `files` body echoes them into the inbox event, same shape as the
+persisted records): `{data(base64), mime, source:{type,uri}, name}`. The
+bridge decodes ONLY the link fields (`name`, `source.uri`, `mime`) — `data`
+is deliberately left undeclared so serde skips the base64 payload — and
+re-emits each file as an ACP `ResourceLink` user chunk right after the text
+chunk, with the SAME message id (Zed merges adjacent chunks by messageId
+into one user message, restoring the chips after a reload). This applies to
+the replay path (`session/load` — the reload bug fix) and to the background
+listener's remote-prompt projection (the server DOES forward files there).
+Files without a usable uri are skipped.
+
 ### Replay (`session/load` of a parent)
 
 The parent's replay keeps parent content only (task call + its result — the

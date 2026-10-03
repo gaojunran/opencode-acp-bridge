@@ -2277,6 +2277,7 @@ mod tests {
                     text: Some(
                         "You are a subagent spawned by another session.\nDo the thing".into(),
                     ),
+                    files: None,
                 }),
             }),
         });
@@ -2323,6 +2324,7 @@ mod tests {
         let record = |kind: &str, tools: usize| crate::dto::MessageRecord {
             kind: kind.into(),
             id: "msg_x".into(),
+            files: None,
             text: None,
             agent: None,
             model: None,

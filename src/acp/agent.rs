@@ -2732,14 +2732,38 @@ impl AgentService {
             // consumed on match).
             self.stage_pending(&session_id).await;
             tracing::debug!(session = %session_id, "remote turn: user message chunk");
-            let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
-                .message_id(inbox.inboxID.as_str());
-            return cx
-                .send_notification(acp::SessionNotification::new(
-                    session_id.clone(),
-                    acp::SessionUpdate::UserMessageChunk(chunk),
-                ))
-                .is_ok();
+            // Release 0.7.2: the server forwards the prompt's `files` in the
+            // inbox payload (live-verified) — RE-EMIT them as ResourceLink
+            // chunks after the text chunk (same inbox id → Zed merges) so a
+            // remote frontend's @-attachments stay visible.
+            let text_chunk =
+                acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+                    .message_id(inbox.inboxID.as_str());
+            let mut updates = vec![acp::SessionUpdate::UserMessageChunk(text_chunk)];
+            for file in inbox
+                .item
+                .as_ref()
+                .and_then(|i| i.payload.as_ref())
+                .and_then(|p| p.files.as_ref())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(update) = replay::user_file_link(file, &inbox.inboxID) {
+                    updates.push(update);
+                }
+            }
+            for update in updates {
+                if cx
+                    .send_notification(acp::SessionNotification::new(
+                        session_id.clone(),
+                        update,
+                    ))
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         // Remote agent/model switches (own-switch echo suppression falls out
@@ -5130,6 +5154,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("remote turn two".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -5205,6 +5230,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("You are a subagent spawned by another session.\ngo".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -5428,6 +5454,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("first task".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -5495,6 +5522,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("continue".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -5694,6 +5722,7 @@ mod tests {
         let spawner_call: dto::MessageRecord = dto::MessageRecord {
             kind: "assistant".into(),
             id: "msg_p".into(),
+            files: None,
             text: None,
             agent: Some("orchestrator".into()),
             model: None,
@@ -5717,6 +5746,7 @@ mod tests {
         let user_msg = dto::MessageRecord {
             kind: "user".into(),
             id: "msg_u".into(),
+            files: None,
             text: Some("use the subagent".into()),
             agent: None,
             model: None,
@@ -5814,6 +5844,7 @@ mod tests {
         backend.set_messages(vec![dto::MessageRecord {
             kind: "assistant".into(),
             id: "msg_p".into(),
+            files: None,
             text: None,
             agent: None,
             model: None,
@@ -6677,6 +6708,7 @@ mod tests {
         dto::MessageRecord {
             kind: kind.into(),
             id: format!("{kind}-rec"),
+            files: None,
             text: None,
             agent: agent.map(str::to_string),
             model: None,
@@ -6782,6 +6814,7 @@ mod tests {
         dto::MessageRecord {
             kind: kind.into(),
             id: format!("{kind}-rec"),
+            files: None,
             text: None,
             agent: agent.map(str::to_string),
             model,
@@ -8175,7 +8208,10 @@ mod tests {
                 sessionID: Some("ses_mock_1".into()),
                 item: Some(dto::InboxEventItem {
                     kind: Some("user".into()),
-                    payload: Some(dto::InboxPayload { text: Some("do the thing remotely".into()) }),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("do the thing remotely".into()),
+                        files: None,
+                    }),
                 }),
             }));
             backend.remote_push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
@@ -8288,6 +8324,97 @@ mod tests {
         )));
     }
 
+    /// Release 0.7.2: a REMOTE prompt with @-attachments — the server
+    /// FORWARDS the prompt's `files` in the inbox payload (live-verified
+    /// 2026-10-03) — projects the text chunk AND one ResourceLink chunk per
+    /// usable file (same inbox id → Zed merges both into one user message).
+    /// Files without a usable uri project nothing.
+    #[tokio::test]
+    async fn background_remote_prompt_with_attachments_projects_resource_links() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_remote_att".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("read the attached file".into()),
+                        files: Some(vec![
+                            dto::AttachmentFile {
+                                name: "notes.txt".into(),
+                                mime: Some("text/plain".into()),
+                                source: Some(dto::AttachmentSource {
+                                    kind: Some("uri".into()),
+                                    uri: Some("file:///tmp/opencode/acp-v072-live/notes.txt".into()),
+                                }),
+                            },
+                            // Degenerate: no source at all → no link chunk.
+                            dto::AttachmentFile {
+                                name: "broken.md".into(),
+                                mime: None,
+                                source: None,
+                            },
+                        ]),
+                    }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            wait_for(&collected, |n| {
+                n.iter()
+                    .filter(|x| matches!(&x.update, acp::SessionUpdate::UserMessageChunk(_)))
+                    .count()
+                    == 2
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        let user_chunks: Vec<&acp::ContentChunk> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::UserMessageChunk(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(user_chunks.len(), 2, "text chunk + one usable link chunk");
+        // Text first, then the link — deterministic order.
+        assert!(matches!(
+            &user_chunks[0].content,
+            acp::ContentBlock::Text(t) if t.text == "read the attached file"
+        ));
+        let acp::ContentBlock::ResourceLink(link) = &user_chunks[1].content else {
+            panic!("second user chunk is a resource link");
+        };
+        assert_eq!(link.name, "notes.txt");
+        assert_eq!(link.uri, "file:///tmp/opencode/acp-v072-live/notes.txt");
+        assert_eq!(link.mime_type.as_deref(), Some("text/plain"));
+        for c in &user_chunks {
+            assert_eq!(
+                c.message_id.as_ref().map(|m| m.0.as_ref()),
+                Some("msg_remote_att"),
+                "text and links share the inbox id as message id"
+            );
+        }
+    }
+
     /// While a LOCAL turn is in flight on a session, the background
     /// listener drops that session's server-wide events (the per-turn loop
     /// already delivers them) — no double push. After the turn, the
@@ -8330,6 +8457,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("remote during local".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -8547,6 +8675,7 @@ mod tests {
                     kind: Some("user".into()),
                     payload: Some(dto::InboxPayload {
                         text: Some("remote child prompt".into()),
+                        files: None,
                     }),
                 }),
             }));
@@ -8995,7 +9124,10 @@ mod tests {
                 sessionID: Some("ses_other_frontend".into()),
                 item: Some(dto::InboxEventItem {
                     kind: Some("user".into()),
-                    payload: Some(dto::InboxPayload { text: Some("stranger".into()) }),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("stranger".into()),
+                        files: None,
+                    }),
                 }),
             }));
             backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
