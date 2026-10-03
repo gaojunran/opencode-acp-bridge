@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UsageUpdate,
 };
 
 use crate::dto::{self, ToolContent, ToolMetadata};
@@ -89,6 +90,13 @@ pub struct MappingState {
     /// but not yet completed/failed. Read by the cancel drain to abandon
     /// stragglers with `Failed` + "Cancelled".
     open_tools: HashSet<String>,
+    /// ToolCallIds already DECLARED to the client as an initial `ToolCall`
+    /// (Release 0.3.2). ACP requires the declaration before any
+    /// `ToolCallUpdate` — Zed otherwise renders a "Tool call not found"
+    /// placeholder card. Filled on the FIRST emission for each id; keyed by
+    /// the FINAL (namespaced) id like `open_tools`, so child projections
+    /// declare their own calls.
+    introduced_tools: HashSet<String>,
     /// Pending automatic retry (from `session.retry.scheduled`) — cleared on
     /// the next `step.started`, folded into the PromptResponse `_meta` when
     /// the turn ends before the retry fires.
@@ -141,6 +149,30 @@ impl MappingState {
                 )
             })
             .collect()
+    }
+
+    /// Release 0.3.2: declare a tool call to the client on its FIRST
+    /// emission — ACP requires the initial `ToolCall` before any
+    /// `ToolCallUpdate` (the live path historically pushed updates only,
+    /// which Zed renders as a "Tool call not found" placeholder). Returns
+    /// the initial `ToolCall` update, or `None` when the id was already
+    /// introduced.
+    pub(crate) fn introduce_tool(
+        &mut self,
+        id: &str,
+        title: String,
+        kind: ToolKind,
+        status: ToolCallStatus,
+        raw_input: Option<serde_json::Value>,
+    ) -> Option<SessionUpdate> {
+        if !self.introduced_tools.insert(id.to_string()) {
+            return None;
+        }
+        let mut call = ToolCall::new(id.to_string(), title).kind(kind).status(status);
+        if let Some(input) = raw_input {
+            call = call.raw_input(input);
+        }
+        Some(SessionUpdate::ToolCall(call))
     }
 
     /// Pending retry meta object (the value for `_meta["opencode/retry"]`).
@@ -303,12 +335,25 @@ fn to_tool_updates(
             let id = tool_call_id(ns, &t.base.id);
             state.tool_titles.insert(id.clone(), t.name.clone());
             state.open_tool(id.clone());
-            vec![tool_update(
+            // Release 0.3.2: the initial `ToolCall` declaration rides the
+            // first emission (the client must see the call before any update).
+            let mut out = Vec::with_capacity(2);
+            if let Some(decl) = state.introduce_tool(
+                &id,
+                tool_title(ns, &t.name),
+                tool_kind(&t.name),
+                ToolCallStatus::Pending,
+                None,
+            ) {
+                out.push(decl);
+            }
+            out.push(tool_update(
                 &id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Pending)
                     .title(tool_title(ns, &t.name)),
-            )]
+            ));
+            out
         }
         dto::SessionEvent::ToolInputEnded(t) => {
             // `text` is the raw JSON input string — pass it through verbatim
@@ -318,25 +363,65 @@ fn to_tool_updates(
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
                 state.tool_inputs.insert(id.clone(), parsed);
             }
-            vec![tool_update(
+            // Degenerate introduced-here case (input.started skipped): no
+            // name on the event — the id itself is the only truthful title;
+            // the raw JSON input rides the declaration.
+            let mut out = Vec::with_capacity(2);
+            if let Some(decl) = state.introduce_tool(
+                &id,
+                id.clone(),
+                ToolKind::Other,
+                ToolCallStatus::Pending,
+                Some(serde_json::Value::String(t.text.clone())),
+            ) {
+                out.push(decl);
+            }
+            out.push(tool_update(
                 &id,
                 ToolCallUpdateFields::new().raw_input(serde_json::Value::String(t.text.clone())),
-            )]
+            ));
+            out
         }
         dto::SessionEvent::ToolCalled(t) => {
             // Parsed input now available → mark in progress.
             let id = tool_call_id(ns, &t.base.id);
             state.tool_inputs.insert(id.clone(), t.input.clone());
-            vec![tool_update(
+            let mut out = Vec::with_capacity(2);
+            if let Some(decl) = state.introduce_tool(
+                &id,
+                id.clone(),
+                ToolKind::Other,
+                ToolCallStatus::InProgress,
+                Some(t.input.clone()),
+            ) {
+                out.push(decl);
+            }
+            out.push(tool_update(
                 &id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::InProgress)
                     .raw_input(t.input.clone()),
-            )]
+            ));
+            out
         }
         dto::SessionEvent::ToolSuccess(t) => {
             let id = tool_call_id(ns, &t.base.id);
             state.close_tool(&id);
+            // Introduce-with-terminal when the whole lifecycle was missed
+            // (no input events at all): the event's own title field, then
+            // the indexed tool name, then the id.
+            let title = t
+                .metadata
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .or_else(|| state.tool_titles.get(&id).cloned())
+                .unwrap_or_else(|| id.clone());
+            let mut out = Vec::with_capacity(2);
+            if let Some(decl) =
+                state.introduce_tool(&id, title, ToolKind::Other, ToolCallStatus::Completed, None)
+            {
+                out.push(decl);
+            }
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             if let Some(meta) = &t.metadata {
                 if let Some(title) = &meta.title {
@@ -353,11 +438,27 @@ fn to_tool_updates(
                     fields = fields.content(Some(blocks));
                 }
             }
-            vec![tool_update(&id, fields)]
+            out.push(tool_update(&id, fields));
+            out
         }
         dto::SessionEvent::ToolFailed(t) => {
             let id = tool_call_id(ns, &t.base.id);
             state.close_tool(&id);
+            let mut out = Vec::with_capacity(2);
+            let title = state
+                .tool_titles
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            if let Some(decl) = state.introduce_tool(
+                &id,
+                title,
+                ToolKind::Other,
+                ToolCallStatus::Failed,
+                None,
+            ) {
+                out.push(decl);
+            }
             // v1 has no error field on tool updates: the failure surfaces as
             // `Failed` with the error message in the raw output.
             let message = t
@@ -365,12 +466,13 @@ fn to_tool_updates(
                 .message
                 .clone()
                 .unwrap_or_else(|| "Tool execution failed".to_string());
-            vec![tool_update(
+            out.push(tool_update(
                 &id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Failed)
                     .raw_output(serde_json::Value::String(message)),
-            )]
+            ));
+            out
         }
         _ => vec![],
     }
@@ -513,6 +615,17 @@ fn tool_update(
     fields: ToolCallUpdateFields,
 ) -> SessionUpdate {
     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string(), fields))
+}
+
+/// Release 0.3.2: conservative ACP `ToolKind` from an opencode tool name —
+/// the obvious families only (file-modifying tools → `Edit`, read-family →
+/// `Read`); anything else stays `Other` (unknown tools are not guessed).
+fn tool_kind(name: &str) -> ToolKind {
+    match name {
+        "edit" | "write" | "apply_patch" => ToolKind::Edit,
+        "read" | "grep" | "glob" => ToolKind::Read,
+        _ => ToolKind::Other,
+    }
 }
 
 /// Shared helper: tool result content → ACP `ToolCallContent` (text blocks
@@ -976,6 +1089,153 @@ mod tests {
         assert_eq!(u.fields.title, Some("Cancelled".into()));
     }
 
+    // ================ Release 0.3.2: declare-before-update ================
+
+    /// (a) The captured LIVE turn (real server stream, fixture) — every tool
+    /// call id is DECLARED via `ToolCall` (non-unknown id + non-empty title)
+    /// before its first `ToolCallUpdate`. This is the fix for Zed's
+    /// "Tool call not found" placeholder cards.
+    #[test]
+    fn live_turn_introduces_every_call_before_its_first_update() {
+        let events = decode_fixture();
+        let mut state = MappingState::new();
+        let mut introduced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut declarations = 0usize;
+        for ev in &events {
+            for u in to_updates(ev, &mut state) {
+                match u {
+                    SessionUpdate::ToolCall(c) => {
+                        declarations += 1;
+                        assert!(!c.title.is_empty(), "declared call must carry a title");
+                        let id = c.tool_call_id.0.as_ref().to_string();
+                        assert!(id.starts_with("call_"), "id must be a real call id, got {id}");
+                        assert!(
+                            introduced.insert(id),
+                            "an id must be declared at most once"
+                        );
+                    }
+                    SessionUpdate::ToolCallUpdate(u) => {
+                        let id = u.tool_call_id.0.as_ref().to_string();
+                        assert!(
+                            introduced.contains(&id),
+                            "update for {id} arrived before any tool_call declaration"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(declarations, 1, "the live fixture has one tool call");
+        assert!(introduced.contains("call_9663d4974690464f98d40e7c"));
+        // The declaration carries the tool name as title (input.started arm)
+        // and an edit-family kind for `write`.
+        let mut state = MappingState::new();
+        let all: Vec<SessionUpdate> =
+            events.iter().flat_map(|ev| to_updates(ev, &mut state)).collect();
+        let SessionUpdate::ToolCall(c) = all.iter().find(|u| matches!(u, SessionUpdate::ToolCall(_))).expect("fixture has a declaration") else {
+            panic!("the fixture's first tool emission must be the declaration")
+        };
+        assert_eq!(c.title, "write");
+        assert_eq!(c.kind, acp::ToolKind::Edit);
+    }
+
+    /// (b) Out-of-order lifecycle starting at `called` (input.started
+    /// skipped): the `called` arm introduces with `InProgress` + the parsed
+    /// input, then updates. A later event must NOT re-introduce.
+    #[test]
+    fn called_first_still_introduces_with_in_progress() {
+        let mut state = MappingState::new();
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_x", "msg_x", "call_x"),
+            input: serde_json::json!({ "command": "ls" }),
+            executed: None,
+        });
+        let updates = to_updates(&called, &mut state);
+        assert_eq!(updates.len(), 2, "declaration + update");
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("first emission must be the initial tool_call")
+        };
+        assert_eq!(c.tool_call_id.0.as_ref(), "call_x");
+        assert_eq!(c.status, acp::ToolCallStatus::InProgress);
+        assert_eq!(c.raw_input, Some(serde_json::json!({ "command": "ls" })));
+        let SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
+            panic!("expected the tool_call update")
+        };
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::InProgress));
+
+        // No re-declaration on the next event for the same id.
+        let updates = to_updates(&called, &mut state);
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(&updates[0], SessionUpdate::ToolCallUpdate(_)));
+    }
+
+    /// (c) No input events at all: success- and failure-first sequences
+    /// introduce with the TERMINAL status directly.
+    #[test]
+    fn terminal_first_introduces_with_terminal_status() {
+        let mut state = MappingState::new();
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_x", "msg_x", "call_ok"),
+            content: None,
+            metadata: None,
+            executed: None,
+        });
+        let updates = to_updates(&success, &mut state);
+        assert_eq!(updates.len(), 2);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("success-first must declare the call")
+        };
+        assert_eq!(c.tool_call_id.0.as_ref(), "call_ok");
+        assert_eq!(c.status, acp::ToolCallStatus::Completed, "terminal status, not pending");
+        assert_eq!(c.title, "call_ok", "no title anywhere → the id fallback");
+
+        let mut state = MappingState::new();
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_x", "msg_x", "call_err"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("boom".into()),
+            },
+        });
+        let updates = to_updates(&failed, &mut state);
+        assert_eq!(updates.len(), 2);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("failure-first must declare the call")
+        };
+        assert_eq!(c.status, acp::ToolCallStatus::Failed);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
+            panic!("expected the tool_call update")
+        };
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+    }
+
+    /// The kind mapping is deliberately conservative: write/edit/apply_patch
+    /// → Edit, read/grep/glob → Read, everything else → Other.
+    #[test]
+    fn tool_kind_mapping_is_conservative() {
+        let mut state = MappingState::new();
+        for (name, kind) in [
+            ("write", acp::ToolKind::Edit),
+            ("edit", acp::ToolKind::Edit),
+            ("apply_patch", acp::ToolKind::Edit),
+            ("read", acp::ToolKind::Read),
+            ("grep", acp::ToolKind::Read),
+            ("glob", acp::ToolKind::Read),
+            ("bash", acp::ToolKind::Other),
+            ("weird_custom_tool", acp::ToolKind::Other),
+        ] {
+            let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_x", "msg_x", &format!("call_{name}")),
+                name: name.into(),
+            });
+            let updates = to_updates(&started, &mut state);
+            let SessionUpdate::ToolCall(c) = &updates[0] else {
+                panic!("expected the initial tool_call")
+            };
+            assert_eq!(c.kind, kind, "kind for {name}");
+        }
+    }
+
     // ======================= Wave 5: aft hoist dialect =======================
 
     /// Decoded ToolSuccess events of an aft capture, in fixture order.
@@ -1016,7 +1276,15 @@ mod tests {
 
         let mut state = MappingState::new();
         let updates = to_updates(&dto::SessionEvent::ToolSuccess(successes[0].clone()), &mut state);
-        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+        // Release 0.3.2: success-first introductions declare the call with
+        // its terminal status, then update.
+        assert_eq!(updates.len(), 2);
+        let acp::SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("expected the initial tool_call declaration")
+        };
+        assert_eq!(c.tool_call_id.0.as_ref(), "call_45f029f2a7754b23a4c05df2");
+        assert_eq!(c.status, acp::ToolCallStatus::Completed);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
             panic!("expected a tool_call update")
         };
         let blocks = u.fields.content.as_ref().expect("content present");
@@ -1044,7 +1312,7 @@ mod tests {
         // --no-aft: image passthrough off, text stays.
         let mut no_aft = MappingState::new().with_no_aft(true);
         let updates = to_updates(&dto::SessionEvent::ToolSuccess(successes[0].clone()), &mut no_aft);
-        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
             panic!("expected a tool_call update")
         };
         let blocks = u.fields.content.as_ref().expect("content present");
@@ -1068,7 +1336,10 @@ mod tests {
             .map(|t| {
                 let updates =
                     to_updates(&dto::SessionEvent::ToolSuccess(t.clone()), &mut state);
-                let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+                // Release 0.3.2: [ToolCall, ToolCallUpdate] for these
+                // success-first sequences.
+                assert!(matches!(&updates[0], acp::SessionUpdate::ToolCall(_)));
+                let acp::SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
                     panic!("expected a tool_call update")
                 };
                 u.fields
@@ -1215,8 +1486,16 @@ mod tests {
             name: "grep".into(),
         });
         let updates = to_child_updates(&started, &ns, &mut state);
-        assert_eq!(updates.len(), 1);
-        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+        // Release 0.3.2: the initial declaration precedes the update.
+        assert_eq!(updates.len(), 2);
+        let acp::SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("expected the initial tool_call declaration")
+        };
+        assert_eq!(c.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
+        assert_eq!(c.title, "Explore the repo: grep");
+        assert_eq!(c.kind, acp::ToolKind::Read, "grep is a read-family tool");
+        assert_eq!(c.status, acp::ToolCallStatus::Pending);
+        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
             panic!("expected a tool_call update")
         };
         assert_eq!(u.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
