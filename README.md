@@ -98,6 +98,10 @@ usage error.
   same sessions on the same server
 - **Streaming turns** — text, reasoning, and tool-call events; cancel maps to
   interrupt with a bounded drain of in-flight tools
+- **Live sync of other frontends' turns** — a persistent background
+  listener streams turns started in the TUI (or any other frontend) into the
+  connected editor: user messages, text/reasoning, tool calls, usage, and
+  remote agent/model switches — no reload needed
 - **Editor attachments** — `@`-file references and pasted images travel to
   the server as opencode attachments; unmapped block types degrade to a
   warning, never an error

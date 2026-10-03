@@ -84,7 +84,9 @@ async fn open_event_stream(
 }
 
 /// Reconnect delay for the n-th attempt: 1 s, 2 s, 4 s, then 5 s cap.
-fn backoff(attempt: u32) -> Duration {
+/// `pub(crate)`: the background listener (Release 0.5.0) reuses the same
+/// escalation for its initial-connect retry loop.
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let secs = 2u64.saturating_pow(attempt.saturating_sub(1)).min(BACKOFF_CAP_SECS);
     Duration::from_secs(secs.max(1))
 }
@@ -213,6 +215,7 @@ mod tests {
             SessionCreated(_) => "session.created",
             AgentSelected(_) => "session.agent.selected",
             ModelSelected(_) => "session.model.selected",
+            InboxEnqueued(_) => "session.inbox.enqueued",
         }
     }
 

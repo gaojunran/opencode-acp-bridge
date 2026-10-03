@@ -557,6 +557,90 @@ pickers as session config options (`session/set_config_option`):
    Advertised via `sessionCapabilities.fork` (unstable, enabled by the
    `unstable_session_fork` umbrella feature the bridge pins).
 
+## Background listener: live sync of remote turns (Release 0.5.0)
+
+The per-turn SSE subscription (`event_stream(sessionID)`, opened inside the
+turn loop before each prompt POST) only covers turns the bridge itself
+started. Turns started in OTHER frontends on the same opencode server (the
+TUI, the web UI, a second ACP client) were invisible to the connected ACP
+client until a `session/load` replay. Release 0.5.0 adds a persistent
+background listener: **one long-lived server-wide SSE subscription per ACP
+connection** (`event_stream_global` — the wire is `GET /api/event`, the same
+server broadcast the per-turn streams consume; the 2026-10-02 dual-subscriber
+probe confirmed the server fans every event out to all subscribers).
+
+### Lifecycle
+
+- Spawned when the connection's message loop starts (the `connect_with`
+  main closure), torn down with the connection — task-tracking drop, or a
+  notification send failure (client gone) ends it quietly. It never panics
+  and never blocks the serve loop.
+- First connect is eager and retried with the SSE module's backoff (1 s → 2 s
+  → 4 s → 5 s cap); after the first connect the stream reconnects internally.
+
+### Routing rules (per event)
+
+1. Catalog reloads (`model.updated` / `provider.updated`, no session):
+   push the full config-options state to every registered session WITHOUT a
+   local turn in flight (the per-turn loop pushes for its own in-turn
+   session).
+2. Session NOT in the bridge's registry (`self.sessions`, populated by
+   `session/new`, `session/load`, `session/resume`, `session/fork`) →
+   ignored. Child (subagent) sessions are not registered → their traffic is
+   ignored too (remote subagent projection is out of scope).
+3. Session HAS an in-flight LOCAL turn (`in_turn` flag, set by the turn loop
+   around its full lifecycle including the cancel drain) → the event is
+   DROPPED, no state, no push: the turn loop's own subscription delivers it.
+4. Otherwise → projected (below).
+
+### Projection surface (byte-compatible with the turn loop's push)
+
+- `session.inbox.enqueued` with a `user` item → one `user_message_chunk`
+  (text + the inbox id as `messageId`) — the remote frontend's prompt text,
+  which the ACP client cannot otherwise see.
+- Text/reasoning deltas → `agent_message_chunk` / `agent_thought_chunk`.
+- Tool events → declaration-before-update via the same `MappingState`
+  machinery (introduce-on-first-sight: a tool first seen after a frozen
+  window gets a synthesized declaration from its own fields).
+- `usage.updated` → `usage_update`; retry/compaction/rename → the same
+  info-update mapping as the turn loop.
+- `session.agent.selected` / `session.model.selected` / `step.started`
+  agent/model → tracked mode/model (echo suppression via tracked-first
+  comparison) + `current_mode_update` and the full `config_option_update`
+  push (capability-gated).
+- The projector state is SESSION-scoped: created on demand when a remote
+  turn's activity starts, cleared at the terminal event
+  (`execution.succeeded` / `execution.failed` / `execution.interrupted`) —
+  each remote turn starts with fresh declarations.
+- Terminal events themselves push nothing (the client has no open prompt).
+- `permission.asked` during a remote turn is NOT forwarded: the frontend
+  that started the turn owns the ask and answers it there (the server
+  accepts the first reply); the bridge would only double-prompt or hang the
+  turn.
+
+### Suppression of the local user message
+
+The turn loop records the enqueued user message's inbox id (from the prompt
+POST response) on the session entry; the listener matches
+`session.inbox.enqueued` against it (consuming the id on match) and drops it.
+The local user message can therefore never project as a remote user chunk —
+even when the listener processes it after the local turn already ended. The
+ACP client drafted its own prompt; a second user entry would be a duplicate.
+
+### Known degraded edge (documented, not fixed)
+
+The wire serializes executions per session (a prompt during an active turn
+is queued), so remote and local turns cannot interleave mid-execution on the
+same session. The in-turn gate still drops events processed while a local
+turn is in flight, which covers the queued-remote-turn window and the local
+turn's own tail. Residual loss — no worse than today's full loss:
+
+- Events emitted by a remote turn that races a local turn on the SAME
+  session are dropped (the local turn's own stream delivers its events).
+- Tools first seen after the frozen window get synthesized declarations
+  (introduce-on-first-sight), but any input JSON emitted during the freeze
+  is missed.
+
 ## Governance for lanes
 
 - `src/dto.rs` is the shared contract. Lanes may **add** fields (with serde defaults)

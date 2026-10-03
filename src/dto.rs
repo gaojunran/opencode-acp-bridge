@@ -203,6 +203,30 @@ pub struct InboxPayload {
     pub text: Option<String>,
 }
 
+/// `session.inbox.enqueued` — a message entered the session's inbox
+/// (Releases: 0.5.0 background listener). The bridge decodes this event so
+/// the remote-turn pusher can surface the REMOTE frontend's user message as
+/// an ACP `user_message_chunk` (the ACP client's own prompt is its draft —
+/// the local user message never projects: it is matched by inbox id). The
+/// item `type` discriminates the message kind; only `"user"` items carry a
+/// payload the ACP user-chunk mapping can use.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboxEnqueued {
+    pub inboxID: String,
+    #[serde(default)]
+    pub sessionID: Option<String>,
+    #[serde(default)]
+    pub item: Option<InboxEventItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboxEventItem {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub payload: Option<InboxPayload>,
+}
+
 // ============================================================
 // Permission
 // ============================================================
@@ -888,6 +912,12 @@ pub enum SessionEvent {
     /// layer: the agent layer consumes it for the model config-option state
     /// (with echo suppression).
     ModelSelected(SessionModelSelected),
+    // inbox
+    /// `session.inbox.enqueued` — a message entered the session's inbox.
+    /// Decoded for the Release 0.5.0 background listener (the remote
+    /// frontend's user message); the per-turn mapping layer maps it to
+    /// nothing (the ACP client authored the local prompt itself).
+    InboxEnqueued(InboxEnqueued),
 }
 
 fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
@@ -932,6 +962,7 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.created" => parse(data).map(SessionEvent::SessionCreated),
         "session.agent.selected" => parse(data).map(SessionEvent::AgentSelected),
         "session.model.selected" => parse(data).map(SessionEvent::ModelSelected),
+        "session.inbox.enqueued" => parse(data).map(SessionEvent::InboxEnqueued),
         _ => None,
     }
 }
@@ -943,8 +974,9 @@ mod tests {
     /// The full successful tool turn capture must decode end-to-end: every
     /// frame parses as an envelope, every ACP-relevant kind decodes.
     /// Skipped-by-design kinds: plugin `rpc.*`, `server.connected`,
-    /// `session.inbox.*` (the bridge gets the inbox message from the prompt
-    /// response, not from events).
+    /// `session.inbox.delivered` (delivery confirmations replay the enqueued
+    /// message — the bridge maps `session.inbox.enqueued` and would push the
+    /// user chunk twice).
     #[test]
     fn decode_tool_turn_capture() {
         let raw = include_str!("../tests/fixtures/sse-tool-turn.sse");
@@ -960,7 +992,7 @@ mod tests {
             let skipped = env.kind.starts_with("rpc.")
                 || matches!(
                     env.kind.as_str(),
-                    "server.connected" | "session.inbox.enqueued" | "session.inbox.delivered"
+                    "server.connected" | "session.inbox.delivered"
                 );
             if skipped {
                 continue;
@@ -999,7 +1031,6 @@ mod tests {
                 || matches!(
                     env.kind.as_str(),
                     "server.connected"
-                        | "session.inbox.enqueued"
                         | "session.inbox.delivered"
                         | "project.updated"
                         | "session.instructions.updated"
@@ -1103,7 +1134,6 @@ mod tests {
                 || matches!(
                     env.kind.as_str(),
                     "server.connected"
-                        | "session.inbox.enqueued"
                         | "session.inbox.delivered"
                         | "project.updated"
                         | "session.instructions.updated"
@@ -1166,7 +1196,7 @@ mod tests {
                 serde_json::from_str(line.strip_prefix("data: ").expect("data: prefix"))
                     .expect("envelope parses");
             match env.kind.as_str() {
-                "server.connected" | "session.inbox.enqueued" | "session.inbox.delivered" => {}
+                "server.connected" | "session.inbox.delivered" => {}
                 "session.compaction.started" => {
                     let SessionEvent::CompactionStarted(started) =
                         decode_event(&env.kind, &env.data).expect("started decodes")
@@ -1241,7 +1271,6 @@ mod tests {
                 || matches!(
                     env.kind.as_str(),
                     "server.connected"
-                        | "session.inbox.enqueued"
                         | "session.inbox.delivered"
                         | "project.updated"
                         | "session.instructions.updated"

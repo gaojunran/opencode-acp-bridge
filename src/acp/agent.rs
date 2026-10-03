@@ -54,13 +54,17 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     /// entries (`{type:"file", url, filename, mime}`) derived from the ACP
     /// prompt's Image/ResourceLink/Resource blocks — `file://` urls are
     /// resolved by the opencode server (co-located with the client). Returns
-    /// once enqueued — the turn itself plays out on the event stream.
+    /// once enqueued — the turn itself plays out on the event stream. The
+    /// Ok value (Release 0.5.0) is the enqueued user message's inbox id,
+    /// when the backend can report it: the background listener matches
+    /// `session.inbox.enqueued` against it so the LOCAL user message never
+    /// projects as a remote `user_message_chunk`.
     fn prompt(
         &self,
         session_id: &str,
         text: &str,
         files: &[dto::PromptFile],
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+    ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>>;
 
     /// Interrupt a running turn (`session/cancel`).
     fn interrupt(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
@@ -73,6 +77,17 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
 
     /// The session-tagged event stream (see trait docs for the contract).
     fn event_stream(&self, session_id: &str) -> BoxFuture<'_, Result<EventStream, anyhow::Error>>;
+
+    /// Release 0.5.0: the SERVER-WIDE event stream — every session's events,
+    /// regardless of which frontend started the turn (the background
+    /// remote-turn listener subscribes once per connection and keeps the
+    /// subscription alive). The live impl shares the wire with
+    /// [`Self::event_stream`] (both are `GET /api/event`, the server
+    /// broadcasts); the default is unavailable so mocks can model the two
+    /// consumers separately.
+    fn event_stream_global(&self) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("event_stream_global not available on this backend")) })
+    }
 
     /// Answer an opencode permission prompt (Wave 3). Called once the ACP
     /// client has decided on a `session/request_permission`; the decision is
@@ -210,6 +225,39 @@ struct SessionEntry {
     /// `step.started` models. `config_option_update` pushes fire only on an
     /// ACTUAL change — which suppresses the own-switch SSE echo.
     model: Mutex<Option<dto::ModelRef>>,
+    /// Release 0.5.0: a LOCAL turn (`session/prompt`) is in flight. Set by
+    /// the turn loop around its full lifecycle (including the cancel drain);
+    /// the background remote-turn listener drops this session's events while
+    /// set — the per-turn loop's own subscription already delivers them, and
+    /// a second projection would duplicate every notification.
+    in_turn: AtomicBool,
+    /// Release 0.5.0: the inbox message id of the in-flight local turn's
+    /// enqueued user message (from the prompt POST response, when the
+    /// backend reports it). The background listener matches
+    /// `session.inbox.enqueued` against it and consumes the id on match, so
+    /// the LOCAL user message can never project as a remote
+    /// `user_message_chunk` — even when the listener processes it after the
+    /// local turn already ended.
+    local_inbox_id: Mutex<Option<String>>,
+}
+
+/// Release 0.5.0: scope guard clearing a session's `in_turn` flag on drop —
+/// the local turn's full lifecycle (including the cancel drain and every
+/// early-return path) keeps the background listener from projecting the
+/// turn's events a second time.
+struct InTurnGuard(Arc<SessionEntry>);
+
+impl InTurnGuard {
+    fn new(entry: Arc<SessionEntry>) -> Self {
+        entry.in_turn.store(true, Ordering::Release);
+        Self(entry)
+    }
+}
+
+impl Drop for InTurnGuard {
+    fn drop(&mut self) {
+        self.0.in_turn.store(false, Ordering::Release);
+    }
 }
 
 impl AgentService {
@@ -374,7 +422,28 @@ impl AgentService {
                 },
                 on_receive_notification!(),
             )
-            .connect_to(transport)
+            // Release 0.5.0: connect_with — the default main_fn
+            // (`incoming_closed` + `drain_outgoing`) plus the background
+            // remote-turn listener, which lives for the whole connection:
+            // one server-wide SSE subscription per connection, started when
+            // the message loop starts, torn down with it.
+            .connect_with(
+                transport,
+                {
+                    let svc = Arc::clone(&self);
+                    async move |cx: ConnectionTo<Client>| {
+                        if let Err(e) = svc.spawn_background_listener(cx.clone()) {
+                            tracing::error!(error = %e, "background listener spawn failed");
+                        }
+                        // NOTE: `drain_outgoing` is private to the crate —
+                        // connect_to's default main_fn runs it; here we only
+                        // wait for the close. The listener task is dropped
+                        // with the connection either way.
+                        cx.incoming_closed().await;
+                        Ok(())
+                    }
+                },
+            )
             .await
     }
 
@@ -485,6 +554,8 @@ impl AgentService {
                 // turn, and config documents have no default-model field.
                 // UNKNOWN is surfaced as the synthetic "__default__" option.
                 model: Mutex::new(None),
+                in_turn: AtomicBool::new(false),
+                local_inbox_id: Mutex::new(None),
             }),
         );
         tracing::info!(%session_id, modes = %modes.len(), current_mode = ?current, "ACP newSession -> opencode session");
@@ -626,6 +697,8 @@ impl AgentService {
                 cwd: req.cwd.to_string_lossy().to_string(),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
+                in_turn: AtomicBool::new(false),
+                local_inbox_id: Mutex::new(None),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
@@ -981,6 +1054,8 @@ impl AgentService {
                 cwd: cwd.clone(),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
+                in_turn: AtomicBool::new(false),
+                local_inbox_id: Mutex::new(None),
             }),
         );
         let mut response = if modes.is_empty() {
@@ -1073,6 +1148,8 @@ impl AgentService {
                 cwd: req.cwd.to_string_lossy().to_string(),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
+                in_turn: AtomicBool::new(false),
+                local_inbox_id: Mutex::new(None),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
@@ -1122,6 +1199,12 @@ impl AgentService {
                 })),
             );
         };
+        // Release 0.5.0: mark the local turn in flight for the background
+        // remote-turn listener — its per-session events are dropped while
+        // this is set (the per-turn loop's own subscription delivers them).
+        // The guard clears the flag on EVERY exit path, including the
+        // cancel drain.
+        let _in_turn = InTurnGuard::new(Arc::clone(&entry));
 
         // ACP prompt block → opencode prompt body mapping (official 2.0.21
         // adapter semantics): Text appends to `text`; Image / ResourceLink /
@@ -1256,9 +1339,19 @@ impl AgentService {
                 ));
             }
         };
-        if let Err(e) = backend.prompt(&req.session_id.0, &text, &files).await {
-            tracing::error!(error = %e, "backend prompt failed");
-            return responder.respond_with_internal_error(format!("prompt failed: {e}"));
+        let inbox_id = match backend.prompt(&req.session_id.0, &text, &files).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "backend prompt failed");
+                return responder.respond_with_internal_error(format!("prompt failed: {e}"));
+            }
+        };
+        // Remember the enqueued user message's inbox id: the background
+        // listener matches `session.inbox.enqueued` against it (consuming
+        // the id on match) so the LOCAL user message never projects as a
+        // remote user chunk — regardless of when the listener processes it.
+        if let Some(id) = inbox_id.filter(|id| !id.is_empty()) {
+            *entry.local_inbox_id.lock().expect("inbox lock") = Some(id);
         }
 
         let mut state = updates::MappingState::new().with_no_aft(self.no_aft);
@@ -1916,6 +2009,325 @@ impl AgentService {
         }
         Ok(())
     }
+
+    // ============================================================
+    // Release 0.5.0: the background remote-turn listener
+    // ============================================================
+
+    /// Spawn the one-per-connection background listener on the client's
+    /// task pool. The task owns a server-wide SSE subscription and projects
+    /// turns started in OTHER frontends into the connected ACP client. The
+    /// task ends when the connection tears down (the task-tracking future is
+    /// dropped) or when a notification send fails (the client is gone).
+    fn spawn_background_listener(
+        self: &Arc<Self>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let svc = Arc::clone(self);
+        let task_cx = cx.clone();
+        cx.spawn(async move { svc.background_listener_loop(task_cx).await })
+    }
+
+    /// The listener loop. The stream reconnects internally after the first
+    /// successful connect; the FIRST connect is eager and retried here with
+    /// the same backoff. Events route through
+    /// [`Self::handle_background_event`]; a send failure (client gone) ends
+    /// the loop quietly — it must never panic and never block the serve
+    /// loop (the serve loop only ever sends notifications, so a blocked
+    /// listener cannot block it either).
+    async fn background_listener_loop(
+        self: Arc<Self>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let mut attempt = 0u32;
+        let mut stream = loop {
+            match self.backend.event_stream_global().await {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "background listener: server-wide event stream connect failed"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(crate::opencode::sse::backoff(attempt)).await;
+                }
+            }
+        };
+        tracing::debug!("background listener: server-wide event stream connected");
+        // Session-scoped projector state: created on demand when a remote
+        // turn's activity starts, cleared at that turn's terminal event —
+        // each remote turn gets a fresh declaration set.
+        let mut projectors: HashMap<acp::SessionId, updates::MappingState> = HashMap::new();
+        while let Some(event) = stream.next().await {
+            if !self.handle_background_event(&event, &mut projectors, &cx).await {
+                tracing::debug!("background listener ending: client connection gone");
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Route one server-wide event through the background projection.
+    ///
+    /// Returns `false` when the client connection is gone (a notification
+    /// send failed) — the listener then ends quietly.
+    async fn handle_background_event(
+        self: &Arc<Self>,
+        event: &dto::SessionEvent,
+        projectors: &mut HashMap<acp::SessionId, updates::MappingState>,
+        cx: &ConnectionTo<Client>,
+    ) -> bool {
+        // Catalog reloads carry no session: push the full config-options
+        // state to every registered session WITHOUT a local turn in flight
+        // (the per-turn loop pushes for its own in-turn session on the same
+        // event — a second push here would duplicate it, hence the filter).
+        if matches!(
+            event,
+            dto::SessionEvent::ModelUpdated(_) | dto::SessionEvent::ProviderUpdated(_)
+        ) {
+            let idle: Vec<(acp::SessionId, Arc<SessionEntry>)> = self
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .iter()
+                .filter(|(_, entry)| !entry.in_turn.load(Ordering::Acquire))
+                .map(|(sid, entry)| (sid.clone(), entry.clone()))
+                .collect();
+            for (sid, entry) in idle {
+                self.push_config_options(&sid, &entry, cx).await;
+            }
+            return true;
+        }
+
+        // Everything else must be routable to a session; `session.created`
+        // and future id-less kinds are not projectable.
+        let Some(session_id) = updates::event_session_id(event) else {
+            return true;
+        };
+        let session_id = acp::SessionId::from(session_id.to_string());
+        // Only sessions the client asked to see (created/loaded/resumed
+        // through this connection). Unregistered traffic is ignored.
+        let Some(entry) = self.sessions.lock().expect("sessions lock").get(&session_id).cloned()
+        else {
+            return true;
+        };
+
+        // A local turn owns the session's stream: the per-turn loop already
+        // delivers these events. Drop — never project (a projection here
+        // would duplicate the turn loop's notifications).
+        if entry.in_turn.load(Ordering::Acquire) {
+            return true;
+        }
+
+        // The remote frontend's user message → `user_message_chunk` (the
+        // ACP client authored its own prompt, but a REMOTE prompt's text is
+        // invisible without this). The LOCAL turn's own message never
+        // projects: its inbox id (recorded by the turn loop from the prompt
+        // POST response) is matched and consumed here — the match still
+        // fires when the listener processes the event after the local turn
+        // already ended.
+        if let dto::SessionEvent::InboxEnqueued(inbox) = event {
+            let is_user = inbox.item.as_ref().and_then(|i| i.kind.as_deref()) == Some("user");
+            let Some(text) = inbox
+                .item
+                .as_ref()
+                .and_then(|i| i.payload.as_ref())
+                .and_then(|p| p.text.clone())
+            else {
+                return true;
+            };
+            if !is_user {
+                return true;
+            }
+            {
+                let mut local = entry.local_inbox_id.lock().expect("inbox lock");
+                if local.as_deref() == Some(inbox.inboxID.as_str()) {
+                    *local = None;
+                    return true;
+                }
+            }
+            tracing::debug!(session = %session_id, "remote turn: user message chunk");
+            let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+                .message_id(inbox.inboxID.as_str());
+            return cx
+                .send_notification(acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::UserMessageChunk(chunk),
+                ))
+                .is_ok();
+        }
+
+        // Remote agent/model switches (own-switch echo suppression falls out
+        // of the tracked-first comparison; the config-option push is
+        // capability-gated inside push_config_options). `AgentSelected` /
+        // `ModelSelected` are consumed; `step.started` continues below.
+        match self.track_background_agent_model(&session_id, event, &entry, cx).await {
+            BgTrackOutcome::Consumed => return true,
+            BgTrackOutcome::Stop => return false,
+            BgTrackOutcome::Continue => {}
+        }
+
+        // Terminal events close the session's projector window: the next
+        // remote turn starts with fresh declaration state.
+        if matches!(
+            event,
+            dto::SessionEvent::ExecutionSucceeded(_)
+                | dto::SessionEvent::ExecutionFailed(_)
+                | dto::SessionEvent::ExecutionInterrupted(_)
+        ) {
+            projectors.remove(&session_id);
+            return true;
+        }
+
+        // Project through the SAME machinery as the turn loop
+        // (`to_updates` + `to_tool_updates`; tool declarations are
+        // introduce-on-first-sight, so a tool first seen after a frozen
+        // window gets a synthesized declaration from its own fields).
+        let state = projectors
+            .entry(session_id.clone())
+            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        for update in updates::to_updates(event, state) {
+            if cx
+                .send_notification(acp::SessionNotification::new(session_id.clone(), update))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Mirror of the turn loop's mode/model tracking, for the background
+    /// listener: `session.agent.selected`, `session.model.selected` and
+    /// `step.started` agent/model drive the tracked values (own-switch echo
+    /// suppression falls out of the tracked-first comparison) and push the
+    /// full config-options state on an actual change.
+    async fn track_background_agent_model(
+        self: &Arc<Self>,
+        session_id: &acp::SessionId,
+        event: &dto::SessionEvent,
+        entry: &SessionEntry,
+        cx: &ConnectionTo<Client>,
+    ) -> BgTrackOutcome {
+        let event_agent: Option<&str> = match event {
+            dto::SessionEvent::AgentSelected(sel) if sel.sessionID == session_id.0.as_ref() => {
+                Some(&sel.agent)
+            }
+            dto::SessionEvent::StepStarted(s)
+                if s.session.sessionID == session_id.0.as_ref() =>
+            {
+                s.agent.as_deref()
+            }
+            _ => None,
+        };
+        let event_model: Option<&dto::ModelRef> = match event {
+            dto::SessionEvent::ModelSelected(sel) if sel.sessionID == session_id.0.as_ref() => {
+                Some(&sel.model)
+            }
+            dto::SessionEvent::StepStarted(s)
+                if s.session.sessionID == session_id.0.as_ref() =>
+            {
+                s.model.as_ref()
+            }
+            _ => None,
+        };
+        if event_agent.is_none() && event_model.is_none() {
+            return BgTrackOutcome::Continue;
+        }
+        let mut any_changed = false;
+        if let Some(agent) = event_agent {
+            let changed = {
+                let mut mode = entry.mode.lock().expect("mode lock");
+                if mode.as_deref() != Some(agent) {
+                    *mode = Some(agent.to_string());
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                any_changed = true;
+                tracing::info!(
+                    session = %session_id,
+                    agent,
+                    "remote agent switch: current mode -> {agent}"
+                );
+                if cx
+                    .send_notification(acp::SessionNotification::new(
+                        session_id.clone(),
+                        acp::SessionUpdate::CurrentModeUpdate(
+                            acp::CurrentModeUpdate::new(agent.to_string()),
+                        ),
+                    ))
+                    .is_err()
+                {
+                    return BgTrackOutcome::Stop;
+                }
+            } else {
+                tracing::debug!(
+                    session = %session_id,
+                    agent,
+                    "remote agent echo suppressed (tracked mode unchanged)"
+                );
+            }
+        }
+        if let Some(model) = event_model {
+            let changed = {
+                let mut tracked = entry.model.lock().expect("model lock");
+                if tracked
+                    .as_ref()
+                    .map(|m| (m.providerID.as_str(), m.id.as_str()))
+                    != Some((model.providerID.as_str(), model.id.as_str()))
+                {
+                    *tracked = Some(model.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                any_changed = true;
+                tracing::info!(
+                    session = %session_id,
+                    model = %format!("{}/{}", model.providerID, model.id),
+                    "remote model switch: current model -> {}/{}",
+                    model.providerID,
+                    model.id
+                );
+            } else {
+                tracing::debug!(
+                    session = %session_id,
+                    model = %format!("{}/{}", model.providerID, model.id),
+                    "remote model echo suppressed (tracked model unchanged)"
+                );
+            }
+        }
+        if any_changed {
+            // Full config-options push (both options, current values) so
+            // the model/agent pickers stay honest.
+            self.push_config_options(session_id, entry, cx).await;
+        }
+        // `AgentSelected` / `ModelSelected` have no ACP update mapping —
+        // consumed here; `step.started` continues (retry-clear bookkeeping).
+        if matches!(
+            event,
+            dto::SessionEvent::AgentSelected(_) | dto::SessionEvent::ModelSelected(_)
+        ) {
+            BgTrackOutcome::Consumed
+        } else {
+            BgTrackOutcome::Continue
+        }
+    }
+}
+
+/// Outcome of [`AgentService::track_background_agent_model`]: the event was
+/// consumed (no generic mapping), the client connection is gone (stop the
+/// listener), or the event continues into the generic projection.
+enum BgTrackOutcome {
+    Consumed,
+    Stop,
+    Continue,
 }
 
 // ============================================================
@@ -2209,6 +2621,15 @@ mod tests {
     /// stale replay.
     events_tx: Mutex<broadcast::Sender<dto::SessionEvent>>,
     pending: Mutex<Vec<dto::SessionEvent>>,
+        /// Release 0.5.0: event bus for the BACKGROUND listener (the
+        /// server-wide stream). Deliberately separate from the turn bus:
+        /// `push()` models the per-turn loop's own subscription while
+        /// `remote_push()` models the server-wide broadcast the background
+        /// listener subscribes to — the live wire is one broadcast the two
+        /// consumers both hear, but the per-turn path must never be driven
+        /// by remote pushes (the turn loop has its own subscription), so
+        /// the mock keeps exact per-consumer delivery.
+        remote_tx: Mutex<broadcast::Sender<dto::SessionEvent>>,
         messages_out: Mutex<Option<Vec<dto::MessageRecord>>>,
         /// Wave 6a: set by `messages()` — resume must never call it.
         messages_called: AtomicBool,
@@ -2259,8 +2680,10 @@ mod tests {
     impl MockBackend {
         fn new() -> Arc<Self> {
             let (tx, _rx) = broadcast::channel(1024);
+            let (remote_tx, _remote_rx) = broadcast::channel(1024);
             Arc::new(Self {
                 events_tx: Mutex::new(tx),
+                remote_tx: Mutex::new(remote_tx),
                 pending: Mutex::new(Vec::new()),
                 messages_out: Mutex::new(None),
                 messages_called: AtomicBool::new(false),
@@ -2297,6 +2720,20 @@ mod tests {
             // another turn starts before it is drained — no test does that.
             self.pending.lock().expect("pending lock").push(event.clone());
             let _ = self.events_tx.lock().expect("tx lock").send(event);
+        }
+
+        /// Release 0.5.0: push an event onto the background (server-wide)
+        /// bus only — the remote-turn listener's sole input. Turn-loop
+        /// subscriptions never see it.
+        fn remote_push(&self, event: dto::SessionEvent) {
+            let _ = self.remote_tx.lock().expect("tx lock").send(event);
+        }
+
+        /// Release 0.5.0: how many live background subscriptions exist
+        /// right now — proves the listener connects at serve start and
+        /// terminates with the connection.
+        fn remote_subscription_count(&self) -> usize {
+            self.remote_tx.lock().expect("tx lock").receiver_count()
         }
 
         fn set_messages(&self, records: Vec<dto::MessageRecord>) {
@@ -2409,12 +2846,12 @@ mod tests {
             session_id: &str,
             text: &str,
             files: &[dto::PromptFile],
-        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
             self.prompt_bodies
                 .lock()
                 .expect("prompt lock")
                 .push((session_id.to_string(), text.to_string(), files.to_vec()));
-            Box::pin(async { Ok(()) })
+            Box::pin(async { Ok(None) })
         }
 
         fn interrupt(&self, _session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
@@ -2460,6 +2897,29 @@ mod tests {
                 });
                 let stream: EventStream =
                     Box::pin(futures_util::stream::iter(ledger).chain(live));
+                Ok(stream)
+            })
+        }
+
+        /// Release 0.5.0: the background listener's server-wide stream —
+        /// the remote bus, live only (no pending replay: the listener
+        /// subscribes once at serve start and stays subscribed).
+        fn event_stream_global(
+            &self,
+        ) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
+            let tx = self.remote_tx.lock().expect("tx lock").clone();
+            Box::pin(async move {
+                let rx = tx.subscribe();
+                let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => return Some((event, rx)),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                });
+                let stream: EventStream = Box::pin(stream);
                 Ok(stream)
             })
         }
@@ -5875,5 +6335,540 @@ mod tests {
                 dto::PromptFile::new("file:///tmp/blob.bin", "blob.bin", "application/octet-stream"),
             ]
         );
+    }
+
+    // ============ Release 0.5.0: background remote-turn listener ============
+
+    /// A full remote (other-frontend) turn driven through the mock's
+    /// server-wide bus: the user message surfaces as a user chunk, text as
+    /// agent chunks, the tool call is declared BEFORE its first update, and
+    /// the terminal event closes the turn.
+    #[tokio::test]
+    async fn background_projects_full_remote_turn() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            // Wait until the listener's server-wide subscription is live
+            // before pushing (broadcast events before subscribe are lost).
+            wait_for_listener(&backend).await;
+
+            // The remote frontend's prompt text (session.inbox.enqueued).
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_remote_1".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload { text: Some("do the thing remotely".into()) }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            let base = dto::ToolRef {
+                sessionID: "ses_mock_1".into(),
+                assistantMessageID: "msg_remote_1".into(),
+                id: "call_remote_1".into(),
+            };
+            backend.remote_push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: base.clone(),
+                name: "read".into(),
+            }));
+            backend.remote_push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                base: base.clone(),
+                input: serde_json::json!({ "path": "/tmp/x" }),
+                executed: Some(true),
+            }));
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: base.clone(),
+                content: Some(vec![dto::ToolContent::Text { text: "file contents".into() }]),
+                metadata: None,
+                executed: Some(true),
+            }));
+            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_remote_1".into(),
+                    ordinal: Some(0),
+                },
+                delta: "remote reply".into(),
+            }));
+            backend.remote_push(dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
+                session: dto::SessionRef { sessionID: "ses_mock_1".into() },
+                cost: None,
+                tokens: Some(dto::Usage {
+                    input: Some(7),
+                    output: Some(3),
+                    reasoning: None,
+                    cache: None,
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            // Wait for the LAST projected notification (the usage update
+            // precedes the terminal event in stream order): everything
+            // before it has been processed and pushed in order.
+            wait_for(&collected, |n| {
+                n.iter().any(|x| matches!(&x.update, acp::SessionUpdate::UsageUpdate(u) if u.used == 10))
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        assert!(notifications.iter().all(|n| &*n.session_id.0 == "ses_mock_1"));
+        // The remote user message: exactly one user chunk, its text + the
+        // inbox id as the message id.
+        let user_chunks: Vec<&acp::ContentChunk> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::UserMessageChunk(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(user_chunks.len(), 1, "the remote user message projects once");
+        assert!(matches!(
+            &user_chunks[0].content,
+            acp::ContentBlock::Text(t) if t.text == "do the thing remotely"
+        ));
+        assert_eq!(
+            user_chunks[0].message_id.as_ref().map(|m| m.0.as_ref()),
+            Some("msg_remote_1"),
+            "user chunk carries the inbox id as message id"
+        );
+        // Agent text chunk.
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::AgentMessageChunk(c)
+                if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "remote reply")
+        )));
+        // Tool: declaration BEFORE the first update (the v0.3.2 invariant),
+        // then in-progress and completed updates.
+        let decl_idx = notifications.iter().position(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::ToolCall(t) if t.tool_call_id.0.as_ref() == "call_remote_1"
+        ));
+        let first_update_idx = notifications.iter().position(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_remote_1"
+        ));
+        let (Some(decl_idx), Some(first_update_idx)) = (decl_idx, first_update_idx) else {
+            panic!("tool call declared and updated by the background path");
+        };
+        assert!(decl_idx < first_update_idx, "declaration precedes the first update");
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::ToolCallUpdate(u)
+                if u.tool_call_id.0.as_ref() == "call_remote_1"
+                    && u.fields.status == Some(acp::ToolCallStatus::Completed)
+        )));
+        // Usage summary.
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::UsageUpdate(u) if u.used == 10
+        )));
+    }
+
+    /// While a LOCAL turn is in flight on a session, the background
+    /// listener drops that session's server-wide events (the per-turn loop
+    /// already delivers them) — no double push. After the turn, the
+    /// listener is alive again and projects fresh events.
+    #[tokio::test]
+    async fn background_drops_events_during_local_turn() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            // Start a LOCAL turn; its events ride the per-turn bus.
+            let pending = cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::Text(TextContent::new("local prompt"))],
+            ));
+            // Wait until the turn loop recorded the prompt: the in-turn
+            // flag is set before the prompt POST, so this is the guarantee
+            // that the local turn is in flight.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while backend.recorded_prompt_bodies().is_empty() {
+                assert!(std::time::Instant::now() < deadline, "prompt never recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // A second frontend's turn on the SAME session, arriving while
+            // the local turn runs: the listener must drop every event.
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_remote_during".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("remote during local".into()),
+                    }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_remote_during".into(),
+                    ordinal: Some(0),
+                },
+                delta: "remote-during-local text".into(),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            // The local turn's own events (turn bus) + terminal.
+            backend.push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            backend.push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_local_1".into(),
+                    ordinal: Some(0),
+                },
+                delta: "local text".into(),
+            }));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            let prompt = pending.block_task().await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // The listener must be ALIVE after the local turn: a fresh
+            // remote event projects (waiting for it also proves the
+            // during-local pushes were processed BEFORE it — and dropped).
+            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_remote_after".into(),
+                    ordinal: Some(0),
+                },
+                delta: "remote-after text".into(),
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| matches!(
+                    &x.update,
+                    acp::SessionUpdate::AgentMessageChunk(c)
+                        if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "remote-after text")
+                ))
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        let remote_text = |n: &SessionNotification| match &n.update {
+            acp::SessionUpdate::UserMessageChunk(c) => match &c.content {
+                acp::ContentBlock::Text(t) => t.text.contains("remote during local"),
+                _ => false,
+            },
+            acp::SessionUpdate::AgentMessageChunk(c) => match &c.content {
+                acp::ContentBlock::Text(t) => t.text.contains("remote-during-local"),
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(
+            !notifications.iter().any(remote_text),
+            "no remote-turn event may project while the local turn is in flight"
+        );
+        // The LOCAL turn streamed exactly its own text once.
+        let local_chunks: Vec<&acp::ContentChunk> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::AgentMessageChunk(c)
+                    if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "local text") =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(local_chunks.len(), 1, "local turn text delivered exactly once");
+    }
+
+    /// The session-scoped projector is cleared at the turn's terminal
+    /// event: the NEXT remote turn re-declares its tool calls (a fresh
+    /// declaration set, never deduped against the previous turn).
+    #[tokio::test]
+    async fn background_projector_fresh_per_remote_turn() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+            // Two remote turns, deliberately reusing the SAME call id: a
+            // surviving projector would suppress the second declaration.
+            for _ in 0..2 {
+                let base = dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: format!("msg_turn_{}", rand_suffix()).into(),
+                    id: "call_reused".into(),
+                };
+                backend.remote_push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                    base: base.clone(),
+                    name: "read".into(),
+                }));
+                backend.remote_push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: base.clone(),
+                    input: serde_json::json!({}),
+                    executed: None,
+                }));
+                backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                    base,
+                    content: None,
+                    metadata: None,
+                    executed: None,
+                }));
+                backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+            }
+            // Wait for BOTH declarations (the second proves the projector
+            // was cleared at the first turn's terminal event).
+            wait_for(&collected, |n| {
+                n.iter()
+                    .filter(|x| matches!(
+                        &x.update,
+                        acp::SessionUpdate::ToolCall(t) if t.tool_call_id.0.as_ref() == "call_reused"
+                    ))
+                    .count()
+                    >= 2
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        let declarations: Vec<&acp::ToolCall> = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::ToolCall(t) if t.tool_call_id.0.as_ref() == "call_reused" => {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            2,
+            "each remote turn declares its tool calls fresh (projector cleared at terminal)"
+        );
+    }
+
+    /// A REMOTE model switch drives the tracked model and pushes the full
+    /// config-options state (capability-gated: without the client's
+    /// configOptions declaration, no push).
+    #[tokio::test]
+    async fn background_remote_model_switch_pushes_config_options_gated() {
+        // ---- capability declared: the push fires ----
+        let backend = MockBackend::new();
+        backend.set_models(catalog_models());
+        backend.set_agents(vec![wire_agent("build", "build", false, None)]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(init_with_config_options())
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+            backend.remote_push(dto::SessionEvent::ModelSelected(dto::SessionModelSelected {
+                sessionID: "ses_mock_1".into(),
+                model: dto::ModelRef {
+                    id: "GLM-5.3-astra".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                },
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| matches!(&x.update, acp::SessionUpdate::ConfigOptionUpdate(_)))
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        let pushes = config_option_pushes(&notifications);
+        assert_eq!(pushes.len(), 1, "one config_option_update on the remote switch");
+        let model_option = as_select(option_by_id(&pushes[0].config_options, "model"));
+        assert_eq!(
+            model_option.current_value.0.as_ref(),
+            "astra/GLM-5.3-astra",
+            "the remote switch drives the model option's current value"
+        );
+        drop(notifications);
+
+        // ---- no capability: the tracked model updates, no push ----
+        let backend = MockBackend::new();
+        backend.set_models(catalog_models());
+        backend.set_agents(vec![wire_agent("build", "build", false, None)]);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+            backend.remote_push(dto::SessionEvent::ModelSelected(dto::SessionModelSelected {
+                sessionID: "ses_mock_1".into(),
+                model: dto::ModelRef {
+                    id: "GLM-5.3-astra".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                },
+            }));
+            // Echo suppression must NOT fire a push either: push the same
+            // switch again after a beat (the tracked value is unchanged).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            backend.remote_push(dto::SessionEvent::ModelSelected(dto::SessionModelSelected {
+                sessionID: "ses_mock_1".into(),
+                model: dto::ModelRef {
+                    id: "GLM-5.3-astra".into(),
+                    providerID: "astra".into(),
+                    variant: None,
+                },
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        let notifications = collected.lock().expect("collected lock");
+        assert!(
+            config_option_pushes(&notifications).is_empty(),
+            "config_option_update is capability-gated"
+        );
+    }
+
+    /// Events for sessions this connection never registered are ignored.
+    #[tokio::test]
+    async fn background_ignores_unregistered_sessions() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            wait_for_listener(&backend).await;
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_other".into(),
+                sessionID: Some("ses_other_frontend".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload { text: Some("stranger".into()) }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_other_frontend".into(),
+                    assistantMessageID: "msg_other".into(),
+                    ordinal: Some(0),
+                },
+                delta: "stranger text".into(),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_other_frontend".into(),
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(
+            collected.lock().expect("collected lock").is_empty(),
+            "unregistered sessions produce no notifications"
+        );
+    }
+
+    /// The listener's server-wide subscription is opened when the
+    /// connection starts and torn down with it (no leak).
+    #[tokio::test]
+    async fn background_listener_terminates_with_connection() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        // The client connection ended (run_client aborted the serve task):
+        // the listener task is dropped with it, so its subscription must go.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.remote_subscription_count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener subscription did not terminate with the connection"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait until the background listener's server-wide subscription is
+    /// live (its mock stream is created inside `event_stream_global`, which
+    /// the listener calls at serve start and keeps for the connection).
+    async fn wait_for_listener(backend: &Arc<MockBackend>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.remote_subscription_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "listener never subscribed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos() as u64
     }
 }

@@ -214,6 +214,12 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
             // Kept as its own arm so the mapping is explicit and greppable.
             vec![]
         }
+        // inbox enqueued: the PER-TURN path never surfaces the user's own
+        // message (the ACP client authored the local prompt and shows its
+        // own draft). The remote-turn user chunk is produced by the
+        // background listener (agent.rs), which handles the same event
+        // before the generic mapping.
+        dto::SessionEvent::InboxEnqueued(_) => vec![],
 
         // ---------- scheduling / maintenance ----------
         dto::SessionEvent::RetryScheduled(r) => {
@@ -607,6 +613,9 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
         dto::SessionEvent::SessionCreated(_) => None,
         dto::SessionEvent::AgentSelected(sel) => Some(&sel.sessionID),
         dto::SessionEvent::ModelSelected(sel) => Some(&sel.sessionID),
+        // Release 0.5.0: inbox events ride their session id (the payload's
+        // `sessionID` is optional on the wire; absent → unroutable).
+        dto::SessionEvent::InboxEnqueued(e) => e.sessionID.as_deref(),
     }
 }
 

@@ -52,7 +52,7 @@ impl OpenCodeBackend for HttpBackend {
         session_id: &str,
         text: &str,
         files: &[crate::dto::PromptFile],
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+    ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
         let session_id = session_id.to_string();
         let req = crate::dto::PromptRequest {
             text: text.to_string(),
@@ -67,8 +67,12 @@ impl OpenCodeBackend for HttpBackend {
         };
         // The trait ties the future's lifetime to &self, so params are copied.
         Box::pin(async move {
-            self.client.prompt(&session_id, &req).await?;
-            Ok(())
+            // Release 0.5.0: report the enqueued user message's inbox id —
+            // the background listener matches `session.inbox.enqueued`
+            // against it so the LOCAL user message never projects as a
+            // remote user chunk.
+            let inbox = self.client.prompt(&session_id, &req).await?;
+            Ok(if inbox.id.is_empty() { None } else { Some(inbox.id) })
         })
     }
 
@@ -99,6 +103,29 @@ impl OpenCodeBackend for HttpBackend {
             // forwarding task then owns the connected, 'static stream and
             // pumps decoded events into the channel. Dropping the returned
             // stream drops the receiver, which ends the task.
+            let mut stream = crate::opencode::sse::event_stream(client).await?;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    if tx.send(event).is_err() {
+                        break; // consumer dropped the stream
+                    }
+                }
+            });
+            let stream: EventStream = Box::pin(futures_util::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
+            ));
+            Ok(stream)
+        })
+    }
+
+    fn event_stream_global(&self) -> BoxFuture<'_, Result<EventStream, anyhow::Error>> {
+        // The wire has no per-session filter — `GET /api/event` is the
+        // server-wide broadcast, so this is byte-identical to
+        // `event_stream`.
+        let client = self.client.clone();
+        Box::pin(async move {
             let mut stream = crate::opencode::sse::event_stream(client).await?;
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
