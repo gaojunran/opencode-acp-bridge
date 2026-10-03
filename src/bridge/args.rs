@@ -26,6 +26,12 @@ OPTIONS:
                      unstaged-changes view shows only the current turn's
                      changes. Off by default — when off, no tracking and no
                      git invocations happen.
+    --show-synthetic Render SYSTEM-INJECTED ('synthetic') inbox messages —
+                     background bash completions, subagent-completion
+                     notifications — as user message chunks, live and on
+                     replay. Off by default: they are never rendered (the
+                     wire still carries them; staging never reacts to them
+                     either way).
     --version        Print the version and exit.
     --help           Print this help and exit.
 
@@ -81,6 +87,11 @@ pub struct RunOptions {
     /// (Release 0.7.0; see `USAGE`). Off by default — zero staging behavior
     /// when off.
     pub zed_git_add: bool,
+    /// `--show-synthetic`: render system-injected ('synthetic') inbox
+    /// messages as user chunks, live and on replay (Release 0.8.1; see
+    /// `USAGE`). Off by default. Whatever the flag, synthetic/compaction/
+    /// move items NEVER trigger turn-scoped staging.
+    pub show_synthetic: bool,
 }
 
 /// Parse the argument list (argv[0] included, like `std::env::args()`).
@@ -89,8 +100,8 @@ pub struct RunOptions {
 /// - `--help` / `--version` win immediately (first one seen).
 /// - `--attach <url>`: the next token, when it does not start with `-`, is the
 ///   URL; otherwise (next flag or end of args) `--attach` is treated as bare.
-/// - `--no-aft` / `--zed-git-add`: boolean flags, may appear anywhere;
-///   rejected when repeated.
+/// - `--no-aft` / `--zed-git-add` / `--show-synthetic`: boolean flags, may
+///   appear anywhere; rejected when repeated.
 /// - any other token is a usage error; a repeated `--attach` is a usage error.
 pub fn parse_args<I>(args: I) -> ParseOutcome
 where
@@ -106,6 +117,7 @@ where
     let mut attach: Option<Option<String>> = None;
     let mut no_aft = false;
     let mut zed_git_add = false;
+    let mut show_synthetic = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -127,6 +139,14 @@ where
                     );
                 }
                 zed_git_add = true;
+            }
+            "--show-synthetic" => {
+                if show_synthetic {
+                    return ParseOutcome::Error(
+                        "duplicate --show-synthetic (run with --help for usage)".to_string(),
+                    );
+                }
+                show_synthetic = true;
             }
             "--attach" => {
                 if attach.is_some() {
@@ -163,7 +183,7 @@ where
         }
         None => ConnectMode::Default,
     };
-    ParseOutcome::Run(RunOptions { mode, no_aft, zed_git_add })
+    ParseOutcome::Run(RunOptions { mode, no_aft, zed_git_add, show_synthetic })
 }
 
 #[cfg(test)]
@@ -187,7 +207,7 @@ mod tests {
     fn attach_with_url_is_explicit_mode() {
         assert_eq!(
             parse(&["prog", "--attach", "http://127.0.0.1:44041"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false, zed_git_add: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false, zed_git_add: false, show_synthetic: false })
         );
     }
 
@@ -209,7 +229,7 @@ mod tests {
     fn no_attach_means_default_mode() {
         assert_eq!(
             parse(&["prog"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: false, show_synthetic: false })
         );
     }
 
@@ -218,7 +238,7 @@ mod tests {
         // Bare --no-aft.
         assert_eq!(
             parse(&["prog", "--no-aft"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true, zed_git_add: false })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true, zed_git_add: false, show_synthetic: false })
         );
         // With an explicit URL, in either order.
         assert_eq!(
@@ -227,6 +247,7 @@ mod tests {
                 mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
                 no_aft: true,
                 zed_git_add: false,
+                show_synthetic: false,
             })
         );
         // Bare --attach followed by --no-aft: the deferred usage error
@@ -251,7 +272,7 @@ mod tests {
     fn zed_git_add_flag_composes_with_any_attach_form() {
         assert_eq!(
             parse(&["prog", "--zed-git-add"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: true })
+            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: true, show_synthetic: false })
         );
         assert_eq!(
             parse(&["prog", "--no-aft", "--zed-git-add", "--attach", "http://127.0.0.1:44041"]),
@@ -259,6 +280,17 @@ mod tests {
                 mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
                 no_aft: true,
                 zed_git_add: true,
+                show_synthetic: false,
+            })
+        );
+        // Release 0.8.1: --show-synthetic composes with --zed-git-add.
+        assert_eq!(
+            parse(&["prog", "--show-synthetic", "--zed-git-add"]),
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: false,
+                zed_git_add: true,
+                show_synthetic: true,
             })
         );
     }

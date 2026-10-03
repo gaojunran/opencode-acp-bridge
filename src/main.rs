@@ -34,11 +34,11 @@ async fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::from(2)
         }
-        ParseOutcome::Run(opts) => run(opts.mode, opts.no_aft, opts.zed_git_add).await,
+        ParseOutcome::Run(opts) => run(opts.mode, opts.no_aft, opts.zed_git_add, opts.show_synthetic).await,
     }
 }
 
-async fn run(mode: ConnectMode, no_aft: bool, zed_git_add: bool) -> ExitCode {
+async fn run(mode: ConnectMode, no_aft: bool, zed_git_add: bool, show_synthetic: bool) -> ExitCode {
     init_tracing();
 
     let cfg = match resolve_config(&mode, &opencode_acp_bridge::bridge::config::RealEnv) {
@@ -102,7 +102,8 @@ async fn run(mode: ConnectMode, no_aft: bool, zed_git_add: bool) -> ExitCode {
     let service = Arc::new(
         AgentService::new(backend)
             .with_no_aft(no_aft)
-            .with_zed_git_add(zed_git_add),
+            .with_zed_git_add(zed_git_add)
+            .with_show_synthetic(show_synthetic),
     );
 
     // Runs until the stdio connection closes (stdin EOF → clean exit).

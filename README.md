@@ -24,6 +24,10 @@ PR #52075). This bridge attaches to a single shared server instead:
 - **per-turn diffs for Zed** — with `--zed-git-add` (opt-in), each user
   prompt stages the previous turn's edits so Zed's unstaged-changes panel
   shows exactly the current turn's diff
+- **synthetic inbox messages opt-in** — `--show-synthetic` renders the
+  server's system-injected 'synthetic' messages (background bash
+  completions, subagent-completion notifications) as user chunks, live and
+  on replay; off by default, and staging never reacts to them either way
 
 ## Install
 
@@ -91,6 +95,7 @@ To pin a specific server instead, pass the URL and password explicitly:
 | `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
 | `--no-aft` | *(composes with any connection mode)* | disables the aft tool-call hoist adaptations: File/image content passthrough in tool results; diff extraction stays enabled |
 | `--zed-git-add` | *(composes with any connection mode)* | turn-scoped staging: at each user prompt, `git add --` exactly the paths of the previous turn's native snapshot diff (`step.ended.files` — write/edit/apply_patch AND bash, see Features); accepted premise: no concurrent edits in the same directory during the turn |
+| `--show-synthetic` | *(composes with any connection mode)* | renders server-injected 'synthetic' inbox messages (background bash completions, subagent-completion notifications) as user chunks, live and on replay — off by default; synthetic/compaction/move items never trigger staging under any flag |
 
 The server is probed at startup (`GET /api/config`) and failures are
 classified — unreachable, credentials rejected, HTTP status — with the
@@ -153,6 +158,14 @@ usage error.
   the set instead of staging partial batches; `git add` failures retry 3×
   and retain for the next prompt. Off by default — with the flag off, no
   tracking and no git invocations
+- **Synthetic inbox messages** (Release 0.8.1, `--show-synthetic`) — the
+  server discriminates inbox items by `item.type`: `user` / `synthetic`
+  (system-injected: background bash completions, subagent-completion
+  notifications) / `compaction` / `move` (control plane). Synthetic
+  messages are never rendered by default and never trigger staging under
+  ANY flag — `--show-synthetic` additionally renders them as user chunks,
+  live (background listener) and on replay (same flag, same semantics).
+  Control-plane items are always skipped entirely
 - **aft plugin compatible** — image reads map to ACP image content blocks;
   `--no-aft` opts out of the hoist adaptations
 - **Native subagent cards label with the dispatch description** (Release

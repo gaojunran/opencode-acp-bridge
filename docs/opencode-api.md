@@ -86,7 +86,7 @@ present. Plugin events (`rpc.aft.*`) also flow on this stream — skip unknown t
 Order observed for one prompt that reasoned, called `write`, then replied:
 
 ```
-session.inbox.enqueued      {inboxID, sessionID, item: {type:"user", payload:{text}, delivery:"steer"}}
+session.inbox.enqueued      {inboxID, sessionID, item: {type:"user"|"synthetic"|"compaction"|"move", payload:{text, description?, metadata?, files?}, delivery:"steer"}} — the item `type` discriminates the four inbox kinds (live-verified 2026-10-03, 2.0.21)
 session.execution.started   {sessionID}
 session.inbox.delivered     {sessionID, inboxID}
 session.usage.updated       {sessionID, cost, tokens:{input,output,reasoning,cache:{read,write}}}   (×N)
@@ -844,6 +844,7 @@ covered by construction, with zero tool-name bookkeeping.
 - Ignored files, paths outside the session dir, and non-git projects are
   outside the server's snapshot scope, hence never staged.
 
+
 ### Wires & state
 
 - `session.step.ended` `files` — `dto::StepEnded.files: Option<Vec<String>>`,
@@ -876,86 +877,64 @@ covered by construction, with zero tool-name bookkeeping.
   from the temp project, and in the bridge's `zed-git-add: staged` info
   log with RUST_LOG=info).
 
-## Semantics (plugin parity + bridge deltas)
 
-The plugin's settled semantics, ported 1:1 where the wire allows:
+## Synthetic inbox messages (--show-synthetic, Release 0.8.1)
 
-- Track ONLY completed tool calls (`session.tool.success`; `ToolFailed`
-  events are never wired — the plugin's `status == "completed"` gate).
-- `write` / `edit`: `input.path` (from the mapping's per-call input cache —
-  success events carry no input on the wire; a call whose input was missed
-  (mid-attach) is skipped, like a draft without an input).
-- `apply_patch`: `result.metadata.files[].filePath` is AUTHORITATIVE when
-  present (even `files: []` falls back); otherwise parse `input.patchText`
-  headers exactly like the plugin's regexes:
-  `*** Update File: <p>` / `*** Add File: <p>` / `*** Delete File: <p>` /
-  `*** Move to: <p>` and `*** Rename File: <a> to <b>` with BOTH sides
-  (greedy ` to ` split = last separator). Garbage patchText (bogus ops,
-  empty paths, CRLF lines) tracks nothing.
-- Resolution + containment: cwd-relative paths resolve against the session
-  cwd; absolute paths pass through; `..` segments are normalized in BOTH
-  forms (the plugin only normalizes relative paths — an absolute `..` path
-  leaks its startsWith check; we close that) and anything escaping the
-  session cwd is never tracked.
-- Staging at the next user prompt, `git -C <cwd> add -- <deduped absolute
-  paths>` — EXACTLY the tracked paths (never `git add .` / `-A`: only
-  what the agent touched is staged, so the user's own edits and untracked
-  scaffolding are never swept in). No shell, no globs, `--` stops option
-  parsing.
-- Failure policy: any pre-check failure or `git add` failure (after 3
-  retries, 500 ms apart — the plugin's budget) logs a warning and RETAINS
-  the pending set; the next prompt retries. A git failure never kills the
-  user's message.
-- Log at info on success: session, path count, first path.
+### The four inbox kinds (live-verified 2026-10-03 on 2.0.21)
 
-Bridge deltas (by design, settled upstream):
+opencode's inbox admits four item kinds, discriminated by `item.type` on the
+`session.inbox.enqueued` frame (the bridge decoded it as `kind` since Release
+0.5.0 — this release makes the contract explicit):
 
-- Pending is keyed by ROOT SESSION, not project directory. A subagent
-  child's edits (events carrying the child's session id, resolved via the
-  Release 0.6.0 child tracker / `child_parents` map) accumulate under the
-  PARENT's pending set, and the PARENT's next prompt stages them together
-  with its own. A child's own prompt NEVER stages (`parent_id` is captured
-  at session/load from `GET /api/session/{id}`'s `parentID`).
-- Topology guards for the split-machine case (bridge and server may run on
-  different machines — tool-event paths are SERVER-side): every path must
-  EXIST on the bridge's local filesystem, and the session cwd must be
-  inside a git work tree (`git rev-parse --is-inside-work-tree`). Any
-  failure skips staging entirely (never a partial batch) and retains.
-  Note: a DELETED file (apply_patch `Delete File`) therefore never stages
-  (exists() fails → retained, like any pre-check failure) — the plugin,
-  which has no such guard, stages deletions via git.
-- Two triggers, one shared `stage_pending(root)`:
-  - LOCAL prompt: in the `session/prompt` handler, BEFORE the prompt POST.
-  - REMOTE prompt: the background listener's `session.inbox.enqueued`
-    handler for user items that are NOT the local turn's own suppressed
-    inbox id (local prompts were already staged by the handler).
-- Dedup: the plugin's message-id dedup is unnecessary here — a prompt
-  reaches exactly one trigger (the handler XOR the listener, since the
-  listener consumes the local inbox id).
+- `user` — a real prompt: `payload {text, files?}` (the `POST
+  /api/session/{id}/prompt` / frontend prompt).
+- `synthetic` — system/plugin-injected, via the official
+  `POST /api/session/{sessionID}/synthetic` endpoint (OpenAPI fixture:
+  `{text, description?, metadata?, delivery?, resume?}`; any `type:"synthetic"`
+  wire payload fits `{text}` only — e.g. the plan hook): background bash
+  completions (`session/tool/plugin/shell.ts` →
+  `sessions.synthetic({description: <command>, text: <shell …> block,
+  metadata: {source: "shell", …}})`) and subagent-completion notifications.
+- `compaction` / `move` — control plane, never messages.
 
-### Wires & state
+NOTE: `description` cannot discriminate synthetic from user (the plan hook's
+synthetic payload is `{text}` only, identical to a bare user prompt) — the
+`item.type` lane is the ONLY reliable discriminator.
 
-- `session.tool.success` `metadata.files[].filePath` — already decoded
-  (`dto::FileEntry`); no wire extension needed for staging.
-- `GET /api/session/{id}` `parentID` — added to `dto::SessionInfo` (serde
-  default; governance lane-add) for the loaded-child gate.
-- `git_add.rs` owns the pure logic (header parsing, containment, staging
-  with retries) — unit-tested against real temp git repos; `SessionEntry`
-  carries `git_add: Mutex<GitAddState>` (pending set) plus `parent_id`.
+### Semantics
+
+- `--show-synthetic` (default OFF): renders synthetic items as
+  `user_message_chunk` — the payload `text` (the notification body) on the
+  item's inbox id — in the LIVE background listener AND on REPLAY
+  (`kind: "synthetic"` message records; same flag, same semantics). OFF:
+  synthetic items are never rendered anywhere. Photos of the wire captured
+  during development: `tests/fixtures/openapi-2021.json` (endpoint schema)
+  plus the live probe recorded in this section.
+- **Staging guard (UNCONDITIONAL — deliberately NOT gated behind the flag):**
+  synthetic / compaction / move items NEVER trigger `stage_pending`. Staging
+  is user-initiated-only by definition; a synthetic completion notification
+  is not a prompt. The listener's inbox branch checks the item kind before
+  the local-inbox suppression / staging code, so no flag combination can
+  weaken this.
+- compaction / move items are always skipped entirely (never rendered, never
+  staged) — control plane, out of scope for message projection.
+
+### Replay
+
+`kind:"synthetic"` message records decode with the existing dto (kind is a
+free string); the replay mapping adds an explicit `"synthetic"` arm — flag on
+→ user-chunk projection (text + any usable `files[]` links, same shape as
+user records via the shared `user_message_chunks` helper), flag off → skip
+(the pre-0.8.1 behavior, now explicit).
 
 ### Verification (as shipped)
 
-- 13 `git_add.rs` unit tests (real temp git repos): header forms incl.
-  rename both sides, garbage patchText, metadata-over-headers priority,
-  empty-metadata fallback, CRLF skip, containment incl. `..` and
-  sibling-prefix escapes, exact-path staging (manual edits untouched),
-  pre-check retains (non-repo + missing path), retry-then-recover under
-  `.git/index.lock`.
-- 6 agent-level tests (MockBackend + real git repos): previous-turn staging
-  at the next prompt, metadata path staging, child-edit-under-parent, flag
-  OFF never stages (identical traffic, nothing staged), failure retains
-  then recovers, remote prompt stages the previous remote turn.
-- Live server check: see the scratch-server recipe — a session whose cwd is
-  a temp git project, prompted to edit a file, stages the file at the
-  SECOND prompt (visible in `git diff --cached` from the temp project, and
-  in the bridge's `zed-git-add: staged` info log with RUST_LOG=info).
+- 3 new tests (186 suite green): replay synthetic off/on projection;
+  agent-level — synthetic item with `--zed-git-add` on: flag off → nothing
+  rendered, nothing staged (proven by the delete-then-retain sequence: the
+  pending file deleted after the synthetic item survives to the next real
+  user prompt, whose pre-check failure retains the whole set — a staging
+  misfire would have left it in the index); flag on → synthetic renders as a
+  user chunk and compaction/move still render nothing, and the following
+  real user prompt stages normally.
+- `--show-synthetic` composes with `--zed-git-add` (args parse test).

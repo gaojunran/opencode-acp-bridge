@@ -207,6 +207,13 @@ pub struct AgentService {
     /// no git subprocess is ever spawned (leak-free gating — every staging
     /// entry point checks this flag first).
     zed_git_add: bool,
+    /// Release 0.8.1: `--show-synthetic` — render SYSTEM-INJECTED
+    /// ('synthetic') inbox messages (background bash completions,
+    /// subagent-completion notifications) as user message chunks, live and
+    /// on replay. Off by default — they are never rendered. Whatever the
+    /// flag, synthetic/compaction/move inbox items NEVER trigger
+    /// turn-scoped staging.
+    show_synthetic: bool,
     /// Release 0.3.0: whether the client declared the session config-options
     /// capability (`clientCapabilities.session.configOptions` non-null) in
     /// its initialize request. Gates the `config_options` payload in
@@ -300,6 +307,7 @@ impl AgentService {
             drain_window: std::time::Duration::from_secs(5),
             no_aft: false,
             zed_git_add: false,
+            show_synthetic: false,
             config_options_supported: AtomicBool::new(false),
         }
     }
@@ -308,6 +316,13 @@ impl AgentService {
     /// previous turn's tracked tool writes at each next user prompt.
     pub fn with_zed_git_add(mut self, zed_git_add: bool) -> Self {
         self.zed_git_add = zed_git_add;
+        self
+    }
+
+    /// Derive a service with `--show-synthetic` (Release 0.8.1): render
+    /// system-injected inbox messages as user chunks (live and replay).
+    pub fn with_show_synthetic(mut self, show_synthetic: bool) -> Self {
+        self.show_synthetic = show_synthetic;
         self
     }
 
@@ -1260,7 +1275,7 @@ impl AgentService {
         // view-creation scan loads the children. Best-effort: a failure or
         // an ambiguous match degrades to parent-only replay.
         let child_metas = self.discover_child_metas(&req.session_id.0, &records).await;
-        for update in replay::replay_updates(&records, self.no_aft, &child_metas) {
+        for update in replay::replay_updates(&records, self.no_aft, &child_metas, self.show_synthetic) {
             cx.send_notification(acp::SessionNotification::new(
                 req.session_id.clone(),
                 update,
@@ -2698,7 +2713,31 @@ impl AgentService {
         // fires when the listener processes the event after the local turn
         // already ended.
         if let dto::SessionEvent::InboxEnqueued(inbox) = event {
-            let is_user = inbox.item.as_ref().and_then(|i| i.kind.as_deref()) == Some("user");
+            // Release 0.8.1 (`--show-synthetic`): the wire discriminates
+            // inbox items by `item.type` — `user` / `synthetic` /
+            // `compaction` / `move` (live-verified 2026-10-03 on 2.0.21
+            // via POST /api/session/{id}/synthetic: the item carries
+            // {type, payload{text, description?, metadata?}, delivery}).
+            // The dto was decoding `type` into `kind` since Release 0.5.0;
+            // the listener only ever acted on "user" — synthetic items
+            // were already never rendered nor staged. This block makes the
+            // four-kind contract EXPLICIT and adds the opt-in rendering.
+            let kind = match inbox.item.as_ref().and_then(|i| i.kind.as_deref()) {
+                Some(kind) => kind,
+                // Unknown / absent item kind — conservative: never render,
+                // never stage.
+                None => return true,
+            };
+            // Control-plane items are not messages: never rendered and
+            // never staged, whatever the flag.
+            if kind == "compaction" || kind == "move" {
+                return true;
+            }
+            let is_synthetic = kind == "synthetic";
+            // System-injected messages render ONLY with `--show-synthetic`.
+            if is_synthetic && !self.show_synthetic {
+                return true;
+            }
             let Some(text) = inbox
                 .item
                 .as_ref()
@@ -2707,23 +2746,30 @@ impl AgentService {
             else {
                 return true;
             };
-            if !is_user {
-                return true;
-            }
-            {
-                let mut local = entry.local_inbox_id.lock().expect("inbox lock");
-                if local.as_deref() == Some(inbox.inboxID.as_str()) {
-                    *local = None;
-                    return true;
+            // Staging guard (Release 0.8.1 — UNCONDITIONAL, deliberately
+            // NOT gated behind `--show-synthetic`): only a genuine `user`
+            // item is a user-initiated prompt. Synthetic items are
+            // injected by the server/plugins (background bash completions,
+            // subagent-completion notifications) and must never trigger
+            // turn-scoped staging.
+            if !is_synthetic {
+                {
+                    let mut local = entry.local_inbox_id.lock().expect("inbox lock");
+                    if local.as_deref() == Some(inbox.inboxID.as_str()) {
+                        *local = None;
+                        return true;
+                    }
                 }
+                // Release 0.7.0 (`--zed-git-add`): a REMOTE user prompt
+                // stages the previous turn's tracked writes (LOCAL prompts
+                // were already staged by the prompt handler before the
+                // POST — this branch is unreachable for them: the local
+                // inbox id above is consumed on match).
+                self.stage_pending(&session_id, Some(&child_parents)).await;
+                tracing::debug!(session = %session_id, "remote turn: user message chunk");
+            } else {
+                tracing::debug!(session = %session_id, "remote turn: synthetic message chunk (--show-synthetic)");
             }
-            // Release 0.7.0 (`--zed-git-add`): a REMOTE user prompt stages
-            // the previous turn's tracked writes (LOCAL prompts were
-            // already staged by the prompt handler before the POST — this
-            // branch is unreachable for them: the local inbox id above is
-            // consumed on match).
-            self.stage_pending(&session_id, Some(&child_parents)).await;
-            tracing::debug!(session = %session_id, "remote turn: user message chunk");
             // Release 0.7.2: the server forwards the prompt's `files` in the
             // inbox payload (live-verified) — RE-EMIT them as ResourceLink
             // chunks after the text chunk (same inbox id → Zed merges) so a
@@ -5109,6 +5155,233 @@ mod tests {
                 staged_files(&repo),
                 vec!["r.txt"],
                 "remote prompt stages the previous remote turn's writes"
+            );
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    /// Release 0.8.1 (`--show-synthetic`): a SYSTEM-INJECTED ('synthetic')
+    /// inbox item is never treated as a user prompt — with the flag OFF it
+    /// is not rendered and staging is never triggered for it, and a
+    /// PROVABLE no-stage check: when the synthetic item lands while the
+    /// pending set holds a file that is then DELETED before the next real
+    /// user prompt, the pending set must survive the synthetic item — the
+    /// later user prompt's pre-check failure retains the whole set. If the
+    /// synthetic item had triggered staging, the file would already sit in
+    /// the index (staged) — the assertion below would catch it.
+    #[tokio::test]
+    async fn synthetic_inbox_default_off_skips_rendering_and_never_stages() {
+        let (_guard, repo) = make_git_repo("zed-git-add-8");
+        // a.txt lands in the pending set via a step snapshot diff BEFORE
+        // the synthetic item arrives.
+        std::fs::write(repo.join("a.txt"), "v1").unwrap();
+        let backend = MockBackend::new();
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                .with_zed_git_add(true),
+        );
+        let cwd2 = repo.to_string_lossy().to_string();
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new(&cwd2))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            backend.remote_push(step_ended("ses_mock_1", "msg_s1", Some(vec!["a.txt"])));
+            std::fs::write(repo.join("a.txt"), "v2").unwrap();
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+
+            // A synthetic completion notification (the wire shape verified
+            // 2026-10-03: item {type:"synthetic", payload:{text,
+            // description?, metadata?}, delivery}). Flag OFF → MUST NOT
+            // render, MUST NOT stage.
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_syn_1".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("synthetic".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("<shell id=\"sh_1\" state=\"completed\" command=\"sleep 2\">\ndone\n</shell>".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            // Let the listener process the synthetic item.
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(
+                staged_files(&repo).is_empty(),
+                "a synthetic item never triggers staging (a.txt must still be unstaged)"
+            );
+
+            // Now DELETE the pending file: the next REAL user prompt hits
+            // the pre-check failure and must retain the set — proving the
+            // synthetic item above never consumed it. If staging HAD run on
+            // the synthetic item, a.txt would already be in the index.
+            std::fs::remove_file(repo.join("a.txt")).unwrap();
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_user_1".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("real prompt".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| {
+                    matches!(&x.update, acp::SessionUpdate::UserMessageChunk(c)
+                        if c.message_id.as_ref().map(|m| m.0.as_ref()) == Some("msg_user_1"))
+                })
+            })
+            .await;
+            assert!(
+                staged_files(&repo).is_empty(),
+                "deleted pending file retains the set — and the synthetic item earlier never staged it"
+            );
+            let notifications = collected.lock().expect("collected lock");
+            let user_chunks = notifications
+                .iter()
+                .filter(|x| matches!(&x.update, acp::SessionUpdate::UserMessageChunk(_)))
+                .count();
+            assert_eq!(user_chunks, 1, "flag off: the synthetic item renders nothing");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    /// Release 0.8.1: with `--show-synthetic` the SAME synthetic item
+    /// renders as a user chunk (its own inbox id), while compaction/move
+    /// items never render — and staging STILL never reacts to any of them.
+    #[tokio::test]
+    async fn synthetic_inbox_renders_with_flag_and_compaction_move_skip_always() {
+        let (_guard, repo) = make_git_repo("zed-git-add-9");
+        std::fs::write(repo.join("a.txt"), "v1").unwrap();
+        let backend = MockBackend::new();
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                .with_zed_git_add(true)
+                .with_show_synthetic(true),
+        );
+        let cwd2 = repo.to_string_lossy().to_string();
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new(&cwd2))
+                .block_task()
+                .await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            backend.remote_push(step_ended("ses_mock_1", "msg_s1", Some(vec!["a.txt"])));
+            std::fs::write(repo.join("a.txt"), "v2").unwrap();
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+
+            // synthetic (renders with the flag), then a compaction and a
+            // move (never render — control plane), then a real user prompt.
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_syn_2".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("synthetic".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("background bash completed".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_compact_1".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("compaction".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("compact summary".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_move_1".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("move".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("moved elsewhere".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(
+                staged_files(&repo).is_empty(),
+                "neither synthetic nor compaction/move items ever stage"
+            );
+            // The real user prompt stages the pending set as usual.
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_user_2".into(),
+                sessionID: Some("ses_mock_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("real prompt".into()),
+                        files: None,
+                    }),
+                }),
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| {
+                    matches!(&x.update, acp::SessionUpdate::UserMessageChunk(c)
+                        if c.message_id.as_ref().map(|m| m.0.as_ref()) == Some("msg_user_2"))
+                })
+            })
+            .await;
+            assert_eq!(staged_files(&repo), vec!["a.txt"], "user prompt stages");
+
+            let notifications = collected.lock().expect("collected lock");
+            let user_chunks: Vec<&acp::ContentChunk> = notifications
+                .iter()
+                .filter_map(|n| match &n.update {
+                    acp::SessionUpdate::UserMessageChunk(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            // flag on: synthetic renders; compaction/move never do.
+            assert_eq!(user_chunks.len(), 2, "synthetic + user render, nothing else");
+            let synthetic_rendered = user_chunks.iter().any(|c| {
+                c.message_id.as_ref().map(|m| m.0.as_ref()) == Some("msg_syn_2")
+                    && matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "background bash completed")
+            });
+            assert!(synthetic_rendered, "the synthetic item renders its payload text");
+            assert!(
+                user_chunks
+                    .iter()
+                    .all(|c| c.message_id.as_ref().map(|m| m.0.as_ref()) != Some("msg_compact_1")
+                        && c.message_id.as_ref().map(|m| m.0.as_ref()) != Some("msg_move_1")),
+                "compaction/move items never render"
             );
             Ok(())
         })

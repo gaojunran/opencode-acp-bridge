@@ -42,24 +42,23 @@ pub fn replay_updates(
     records: &[MessageRecord],
     no_aft: bool,
     children: &[ReplayChildMeta],
+    show_synthetic: bool,
 ) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
     for record in records.iter().rev() {
         match record.kind.as_str() {
             "user" => {
-                let Some(text) = &record.text else { continue };
-                out.push(SessionUpdate::UserMessageChunk(
-                    ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
-                        .message_id(record.id.as_str()),
-                ));
-                // Release 0.7.2: restore the @-attachment chips — one
-                // ResourceLink chunk per file, SAME message id (Zed merges
-                // adjacent chunks by messageId into one user message).
-                // Text first, files after — deterministic order.
-                for file in record.files.iter().flatten() {
-                    if let Some(update) = user_file_link(file, &record.id) {
-                        out.push(update);
-                    }
+                out.extend(user_message_chunks(record));
+            }
+            // Release 0.8.1 (`--show-synthetic`): system-injected messages
+            // replay as user chunks ONLY with the flag on — off (default)
+            // they are skipped, matching the live listener. The wire text
+            // is the notification body (e.g. the `<shell …>` completion
+            // block); the `description` lane (background command) is not
+            // decoded — the body renders as-is, same text source as live.
+            "synthetic" => {
+                if show_synthetic {
+                    out.extend(user_message_chunks(record));
                 }
             }
             "assistant" => {
@@ -72,6 +71,29 @@ pub fn replay_updates(
             other => {
                 tracing::debug!(kind = other, "skipping unhandled message record kind");
             }
+        }
+    }
+    out
+}
+
+/// One user record (`kind: "user"` or `"synthetic"`) → its user chunks:
+/// a Text chunk for `text` plus one ResourceLink chunk per usable
+/// attachment, all on the record's message id (Zed merges adjacent chunks
+/// by messageId into one user message). Text first, files after —
+/// deterministic order. Empty records (no text, no files) yield nothing.
+fn user_message_chunks(record: &MessageRecord) -> Vec<SessionUpdate> {
+    let mut out = Vec::new();
+    if let Some(text) = &record.text {
+        out.push(SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
+                .message_id(record.id.as_str()),
+        ));
+    }
+    // Release 0.7.2: restore the @-attachment chips — one ResourceLink
+    // chunk per file, SAME message id.
+    for file in record.files.iter().flatten() {
+        if let Some(update) = user_file_link(file, &record.id) {
+            out.push(update);
         }
     }
     out
@@ -278,7 +300,7 @@ mod tests {
 
     #[test]
     fn replay_orders_history_and_maps_transcript() {
-        let updates = replay_updates(&fixture_records(), false, &[]);
+        let updates = replay_updates(&fixture_records(), false, &[], false);
 
         // 1. Chronological order: the OLDEST user message comes first.
         let first = &updates[0];
@@ -333,7 +355,7 @@ mod tests {
         // semantics in the live path).
         let streaming = replay_updates(&[record_with_tool(ToolState::Streaming {
             input: r#"{"x":1}"#.into(),
-        })], false, &[]);
+        })], false, &[], false);
         assert_eq!(streaming.len(), 1);
         let SessionUpdate::ToolCall(call) = &streaming[0] else { panic!() };
         assert_eq!(call.raw_input, Some(serde_json::Value::String(r#"{"x":1}"#.into())));
@@ -342,7 +364,7 @@ mod tests {
         let running = replay_updates(&[record_with_tool(ToolState::Running {
             input: serde_json::json!({"x": 1}),
             metadata: None,
-        })], false, &[]);
+        })], false, &[], false);
         assert_eq!(running.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &running[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
@@ -359,7 +381,7 @@ mod tests {
             content: None,
             metadata: None,
         })];
-        let updates = replay_updates(&records, false, &[]);
+        let updates = replay_updates(&records, false, &[], false);
         assert_eq!(updates.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &updates[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::Failed));
@@ -373,7 +395,7 @@ mod tests {
 
     #[test]
     fn reasoning_and_text_parts_share_the_assistant_message_id() {
-        let updates = replay_updates(&fixture_records(), false, &[]);
+        let updates = replay_updates(&fixture_records(), false, &[], false);
         // The write-tool assistant message carries a reasoning part (and no
         // text part in this capture) — the thought chunk must keep the
         // message id so clients can anchor it under the right assistant turn.
@@ -443,7 +465,7 @@ mod tests {
             session_id: "ses_child_1".into(),
             entries: 5,
         }];
-        let updates = replay_updates(&records, false, &children);
+        let updates = replay_updates(&records, false, &children, false);
         assert_eq!(updates.len(), 2, "declaration + terminal");
         // Declaration carries the meta (the view-creation scan reads it HERE
         // to discover + load the child).
@@ -483,6 +505,73 @@ mod tests {
     /// followed by ONE ResourceLink chunk per file — same message id (Zed
     /// merges adjacent chunks by messageId into one user message). Files
     /// without a usable uri (missing source / empty uri) project nothing.
+    /// Release 0.8.1 (`--show-synthetic`): `kind: "synthetic"` records
+    /// (system-injected messages — background bash completions, subagent-
+    /// completion notifications) replay as user chunks ONLY with the flag.
+    /// Default off: skipped, matching the live listener. User records are
+    /// unaffected either way.
+    #[test]
+    fn synthetic_records_skip_by_default_and_replay_with_flag() {
+        let synthetic = MessageRecord {
+            kind: "synthetic".into(),
+            id: "msg_syn".into(),
+            files: None,
+            text: Some("<shell id=\"sh_1\" state=\"completed\" command=\"sleep 2\">\ndone\n</shell>".into()),
+            agent: None,
+            model: None,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        let user = MessageRecord {
+            kind: "user".into(),
+            id: "msg_user".into(),
+            files: None,
+            text: Some("a real prompt".into()),
+            agent: None,
+            model: None,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        let records = [synthetic, user];
+
+        // Flag off (default): only the user record renders.
+        let off = replay_updates(&records, false, &[], false);
+        assert_eq!(off.len(), 1, "synthetic skipped with the flag off");
+        let SessionUpdate::UserMessageChunk(chunk) = &off[0] else {
+            panic!("the single update is the user text chunk");
+        };
+        assert!(matches!(&chunk.content, ContentBlock::Text(t) if t.text == "a real prompt"));
+
+        // Flag on: BOTH render as user chunks (records replay newest-first:
+        // the synthetic record is older, so it comes second).
+        let on = replay_updates(&records, false, &[], true);
+        assert_eq!(on.len(), 2, "synthetic renders with the flag on");
+        let SessionUpdate::UserMessageChunk(user_chunk) = &on[0] else {
+            panic!("first update is the user text chunk");
+        };
+        assert!(matches!(&user_chunk.content, ContentBlock::Text(t) if t.text == "a real prompt"));
+        let SessionUpdate::UserMessageChunk(syn_chunk) = &on[1] else {
+            panic!("second update is the synthetic text chunk");
+        };
+        assert!(matches!(
+            &syn_chunk.content,
+            ContentBlock::Text(t) if t.text.contains("<shell id=\"sh_1\"")
+        ));
+        assert_eq!(
+            syn_chunk.message_id.as_ref().map(|m| m.0.as_ref()),
+            Some("msg_syn"),
+            "synthetic record replays on its own message id"
+        );
+    }
+
     #[test]
     fn user_record_with_files_replays_text_then_resource_links() {
         let record = MessageRecord {
@@ -503,7 +592,7 @@ mod tests {
             tokens: None,
             time: None,
         };
-        let updates = replay_updates(&[record], false, &[]);
+        let updates = replay_updates(&[record], false, &[], false);
 
         // Text first, then exactly ONE link chunk (the two degenerate files
         // project nothing).
@@ -556,7 +645,7 @@ mod tests {
 
         // The decoded record replays as text + link, like the live user saw
         // before reload.
-        let updates = replay_updates(&[rec], false, &[]);
+        let updates = replay_updates(&[rec], false, &[], false);
         assert_eq!(updates.len(), 2, "text chunk + resource link chunk");
         let SessionUpdate::UserMessageChunk(c) = &updates[1] else { panic!() };
         assert!(matches!(&c.content, ContentBlock::ResourceLink(_)));
@@ -578,13 +667,13 @@ mod tests {
             session_id: "ses_child_1".into(),
             entries: 5,
         }];
-        let updates = replay_updates(&records, false, &wrong);
+        let updates = replay_updates(&records, false, &wrong, false);
         let SessionUpdate::ToolCall(call) = &updates[0] else {
             panic!("declaration expected")
         };
         assert!(call.meta.is_none(), "unmatched call stays plain");
         // Empty children → plain too.
-        let updates = replay_updates(&records, false, &[]);
+        let updates = replay_updates(&records, false, &[], false);
         let SessionUpdate::ToolCall(call) = &updates[0] else {
             panic!("declaration expected")
         };
