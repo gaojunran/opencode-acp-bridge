@@ -171,6 +171,16 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
         Box::pin(async { Err(anyhow::anyhow!("get_session not available on this backend")) })
     }
 
+    /// Release 0.6.0: the child (subagent) sessions of a parent session
+    /// (`GET /api/session?parentID=<id>` — verified against the live 2.0.21
+    /// server). Used at `session/load` replay time to discover the children
+    /// and attach their pairing meta to the replayed task calls. Default:
+    /// unavailable — replay then replays parent content only (no subagent
+    /// card discovery).
+    fn list_children(&self, _parent_id: &str) -> BoxFuture<'_, Result<Vec<dto::SessionInfo>, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("list_children not available on this backend")) })
+    }
+
     /// Release 0.3.0: switch the model running a session (`POST
     /// /api/session/{id}/model` → 204 — the model config-option wire for
     /// `session/set_config_option`). Default: unavailable; live override on
@@ -239,6 +249,12 @@ struct SessionEntry {
     /// `user_message_chunk` — even when the listener processes it after the
     /// local turn already ended.
     local_inbox_id: Mutex<Option<String>>,
+    /// Release 0.6.0: the subagent tracker of this (parent) session — pairs
+    /// the session's spawner tool calls (`task`/`subagent`) with their child
+    /// sessions and holds the persistent per-child state (entry counts,
+    /// card lines, pending buffers). Shared between the turn loop and the
+    /// background listener; serialized by the mutex.
+    subagents: Mutex<updates::SubagentTracker>,
 }
 
 /// Release 0.5.0: scope guard clearing a session's `in_turn` flag on drop —
@@ -556,6 +572,7 @@ impl AgentService {
                 model: Mutex::new(None),
                 in_turn: AtomicBool::new(false),
                 local_inbox_id: Mutex::new(None),
+                subagents: Mutex::new(updates::SubagentTracker::default()),
             }),
         );
         tracing::info!(%session_id, modes = %modes.len(), current_mode = ?current, "ACP newSession -> opencode session");
@@ -699,6 +716,7 @@ impl AgentService {
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
                 local_inbox_id: Mutex::new(None),
+                subagents: Mutex::new(updates::SubagentTracker::default()),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
@@ -1056,6 +1074,7 @@ impl AgentService {
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
                 local_inbox_id: Mutex::new(None),
+                subagents: Mutex::new(updates::SubagentTracker::default()),
             }),
         );
         let mut response = if modes.is_empty() {
@@ -1101,7 +1120,13 @@ impl AgentService {
                 ));
             }
         };
-        for update in replay::replay_updates(&records, self.no_aft) {
+        // Release 0.6.0: discover the session's children (subagents) and
+        // match them to the replayed spawner calls — the replayed task call
+        // declarations then carry `_meta.subagent_session_info` so Zed's
+        // view-creation scan loads the children. Best-effort: a failure or
+        // an ambiguous match degrades to parent-only replay.
+        let child_metas = self.discover_child_metas(&req.session_id.0, &records).await;
+        for update in replay::replay_updates(&records, self.no_aft, &child_metas) {
             cx.send_notification(acp::SessionNotification::new(
                 req.session_id.clone(),
                 update,
@@ -1150,6 +1175,7 @@ impl AgentService {
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
                 local_inbox_id: Mutex::new(None),
+                subagents: Mutex::new(updates::SubagentTracker::default()),
             }),
         );
         // No pickable modes → omit the payload (Zed renders no picker
@@ -1355,16 +1381,18 @@ impl AgentService {
         }
 
         let mut state = updates::MappingState::new().with_no_aft(self.no_aft);
-        // Child (subagent) sessions of this session, registered from
-        // `session.created {parentID}` — their tool events project into this
-        // turn as nested ACP tool calls (`${child.id}:` / `${child.title}:
-        //` prefixes, official #48232 behavior).
-        let mut children: Vec<updates::ToolNs> = Vec::new();
+        // Release 0.6.0: per-CHILD mapping states (fresh per turn — a
+        // child's call ids are unique per child session, so each turn's
+        // declarations are its own). The pairing tracker + the persistent
+        // per-child state (entry counts, card lines, pending buffers) live
+        // on the SessionEntry — shared with the background listener.
+        let mut child_states: HashMap<String, updates::MappingState> = HashMap::new();
         // Cancel drain: after `session/cancel` the loop keeps consuming the
         // stream for up to `drain_window` (official ~5s wind-down), then
         // abandons still-open tool calls as failed.
         let mut draining = false;
         let mut drain_deadline = std::time::Instant::now();
+        let parent_sid: &str = req.session_id.0.as_ref();
         loop {
             // Next event. Drain mode bounds the wait so a silent server
             // cannot hang the cancel forever.
@@ -1384,45 +1412,52 @@ impl AgentService {
                     None => break,
                 }
             };
+            let event_sid = updates::event_session_id(&event).map(str::to_string);
 
             // ---------- session filter ----------
-            // First: register children of THIS session (the wire emits
-            // `session.created` before any child event). Nothing else maps
-            // from `session.created`, so registration is the whole handling.
+            // `session.created` owns its own handling: children of THIS
+            // session are paired with their spawner calls (FIFO over the
+            // observed `task`/`subagent` calls) and the open-slice meta is
+            // announced BEFORE any child traffic. Nothing else maps from
+            // this event.
             if let dto::SessionEvent::SessionCreated(created) = &event {
-                let Some((child_id, child_title)) = created
-                    .parentID
+                if created
+                    .sessionID
                     .as_deref()
-                    .filter(|parent_id| *parent_id == req.session_id.0.as_ref())
-                    .and(created.sessionID.as_deref())
-                    .map(|child_id| {
-                        (child_id.to_string(), created.title.clone().unwrap_or_default())
-                    })
-                else {
-                    continue;
-                };
-                tracing::info!(
-                    session = %req.session_id,
-                    child = %child_id,
-                    title = %child_title,
-                    "child session registered for projection"
-                );
-                children.push(updates::ToolNs { child_id, child_title });
+                    .is_some_and(|_child_id| created.parentID.as_deref() == Some(parent_sid))
+                {
+                    let outcome = {
+                        let mut tracker = entry.subagents.lock().expect("subagents lock");
+                        updates::track_event(&mut tracker, &event, parent_sid)
+                    };
+                    if let Some((child_id, call_id, meta)) = outcome.announce {
+                        self.announce_subagent(
+                            &child_id,
+                            &call_id,
+                            meta,
+                            &mut child_states,
+                            &entry,
+                            &req,
+                            &cx,
+                        )
+                        .await?;
+                    }
+                }
                 continue;
             }
-            // Then drop other sessions' traffic — except registered
-            // children, whose events ride the same stream under their own
-            // (child) sessionID (wire-verified in subagent-child fixture).
-            let is_child_event = updates::event_session_id(&event)
-                .map(|sid| {
-                    sid != req.session_id.0.as_ref()
-                        && children.iter().any(|c| c.child_id == sid)
-                })
-                .unwrap_or(false);
-            if matches!(
-                updates::event_session_id(&event),
-                Some(sid) if sid != req.session_id.0.as_ref() && !is_child_event
-            ) {
+            // Then drop other sessions' traffic — except TRACKED children,
+            // whose events ride the same stream under their own (child)
+            // sessionID (wire-verified in the subagent fixtures).
+            let is_child_event = event_sid.as_deref().is_some_and(|sid| {
+                sid != parent_sid
+                    && entry
+                        .subagents
+                        .lock()
+                        .expect("subagents lock")
+                        .is_child(sid)
+            });
+            if matches!(event_sid.as_deref(), Some(sid) if sid != parent_sid && !is_child_event)
+            {
                 continue;
             }
 
@@ -1561,9 +1596,10 @@ impl AgentService {
             // `permission.asked` is a turn-level signal, not an update: ask
             // the ACP client and forward the decision before the turn can
             // resume. The server holds the execution until we reply. A child
-            // ask carries the CHILD's sessionID (wire-verified) — the client
-            // request is addressed to the client's own (parent) session, the
-            // reply goes to the ask's sessionID (the #48232 routing rule).
+            // ask carries the CHILD's sessionID (wire-verified) — Release
+            // 0.6.0 native mode: the client request is addressed to the CHILD
+            // session (Zed loaded it via the subagent card; plain ids, no
+            // namespace) and the reply still goes to the ask's own sessionID.
             // During the cancel drain asks are auto-rejected: the user
             // already cancelled, and the client would auto-cancel the prompt
             // anyway — but the server reply must still be sent
@@ -1583,27 +1619,64 @@ impl AgentService {
                         );
                     }
                 } else {
-                    let ns = children.iter().find(|c| c.child_id == asked.sessionID);
-                    self.forward_permission(asked, ns, &req.session_id, &mut state, &entry.cwd, &cx)
-                        .await;
+                    let child = {
+                        let tracker = entry.subagents.lock().expect("subagents lock");
+                        tracker.is_child(&asked.sessionID).then(|| asked.sessionID.clone())
+                    };
+                    self.forward_permission(
+                        asked,
+                        child.as_deref(),
+                        &req.session_id,
+                        &mut state,
+                        &entry.cwd,
+                        &cx,
+                    )
+                    .await;
                 }
                 continue;
             }
 
-            // ---------- child projection ----------
-            // Child lifecycle/text/reasoning events are not surfaced; tool
-            // events project as nested tool calls under the child namespace.
+            // ---------- Release 0.6.0: subagent pairing bookkeeping ----------
+            // Parent events feed the tracker: spawner calls (`task` /
+            // `subagent`) join the pairing queue; a direct linkage (input
+            // `sessionID` continuation, `tool.progress` metadata) pairs
+            // immediately; the spawner's terminal event produces the closing
+            // meta (attached to the mapped update below).
+            let tracker_outcome = {
+                let mut tracker = entry.subagents.lock().expect("subagents lock");
+                updates::track_event(&mut tracker, &event, parent_sid)
+            };
+            if let Some((child_id, call_id, meta)) = tracker_outcome.announce {
+                self.announce_subagent(
+                    &child_id,
+                    &call_id,
+                    meta,
+                    &mut child_states,
+                    &entry,
+                    &req,
+                    &cx,
+                )
+                .await?;
+            }
+            let completion_meta = tracker_outcome.complete;
+
+            // ---------- child events: native child-id addressing ----------
+            // Child events project as `session/update` notifications
+            // addressed to the CHILD's own session id (Zed routes them into
+            // the embedded transcript of the subagent card); tool boundaries
+            // refresh the PARENT's task card content; entries accumulate on
+            // the persistent track.
             if is_child_event {
-                if let Some(ns) = children.iter().find(|c| {
-                    updates::event_session_id(&event) == Some(c.child_id.as_str())
-                }) {
-                    for update in updates::to_child_updates(&event, ns, &mut state) {
-                        cx.send_notification(acp::SessionNotification::new(
-                            req.session_id.clone(),
-                            update,
-                        ))?;
-                    }
-                }
+                let child_id = event_sid.expect("child events carry a session id");
+                self.route_child_event(
+                    &event,
+                    &child_id,
+                    &mut child_states,
+                    &entry,
+                    &req,
+                    &cx,
+                )
+                .await?;
                 continue;
             }
 
@@ -1680,7 +1753,14 @@ impl AgentService {
                             "step failed"
                         );
                     }
-                    for update in updates::to_updates(&event, &mut state) {
+                    // Release 0.6.0: the spawner call's terminal update
+                    // carries the closing `subagent_session_info` meta.
+                    let updates = if completion_meta.is_some() {
+                        updates::to_updates_annotated(&event, &mut state, completion_meta.as_ref().map(|(_, m)| m))
+                    } else {
+                        updates::to_updates(&event, &mut state)
+                    };
+                    for update in updates {
                         cx.send_notification(acp::SessionNotification::new(
                             req.session_id.clone(),
                             update,
@@ -1703,6 +1783,105 @@ impl AgentService {
         )
     }
 
+    /// Release 0.6.0: announce a subagent pairing on the PARENT session's
+    /// task card (`tool_call_update` carrying `_meta.subagent_session_info`
+    /// with the open slice) — BEFORE any child traffic — then flush the
+    /// child's pending events in order (events buffered while the pairing
+    /// was unresolved). Never re-announced by the tracker when the values
+    /// are unchanged.
+    async fn announce_subagent(
+        self: &Arc<Self>,
+        child_id: &str,
+        call_id: &str,
+        meta: serde_json::Map<String, serde_json::Value>,
+        child_states: &mut HashMap<String, updates::MappingState>,
+        entry: &Arc<SessionEntry>,
+        req: &acp::PromptRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let update = acp::ToolCallUpdate::new(
+            call_id.to_string(),
+            acp::ToolCallUpdateFields::new(),
+        )
+        .meta(meta);
+        tracing::info!(
+            session = %req.session_id,
+            child = %child_id,
+            call = %call_id,
+            "subagent pairing announced on the task card"
+        );
+        cx.send_notification(acp::SessionNotification::new(
+            req.session_id.clone(),
+            acp::SessionUpdate::ToolCallUpdate(update),
+        ))?;
+        let pending = {
+            let mut tracker = entry.subagents.lock().expect("subagents lock");
+            tracker
+                .child_mut(child_id)
+                .map(|t| t.drain())
+                .unwrap_or_default()
+        };
+        for ev in pending {
+            self.route_child_event(&ev, child_id, child_states, entry, req, cx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Release 0.6.0: project one CHILD-session event in native subagent
+    /// mode: updates are addressed to the CHILD's own session id (Zed
+    /// routes them into the embedded transcript); tool boundaries refresh
+    /// the PARENT's task card content (throttled at call boundaries);
+    /// transcript entries accumulate on the persistent track. Children
+    /// whose pairing is unresolved buffer their events (cap 256,
+    /// drop-oldest) — the announce must precede any child traffic.
+    async fn route_child_event(
+        self: &Arc<Self>,
+        event: &dto::SessionEvent,
+        child_id: &str,
+        child_states: &mut HashMap<String, updates::MappingState>,
+        entry: &Arc<SessionEntry>,
+        req: &acp::PromptRequest,
+        cx: &ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        let child_state = child_states
+            .entry(child_id.to_string())
+            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        let (child_updates, card) = {
+            let mut tracker = entry.subagents.lock().expect("subagents lock");
+            match tracker.child_mut(child_id) {
+                Some(track) if track.parent_call.is_some() => {
+                    updates::to_child_updates(event, child_state, track)
+                }
+                // Pairing unresolved: buffer — flushed in order when the
+                // pairing lands.
+                Some(track) => {
+                    track.buffer(event.clone());
+                    (Vec::new(), None)
+                }
+                None => (Vec::new(), None),
+            }
+        };
+        let child_session = acp::SessionId::from(child_id.to_string());
+        for update in child_updates {
+            cx.send_notification(acp::SessionNotification::new(
+                child_session.clone(),
+                update,
+            ))?;
+        }
+        if let Some((call_id, content)) = card {
+            let update = acp::ToolCallUpdate::new(
+                call_id,
+                acp::ToolCallUpdateFields::new().content(Some(content)),
+            );
+            cx.send_notification(acp::SessionNotification::new(
+                req.session_id.clone(),
+                acp::SessionUpdate::ToolCallUpdate(update),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Wave 3 permission bridging: turn a `permission.asked` event into an
     /// ACP `session/request_permission`, then route the client's decision
     /// back to opencode via [`OpenCodeBackend::permission_reply`].
@@ -1717,39 +1896,34 @@ impl AgentService {
     /// other outcome (dismissed, cancelled, transport error) rejects — the
     /// "race cancel → reject" rule, and the server reply is uninterruptible.
     ///
-    /// Wave 4: `ns` is `Some` for asks raised inside a child session — the
-    /// client request is addressed to the parent session (the client only
-    /// knows one session), the tool call id/title get the child namespace
-    /// prefix, and the backend reply goes to the ask's OWN (child) sessionID
-    /// — the #48232 routing rule (wire-verified: child asks carry the child
+    /// Release 0.6.0 (native subagents): `child` is `Some` for asks raised
+    /// inside a child session — the client request is addressed to the
+    /// CHILD session (Zed loaded it via the subagent card; ids/titles stay
+    /// plain — no namespace) and the backend reply goes to the ask's OWN
+    /// (child) sessionID (wire-verified: child asks carry the child
     /// sessionID).
     async fn forward_permission(
         self: &Arc<Self>,
         asked: &dto::PermissionAsked,
-        ns: Option<&updates::ToolNs>,
+        child: Option<&str>,
         parent_session_id: &acp::SessionId,
         state: &mut updates::MappingState,
         cwd: &str,
         cx: &ConnectionTo<Client>,
     ) {
         // Tool-call identity: `source.id` (the call_* id of the triggering
-        // tool call); fall back to the permission request id. Child asks
-        // come prefixed with the child namespace.
+        // tool call); fall back to the permission request id. Plain ids in
+        // native mode (the child's own stream owns them).
         let tool_call_id = asked
             .source
             .as_ref()
             .map(|s| s.id.clone())
             .unwrap_or_else(|| asked.id.clone());
-        let tool_call_id = ns
-            .map(|n| n.tool_call_id(&tool_call_id))
-            .unwrap_or(tool_call_id);
         // Title: "<action>: <first resource>" — e.g. "shell: echo hi".
-        // Child asks get the `${child.title}: …` prefix.
         let title = match asked.resources.first() {
             Some(resource) => format!("{}: {}", asked.action, resource),
             None => asked.action.clone(),
         };
-        let title = ns.map(|n| n.title(&title)).unwrap_or(title);
         // state.input = metadata merged over the cached tool input (tool
         // input cached from tool.input.ended / tool.called by the mapping).
         let mut input = serde_json::Map::new();
@@ -1768,9 +1942,11 @@ impl AgentService {
                 .locations(vec![acp::ToolCallLocation::new(cwd)]),
         );
         let request = acp::RequestPermissionRequest::new(
-            // The client's session — the PARENT session for child asks (the
-            // client never sees child session ids on the wire).
-            parent_session_id.clone(),
+            // A child ask targets the CHILD session (the client loaded it
+            // via the subagent card); parent asks target the parent.
+            child
+                .map(|c| acp::SessionId::from(c.to_string()))
+                .unwrap_or_else(|| parent_session_id.clone()),
             update,
             Vec::from([
                 acp::PermissionOption::new(
@@ -1877,6 +2053,89 @@ impl AgentService {
             }
             None => response,
         }
+    }
+
+    /// Release 0.6.0: discover the CHILDREN of a loaded parent session and
+    /// match them to the parent's replayed spawner tool calls. Returns the
+    /// [`replay::ReplayChildMeta`] list (empty = no confident pairing).
+    ///
+    /// Pairing rule (confident-only): children sorted by creation time zip
+    /// with the parent's spawner calls in chronological order — exactly
+    /// when their counts match (the live path's FIFO pairing produces the
+    /// same order). Ambiguous cases (n children ≠ m spawner calls, e.g.
+    /// previous-turn continuations) pair nothing rather than attach a wrong
+    /// meta. Each child's `message_end_index` is its total transcript entry
+    /// count (Zed caps the embedded display to the trailing 8).
+    async fn discover_child_metas(
+        self: &Arc<Self>,
+        parent_id: &str,
+        records: &[dto::MessageRecord],
+    ) -> Vec<replay::ReplayChildMeta> {
+        let Ok(mut children) = self.backend.list_children(parent_id).await else {
+            tracing::debug!(parent = %parent_id, "replay: children discovery unavailable/failed — parent-only replay");
+            return Vec::new();
+        };
+        if children.is_empty() {
+            return Vec::new();
+        }
+        // The parent's spawner calls in chronological order (records are
+        // newest-first).
+        let calls: Vec<String> = records
+            .iter()
+            .rev()
+            .filter(|r| r.kind == "assistant")
+            .flat_map(|r| r.content.iter().flatten())
+            .filter_map(|p| match p {
+                dto::Part::Tool { id, name, .. } if updates::is_spawner_name(name) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() || calls.len() != children.len() {
+            tracing::warn!(
+                parent = %parent_id,
+                children = children.len(),
+                calls = calls.len(),
+                "replay: ambiguous child pairing (counts differ) — no subagent meta attached"
+            );
+            return Vec::new();
+        }
+        // Children by creation time (the wire `time.created` epoch ms).
+        children.sort_by_key(|c| {
+            c.time
+                .as_ref()
+                .and_then(|t| t.get("created"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        });
+        let mut metas = Vec::new();
+        for (call_id, child) in calls.into_iter().zip(children) {
+            // The child's total transcript entry count = its history
+            // (user messages + assistant messages + tool parts).
+            let entries = match self.backend.messages(&child.id).await {
+                Ok(child_records) => updates::count_entry_records(&child_records),
+                Err(e) => {
+                    tracing::warn!(
+                        child = %child.id,
+                        error = %e,
+                        "replay: child history fetch failed — pairing without entries"
+                    );
+                    0
+                }
+            };
+            metas.push(replay::ReplayChildMeta {
+                call_id,
+                session_id: child.id,
+                entries,
+            });
+        }
+        tracing::info!(
+            parent = %parent_id,
+            matched = metas.len(),
+            "replay: child sessions paired with their task calls"
+        );
+        metas
     }
 
     /// Wave 6a: initial `available_commands_update` push (full-replacement
@@ -2059,8 +2318,16 @@ impl AgentService {
         // turn's activity starts, cleared at that turn's terminal event —
         // each remote turn gets a fresh declaration set.
         let mut projectors: HashMap<acp::SessionId, updates::MappingState> = HashMap::new();
+        // Release 0.6.0: globally learned children — child session id →
+        // (parent session id, title). Populated from every `session.created`
+        // carrying a parentID; used to route child events to their own id
+        // (never registered sessions) and gate them on the PARENT's turn.
+        let mut child_parents: HashMap<String, (String, String)> = HashMap::new();
         while let Some(event) = stream.next().await {
-            if !self.handle_background_event(&event, &mut projectors, &cx).await {
+            if !self
+                .handle_background_event(&event, &mut projectors, &mut child_parents, &cx)
+                .await
+            {
                 tracing::debug!("background listener ending: client connection gone");
                 break;
             }
@@ -2076,8 +2343,76 @@ impl AgentService {
         self: &Arc<Self>,
         event: &dto::SessionEvent,
         projectors: &mut HashMap<acp::SessionId, updates::MappingState>,
+        child_parents: &mut HashMap<String, (String, String)>,
         cx: &ConnectionTo<Client>,
     ) -> bool {
+        // Release 0.6.0: learn children globally (`session.created` carries
+        // no session id — handled before the routability gate). Only
+        // parented sessions are children; root sessions are ignored here.
+        // A REGISTERED idle parent's spawner call is ALSO paired here (the
+        // announce lands on its stream like the turn loop would).
+        if let dto::SessionEvent::SessionCreated(created) = event {
+            if let (Some(child_id), Some(parent_id)) =
+                (created.sessionID.as_deref(), created.parentID.as_deref())
+            {
+                child_parents.insert(
+                    child_id.to_string(),
+                    (parent_id.to_string(), created.title.clone().unwrap_or_default()),
+                );
+                tracing::debug!(
+                    parent = %parent_id,
+                    child = %child_id,
+                    "background listener learned a child session"
+                );
+                // Pair with the parent's spawner calls (remote turns — the
+                // local turn loop does its own pairing when in flight).
+                let parent_sid = acp::SessionId::from(parent_id.to_string());
+                let parent_entry = self
+                    .sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .get(&parent_sid)
+                    .cloned();
+                if let Some(parent_entry) = parent_entry
+                    .filter(|e| !e.in_turn.load(Ordering::Acquire))
+                {
+                    let outcome = {
+                        let mut tracker = parent_entry.subagents.lock().expect("subagents lock");
+                        updates::track_event(&mut tracker, event, parent_id)
+                    };
+                    if let Some((child_id, call_id, meta)) = outcome.announce {
+                        if self
+                            .background_announce(&parent_sid, &call_id, meta, projectors, cx)
+                        {
+                            let pending = {
+                                let mut tracker =
+                                    parent_entry.subagents.lock().expect("subagents lock");
+                                tracker
+                                    .child_mut(&child_id)
+                                    .map(|t| t.drain())
+                                    .unwrap_or_default()
+                            };
+                            for ev in pending {
+                                if !self
+                                    .route_background_child(
+                                        &ev,
+                                        &child_id,
+                                        &parent_entry,
+                                        projectors,
+                                        cx,
+                                    )
+                                    .await
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
         // Catalog reloads carry no session: push the full config-options
         // state to every registered session WITHOUT a local turn in flight
         // (the per-turn loop pushes for its own in-turn session on the same
@@ -2100,11 +2435,37 @@ impl AgentService {
             return true;
         }
 
-        // Everything else must be routable to a session; `session.created`
-        // and future id-less kinds are not projectable.
+        // Everything else must be routable to a session; future id-less
+        // kinds are not projectable.
         let Some(session_id) = updates::event_session_id(event) else {
             return true;
         };
+
+        // Release 0.6.0: CHILD-events route via their PARENT (children are
+        // never registered themselves unless Zed loaded them via the
+        // subagent card). The parent's local-turn gate decides ownership:
+        // a local turn in flight on the parent → the turn loop owns the
+        // child's stream, drop here.
+        if let Some((parent_id, _title)) = child_parents.get(session_id) {
+            let parent_sid = acp::SessionId::from(parent_id.clone());
+            let Some(parent_entry) = self
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .get(&parent_sid)
+                .cloned()
+            else {
+                // The parent is not registered with this client — no view.
+                return true;
+            };
+            if parent_entry.in_turn.load(Ordering::Acquire) {
+                return true;
+            }
+            return self
+                .route_background_child(event, session_id, &parent_entry, projectors, cx)
+                .await;
+        }
+
         let session_id = acp::SessionId::from(session_id.to_string());
         // Only sessions the client asked to see (created/loaded/resumed
         // through this connection). Unregistered traffic is ignored.
@@ -2119,6 +2480,36 @@ impl AgentService {
         if entry.in_turn.load(Ordering::Acquire) {
             return true;
         }
+
+        // Release 0.6.0: subagent pairing bookkeeping for the (registered)
+        // parent session — remote turns' spawner calls pair and announce
+        // like local ones; the spawner's terminal closes the slice.
+        let tracker_outcome = {
+            let mut tracker = entry.subagents.lock().expect("subagents lock");
+            updates::track_event(&mut tracker, event, session_id.0.as_ref())
+        };
+        if let Some((child_id, call_id, meta)) = tracker_outcome.announce {
+            if self
+                .background_announce(&session_id, &call_id, meta, projectors, cx)
+            {
+                let pending = {
+                    let mut tracker = entry.subagents.lock().expect("subagents lock");
+                    tracker
+                        .child_mut(&child_id)
+                        .map(|t| t.drain())
+                        .unwrap_or_default()
+                };
+                for ev in pending {
+                    if !self
+                        .route_background_child(&ev, &child_id, &entry, projectors, cx)
+                        .await
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        let completion_meta = tracker_outcome.complete;
 
         // The remote frontend's user message → `user_message_chunk` (the
         // ACP client authored its own prompt, but a REMOTE prompt's text is
@@ -2184,10 +2575,17 @@ impl AgentService {
         // (`to_updates` + `to_tool_updates`; tool declarations are
         // introduce-on-first-sight, so a tool first seen after a frozen
         // window gets a synthesized declaration from its own fields).
+        // Release 0.6.0: the spawner's terminal update carries the closing
+        // `subagent_session_info` meta.
         let state = projectors
             .entry(session_id.clone())
             .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
-        for update in updates::to_updates(event, state) {
+        let updates = if completion_meta.is_some() {
+            updates::to_updates_annotated(event, state, completion_meta.as_ref().map(|(_, m)| m))
+        } else {
+            updates::to_updates(event, state)
+        };
+        for update in updates {
             if cx
                 .send_notification(acp::SessionNotification::new(session_id.clone(), update))
                 .is_err()
@@ -2196,6 +2594,133 @@ impl AgentService {
             }
         }
         true
+    }
+
+    /// Release 0.6.0: project one CHILD-session event through the
+    /// background listener (the parent has NO local turn in flight — a
+    /// remote turn's child, or a background subagent outliving the parent
+    /// turn). Updates are addressed to the child's OWN session id; tool
+    /// boundaries refresh the parent's task card when the call is still
+    /// tracked (declared in the listener's parent projector); terminal
+    /// events close the child's projector window (fresh declaration state
+    /// for its next turn). Children whose pairing is unresolved buffer
+    /// their events (cap 256, drop-oldest). Returns `false` when the client
+    /// connection is gone.
+    async fn route_background_child(
+        self: &Arc<Self>,
+        event: &dto::SessionEvent,
+        child_id: &str,
+        parent_entry: &Arc<SessionEntry>,
+        projectors: &mut HashMap<acp::SessionId, updates::MappingState>,
+        cx: &ConnectionTo<Client>,
+    ) -> bool {
+        let child_sid = acp::SessionId::from(child_id.to_string());
+        // Terminal events close the child's projector window.
+        if matches!(
+            event,
+            dto::SessionEvent::ExecutionSucceeded(_)
+                | dto::SessionEvent::ExecutionFailed(_)
+                | dto::SessionEvent::ExecutionInterrupted(_)
+        ) {
+            projectors.remove(&child_sid);
+            return true;
+        }
+        let child_state = projectors
+            .entry(child_sid.clone())
+            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        let (child_updates, card) = {
+            let mut tracker = parent_entry.subagents.lock().expect("subagents lock");
+            match tracker.child_mut(child_id) {
+                Some(track) if track.parent_call.is_some() => {
+                    updates::to_child_updates(event, child_state, track)
+                }
+                Some(track) => {
+                    track.buffer(event.clone());
+                    (Vec::new(), None)
+                }
+                None => (Vec::new(), None),
+            }
+        };
+        for update in child_updates {
+            if cx
+                .send_notification(acp::SessionNotification::new(child_sid.clone(), update))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if let Some((call_id, content)) = card {
+            // The parent's task card — only when the client already knows
+            // the call (declared in the listener's parent projector). The
+            // parent session id: the entry's OWNER in the sessions map.
+            let parent_sid = self
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .iter()
+                .find(|(_, e)| Arc::ptr_eq(e, parent_entry))
+                .map(|(sid, _)| sid.clone());
+            let declared = parent_sid.as_ref().map_or(false, |sid| {
+                projectors
+                    .get(sid)
+                    .map(|s| s.is_introduced(&call_id))
+                    .unwrap_or(false)
+            });
+            if declared {
+                let update = acp::ToolCallUpdate::new(
+                    call_id,
+                    acp::ToolCallUpdateFields::new().content(Some(content)),
+                );
+                if let Some(sid) = parent_sid {
+                    if cx
+                        .send_notification(acp::SessionNotification::new(
+                            sid,
+                            acp::SessionUpdate::ToolCallUpdate(update),
+                        ))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Release 0.6.0: send the subagent announce update on the parent
+    /// stream (background path). Guarded: the client must already know the
+    /// task call (declared in the parent's projector) or the update would
+    /// target an unknown card. Returns `false` when the client is gone.
+    fn background_announce(
+        &self,
+        parent_sid: &acp::SessionId,
+        call_id: &str,
+        meta: serde_json::Map<String, serde_json::Value>,
+        projectors: &HashMap<acp::SessionId, updates::MappingState>,
+        cx: &ConnectionTo<Client>,
+    ) -> bool {
+        let declared = projectors
+            .get(parent_sid)
+            .map(|s| s.is_introduced(call_id))
+            .unwrap_or(false);
+        if !declared {
+            tracing::warn!(
+                session = %parent_sid,
+                call = %call_id,
+                "subagent announce skipped: task call not declared to the client"
+            );
+            return true;
+        }
+        let update = acp::ToolCallUpdate::new(
+            call_id.to_string(),
+            acp::ToolCallUpdateFields::new(),
+        )
+        .meta(meta);
+        cx.send_notification(acp::SessionNotification::new(
+            parent_sid.clone(),
+            acp::SessionUpdate::ToolCallUpdate(update),
+        ))
+        .is_ok()
     }
 
     /// Mirror of the turn loop's mode/model tracking, for the background
@@ -2675,6 +3200,14 @@ mod tests {
         forked: Mutex<Vec<String>>,
         /// Release 0.4.0: force `fork_session` to fail (proves the error path).
         fork_fail: AtomicBool,
+        /// Release 0.6.0: canned child-session list for `list_children`.
+        children_out: Mutex<Option<Vec<dto::SessionInfo>>>,
+        /// Release 0.6.0: parent ids passed to `list_children`.
+        child_list_calls: Mutex<Vec<String>>,
+        /// Release 0.6.0: when set, `messages()` serves the same records on
+        /// EVERY call instead of taking them (the load path fetches the
+        /// parent's records AND each child's history).
+        repeat_messages: AtomicBool,
     }
 
     impl MockBackend {
@@ -2708,6 +3241,9 @@ mod tests {
                 fork_out: Mutex::new(None),
                 forked: Mutex::new(Vec::new()),
                 fork_fail: AtomicBool::new(false),
+                children_out: Mutex::new(None),
+                child_list_calls: Mutex::new(Vec::new()),
+                repeat_messages: AtomicBool::new(false),
             })
         }
 
@@ -2742,6 +3278,21 @@ mod tests {
 
         fn set_sessions(&self, sessions: Vec<dto::SessionInfo>) {
             *self.sessions_out.lock().expect("sessions lock") = Some(sessions);
+        }
+
+        /// Release 0.6.0: canned child-session list for `list_children`.
+        fn set_children(&self, children: Vec<dto::SessionInfo>) {
+            *self.children_out.lock().expect("children lock") = Some(children);
+        }
+
+        /// Release 0.6.0: parent ids passed to `list_children`.
+        fn recorded_child_list_calls(&self) -> Vec<String> {
+            self.child_list_calls.lock().expect("child list lock").clone()
+        }
+
+        /// Release 0.6.0: serve the same `messages_out` on every call.
+        fn repeat_messages_on(&self) {
+            self.repeat_messages.store(true, Ordering::SeqCst);
         }
 
         fn recorded_list_calls(&self) -> Vec<(Option<String>, Option<String>)> {
@@ -2870,8 +3421,11 @@ mod tests {
             _session_id: &str,
         ) -> BoxFuture<'_, Result<Vec<dto::MessageRecord>, anyhow::Error>> {
             self.messages_called.store(true, Ordering::SeqCst);
-            let out =
-                self.messages_out.lock().expect("messages lock").take().unwrap_or_default();
+            let out = if self.repeat_messages.load(Ordering::SeqCst) {
+                self.messages_out.lock().expect("messages lock").clone().unwrap_or_default()
+            } else {
+                self.messages_out.lock().expect("messages lock").take().unwrap_or_default()
+            };
             Box::pin(async move { Ok(out) })
         }
 
@@ -2984,6 +3538,15 @@ mod tests {
         fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
             self.deleted.lock().expect("deleted lock").push(session_id.to_string());
             Box::pin(async { Ok(()) })
+        }
+
+        fn list_children(
+            &self,
+            parent_id: &str,
+        ) -> BoxFuture<'_, Result<Vec<dto::SessionInfo>, anyhow::Error>> {
+            self.child_list_calls.lock().expect("child list lock").push(parent_id.to_string());
+            let out = self.children_out.lock().expect("children lock").clone();
+            Box::pin(async move { Ok(out.unwrap_or_default()) })
         }
 
         fn fork_session(
@@ -3859,115 +4422,398 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_session_tool_events_project_as_namespaced_calls() {
+    async fn native_subagent_turn_projects_child_stream_and_announces_meta() {
         let backend = MockBackend::new();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
-        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
-        let agent_task = tokio::spawn({
-            let svc = Arc::clone(&svc);
-            async move { let _ = svc.serve(agent_side).await; }
-        });
-        let collected = Arc::new(Mutex::new(Vec::<SessionNotification>::new()));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
 
-        let outcome: Result<(), AcpError> = Client.builder()
-            .name("acp-test-client")
-            .on_receive_notification(
-                {
-                    let collected = Arc::clone(&collected);
-                    async move |notif: SessionNotification, _cx| {
-                        collected.lock().expect("collected lock").push(notif);
-                        Ok(())
-                    }
+            let parent = sid.0.as_ref().to_string();
+            // The parent's spawner call (wire name `subagent`), the child
+            // session.created, then the child's traffic, then the spawner's
+            // terminal success, then the parent turn end.
+            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
                 },
-                on_receive_notification!(),
-            )
-            .connect_with(client_side, {
-                let backend = Arc::clone(&backend);
-                async move |cx| {
-                    let _ = cx
-                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                        .block_task()
-                        .await?;
-                    let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
-                    let sid = ns.session_id.clone();
+                name: "subagent".into(),
+            }));
+            backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
+                },
+                input: serde_json::json!({"agent": "explorer", "prompt": "go"}),
+                executed: Some(false),
+            }));
+            backend.push(child_created(&parent));
+            // The child's prompt + tool events (child's own sessionID).
+            backend.push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_in_child".into(),
+                sessionID: Some("ses_child_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("You are a subagent spawned by another session.\ngo".into()),
+                    }),
+                }),
+            }));
+            backend.push(child_tool_started("call_c1"));
+            backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_c1".into(),
+                },
+                input: serde_json::json!({ "pattern": "**/*.rs" }),
+                executed: Some(false),
+            }));
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_c1".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            // The CHILD turn ends — must NOT stop the parent turn.
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_child_1".into(),
+            }));
+            // The spawner call completes (final output) — the closing meta
+            // rides this update.
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
+                },
+                content: Some(vec![dto::ToolContent::Text { text: "found it".into() }]),
+                metadata: None,
+                executed: None,
+            }));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: parent.clone(),
+            }));
 
-                    // Child announced (wire: session.created with parentID),
-                    // then its tool events ride the child's own sessionID,
-                    // then the child turn ENDS — which must NOT stop the
-                    // parent turn.
-                    backend.push(child_created("ses_mock_1"));
-                    backend.push(child_tool_started("call_c1"));
-                    backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
-                        base: dto::ToolRef {
-                            sessionID: "ses_child_1".into(),
-                            assistantMessageID: "msg_c1".into(),
-                            id: "call_c1".into(),
-                        },
-                        input: serde_json::json!({ "query": "*.rs" }),
-                        executed: Some(false),
-                    }));
-                    backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
-                        base: dto::ToolRef {
-                            sessionID: "ses_child_1".into(),
-                            assistantMessageID: "msg_c1".into(),
-                            id: "call_c1".into(),
-                        },
-                        content: None,
-                        metadata: None,
-                        executed: None,
-                    }));
-                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
-                        sessionID: "ses_child_1".into(),
-                    }));
-                    // The parent turn ends normally only afterwards.
-                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
-                        sessionID: "ses_mock_1".into(),
-                    }));
-
-                    let prompt_req = cx
-                        .send_request(PromptRequest::new(
-                            sid.clone(),
-                            vec![ContentBlock::Text(TextContent::new("use the subagent"))],
-                        ))
-                        .block_task()
-                        .await?;
-                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
-                    Ok(())
-                }
-            })
-            .await;
-
-        agent_task.abort();
+            let prompt_req = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("use the subagent"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
         outcome.expect("client run ok");
 
-        // The child's tool events projected as nested calls: `${child.id}:`
-        // toolCallId + `${child.title}:` title prefix.
         let notifications = collected.lock().expect("collected lock");
-        let tool_updates: Vec<(String, Option<String>, Option<acp::ToolCallStatus>)> =
+
+        // 1. The announce: a parent-addressed tool_call_update for the
+        //    spawner call carrying the open subagent meta — landing BEFORE
+        //    any child-addressed notification.
+        let announce_idx = notifications
+            .iter()
+            .position(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCallUpdate(u)
+                            if u.tool_call_id.0.as_ref() == "call_task_1"
+                                && u.meta.as_ref().and_then(|m| m.get("subagent_session_info")).is_some()
+                    )
+            })
+            .expect("announce meta update on the parent session");
+        let first_child_idx = notifications
+            .iter()
+            .position(|n| n.session_id.0.as_ref() == "ses_child_1")
+            .expect("child-addressed notifications exist");
+        assert!(announce_idx < first_child_idx, "announce precedes any child traffic");
+        let acp::SessionUpdate::ToolCallUpdate(announce) = &notifications[announce_idx].update
+        else {
+            unreachable!()
+        };
+        let info = announce.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        assert_eq!(info["message_end_index"], serde_json::Value::Null);
+
+        // 2. Child events are addressed to the CHILD session with PLAIN ids
+        //    (no `${child}:` namespace) and the user prompt projects as a
+        //    user chunk.
+        assert!(
+            notifications.iter().any(|n| n.session_id.0.as_ref() == "ses_child_1"),
+            "child notifications exist"
+        );
+        assert!(
             notifications
                 .iter()
-                .filter_map(|n| match &n.update {
-                    acp::SessionUpdate::ToolCallUpdate(u) => Some((
-                        u.tool_call_id.0.to_string(),
-                        u.fields.title.clone(),
-                        u.fields.status,
-                    )),
-                    _ => None,
-                })
-                .collect();
-        assert_eq!(tool_updates.len(), 3, "pending + called + completed");
-        assert!(tool_updates.iter().all(|(id, _, _)| id == "ses_child_1:call_c1"));
-        assert_eq!(tool_updates[0].1.as_deref(), Some("List the repo: grep"));
-        assert_eq!(tool_updates[0].2, Some(acp::ToolCallStatus::Pending));
-        assert_eq!(tool_updates[1].2, Some(acp::ToolCallStatus::InProgress));
-        assert_eq!(tool_updates[2].2, Some(acp::ToolCallStatus::Completed));
-        // All updates are addressed to the parent session (the client never
-        // hears child session ids).
-        assert!(notifications.iter().all(|n| &*n.session_id.0 == "ses_mock_1"));
+                .filter(|n| n.session_id.0.as_ref() == "ses_child_1")
+                .all(|n| !matches!(&n.update, acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.contains(':'))),
+            "no namespaced ids remain"
+        );
+        let child_tools: Vec<_> = notifications
+            .iter()
+            .filter(|n| n.session_id.0.as_ref() == "ses_child_1")
+            .filter_map(|n| match &n.update {
+                acp::SessionUpdate::ToolCallUpdate(u) => {
+                    Some((u.tool_call_id.0.as_ref().to_string(), u.fields.status.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(child_tools.iter().any(|(id, _)| id == "call_c1"), "plain child call id");
+        assert!(child_tools
+            .iter()
+            .any(|(_, s)| *s == Some(acp::ToolCallStatus::Pending)));
+        assert!(child_tools
+            .iter()
+            .any(|(_, s)| *s == Some(acp::ToolCallStatus::InProgress)));
+        assert!(child_tools
+            .iter()
+            .any(|(_, s)| *s == Some(acp::ToolCallStatus::Completed)));
+        assert!(notifications
+            .iter()
+            .any(|n| n.session_id.0.as_ref() == "ses_child_1" && matches!(&n.update, acp::SessionUpdate::UserMessageChunk(_))));
+
+        // 3. Card content: a parent-addressed content update on the spawner
+        //    call (title-prefixed boundary lines).
+        assert!(notifications.iter().any(|n| {
+            n.session_id.0.as_ref() == "ses_mock_1"
+                && matches!(&n.update, acp::SessionUpdate::ToolCallUpdate(u)
+                    if u.tool_call_id.0.as_ref() == "call_task_1"
+                        && u.fields.content.as_ref().is_some_and(|c| !c.is_empty())
+                        && u.meta.is_none())
+        }));
+
+        // 4. Completion: the spawner's terminal update carries the closed
+        //    meta — end = the child's transcript entries (prompt + tool = 2).
+        let completion = notifications
+            .iter()
+            .find(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCallUpdate(u)
+                            if u.tool_call_id.0.as_ref() == "call_task_1"
+                                && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                    )
+            })
+            .expect("spawner call completed");
+        let acp::SessionUpdate::ToolCallUpdate(cu) = &completion.update else {
+            unreachable!()
+        };
+        let info = cu.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        assert_eq!(info["message_end_index"], serde_json::json!(2));
+        // The final output rides the same update.
+        assert!(matches!(
+            &cu.fields.content,
+            Some(c) if c.iter().any(|b| matches!(b, acp::ToolCallContent::Content(block) if matches!(&block.content, acp::ContentBlock::Text(t) if t.text == "found it")))
+        ));
+    }
+
+    /// Continuation: the spawner call's input carries `sessionID` — paired
+    /// DIRECTLY (no session.created); the announce re-slices from the
+    /// accumulated entry count; the completion closes the new slice.
+    #[tokio::test]
+    async fn native_subagent_continuation_pairs_by_input_session_id() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id.clone();
+            let parent = sid.0.as_ref().to_string();
+
+            // Turn 1: fresh spawn + child traffic.
+            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
+                },
+                name: "task".into(),
+            }));
+            backend.push(child_created(&parent));
+            backend.push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_in_child".into(),
+                sessionID: Some("ses_child_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("first task".into()),
+                    }),
+                }),
+            }));
+            backend.push(child_tool_started("call_c1"));
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_c1".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p1".into(),
+                    id: "call_task_1".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: parent.clone(),
+            }));
+            let resp = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("turn one"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(resp.stop_reason, acp::StopReason::EndTurn);
+
+            // Turn 2: continuation — the call input carries sessionID; NO
+            // session.created fires. The child does one more tool call, the
+            // spawner completes, the parent turn ends.
+            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p2".into(),
+                    id: "call_task_2".into(),
+                },
+                name: "subagent".into(),
+            }));
+            backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p2".into(),
+                    id: "call_task_2".into(),
+                },
+                input: serde_json::json!({
+                    "agent": "explorer",
+                    "prompt": "continue",
+                    "sessionID": "ses_child_1"
+                }),
+                executed: Some(false),
+            }));
+            backend.push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_in_child2".into(),
+                sessionID: Some("ses_child_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("continue".into()),
+                    }),
+                }),
+            }));
+            backend.push(child_tool_started("call_c2"));
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c2".into(),
+                    id: "call_c2".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: parent.clone(),
+                    assistantMessageID: "msg_p2".into(),
+                    id: "call_task_2".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: parent.clone(),
+            }));
+            let resp = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("turn two"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(resp.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        // The continuation announce: start = turn-1 entries (prompt + tool = 2).
+        let announce: Vec<_> = notifications
+            .iter()
+            .filter(|n| {
+                matches!(
+                    &n.update,
+                    acp::SessionUpdate::ToolCallUpdate(u)
+                        if u.tool_call_id.0.as_ref() == "call_task_2"
+                            && u.fields.status.is_none()
+                            && u.meta.as_ref().and_then(|m| m.get("subagent_session_info")).is_some()
+                )
+            })
+            .collect();
+        assert_eq!(announce.len(), 1, "continuation announce, no re-announce");
+        let acp::SessionUpdate::ToolCallUpdate(u) = &announce[0].update else {
+            unreachable!()
+        };
+        let info = u.meta.as_ref().unwrap()["subagent_session_info"].as_object().unwrap().clone();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_start_index"], serde_json::json!(2));
+        assert_eq!(info["message_end_index"], serde_json::Value::Null);
+        // The completion meta closes [2, 4] (two more entries this turn).
+        let completion = notifications
+            .iter()
+            .find(|n| {
+                matches!(
+                    &n.update,
+                    acp::SessionUpdate::ToolCallUpdate(x)
+                        if x.tool_call_id.0.as_ref() == "call_task_2"
+                            && x.fields.status == Some(acp::ToolCallStatus::Completed)
+                )
+            })
+            .expect("continuation completes");
+        let acp::SessionUpdate::ToolCallUpdate(cu) = &completion.update else {
+            unreachable!()
+        };
+        let info = cu.meta.as_ref().unwrap()["subagent_session_info"].as_object().unwrap();
+        assert_eq!(info["message_start_index"], serde_json::json!(2));
+        assert_eq!(info["message_end_index"], serde_json::json!(4));
     }
 
     #[tokio::test]
-    async fn child_permission_ask_targets_parent_and_replies_to_child() {
+    async fn child_permission_ask_targets_child_session_and_replies_to_child() {
         let backend = MockBackend::new();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
@@ -4042,19 +4888,17 @@ mod tests {
         agent_task.abort();
         outcome.expect("client run ok");
 
-        // The client asked once — addressed to the PARENT session with the
-        // namespaced toolCallId and the projected title.
+        // Native subagents: the ask is addressed to the CHILD session (Zed
+        // loaded it via the subagent card) with the PLAIN toolCallId and a
+        // plain title.
         {
             let requests = seen_requests.lock().expect("requests lock");
             assert_eq!(requests.len(), 1);
-            assert_eq!(&*requests[0].session_id.0, "ses_mock_1");
-            assert_eq!(
-                requests[0].tool_call.tool_call_id.0.as_ref(),
-                "ses_child_1:call_c1"
-            );
+            assert_eq!(&*requests[0].session_id.0, "ses_child_1");
+            assert_eq!(requests[0].tool_call.tool_call_id.0.as_ref(), "call_c1");
             assert_eq!(
                 requests[0].tool_call.fields.title.as_deref(),
-                Some("List the repo: shell: echo hi")
+                Some("shell: echo hi")
             );
             // …and the decision went to the ask's sessionID — the CHILD
             // (#48232: replies must be addressed to the child session).
@@ -4070,6 +4914,202 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_seen)
             .await
             .expect("child permission reply must reach the backend");
+    }
+
+    /// Release 0.6.0: loading a PARENT with children — the replayed
+    /// spawner declaration carries `_meta.subagent_session_info` so Zed's
+    /// view-creation scan discovers + loads the child; the end index is the
+    /// child's total transcript entries. Children discovery goes through
+    /// `list_children` (the `parentID`-filtered session list).
+    #[tokio::test]
+    async fn load_replay_attaches_subagent_meta_to_spawner_calls() {
+        let backend = MockBackend::new();
+        // Parent history: one user message + one assistant message owning a
+        // COMPLETED spawner tool call.
+        let spawner_call: dto::MessageRecord = dto::MessageRecord {
+            kind: "assistant".into(),
+            id: "msg_p".into(),
+            text: None,
+            agent: Some("orchestrator".into()),
+            model: None,
+            content: Some(vec![dto::Part::Tool {
+                id: "call_task_1".into(),
+                name: "subagent".into(),
+                executed: Some(true),
+                state: dto::ToolState::Completed {
+                    input: serde_json::json!({ "agent": "explorer" }),
+                    content: None,
+                    metadata: None,
+                },
+                time: None,
+            }]),
+            finish: Some("end_turn".into()),
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        let user_msg = dto::MessageRecord {
+            kind: "user".into(),
+            id: "msg_u".into(),
+            text: Some("use the subagent".into()),
+            agent: None,
+            model: None,
+            content: None,
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        backend.set_messages(vec![spawner_call, user_msg]); // newest-first
+        // The load path fetches the parent's records AND the child's
+        // history — serve the same records on both calls.
+        backend.repeat_messages_on();
+        // Child discovery: one child, created at t=1000.
+        backend.set_children(vec![dto::SessionInfo {
+            id: "ses_child_1".into(),
+            projectID: None,
+            title: Some("Explore".into()),
+            version: None,
+            subpath: None,
+            location: None,
+            agent: Some("explorer".into()),
+            model: None,
+            summary: None,
+            cost: None,
+            tokens: None,
+            time: Some(serde_json::json!({ "created": 1000 })),
+        }]);
+
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let resp = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp"))
+                .block_task()
+                .await?;
+            assert!(resp.modes.is_none());
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        assert_eq!(
+            backend.recorded_child_list_calls(),
+            vec!["ses_mock_1".to_string()],
+            "children discovered via the parentID-filtered list"
+        );
+        let notifications = collected.lock().expect("collected lock");
+        // The spawner declaration carries the meta (closed slice: 0..3 =
+        // user + assistant + tool = the child's entry count).
+        let n = notifications
+            .iter()
+            .find(|n| matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCall(t)
+                    if t.tool_call_id.0.as_ref() == "call_task_1"
+            ))
+            .expect("spawner declaration replayed");
+        assert_eq!(&*n.session_id.0, "ses_mock_1", "parent content only");
+        let acp::SessionUpdate::ToolCall(call) = &n.update else { unreachable!() };
+        let info = call.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        assert_eq!(info["message_end_index"], serde_json::json!(3));
+        // The terminal update carries it too.
+        let n = notifications
+            .iter()
+            .find(|n| matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCallUpdate(u)
+                    if u.tool_call_id.0.as_ref() == "call_task_1"
+            ))
+            .expect("spawner terminal update replayed");
+        assert_eq!(&*n.session_id.0, "ses_mock_1");
+        let acp::SessionUpdate::ToolCallUpdate(u) = &n.update else { unreachable!() };
+        let info = u.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["message_end_index"], serde_json::json!(3));
+    }
+
+    /// Ambiguous replay pairing (2 children vs 1 spawner call — e.g. a
+    /// previous-turn continuation): NO meta is attached anywhere (confident
+    /// pairing only).
+    #[tokio::test]
+    async fn load_replay_skips_ambiguous_child_pairing() {
+        let backend = MockBackend::new();
+        backend.set_messages(vec![dto::MessageRecord {
+            kind: "assistant".into(),
+            id: "msg_p".into(),
+            text: None,
+            agent: None,
+            model: None,
+            content: Some(vec![dto::Part::Tool {
+                id: "call_task_1".into(),
+                name: "subagent".into(),
+                executed: Some(true),
+                state: dto::ToolState::Completed {
+                    input: serde_json::json!({ "agent": "explorer" }),
+                    content: None,
+                    metadata: None,
+                },
+                time: None,
+            }]),
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        }]);
+        let child = |id: &str, created: i64| dto::SessionInfo {
+            id: id.into(),
+            projectID: None,
+            title: None,
+            version: None,
+            subpath: None,
+            location: None,
+            agent: None,
+            model: None,
+            summary: None,
+            cost: None,
+            tokens: None,
+            time: Some(serde_json::json!({ "created": created })),
+        };
+        backend.set_children(vec![child("ses_child_a", 1), child("ses_child_b", 2)]);
+
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let _resp = cx
+                .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp"))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        let n = notifications
+            .iter()
+            .find(|n| matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCall(t)
+                    if t.tool_call_id.0.as_ref() == "call_task_1"
+            ))
+            .expect("spawner declaration replayed");
+        let acp::SessionUpdate::ToolCall(call) = &n.update else { unreachable!() };
+        assert!(call.meta.is_none(), "ambiguous pairing attaches nothing");
     }
 
     #[tokio::test]
@@ -6606,6 +7646,375 @@ mod tests {
             })
             .collect();
         assert_eq!(local_chunks.len(), 1, "local turn text delivered exactly once");
+    }
+
+    /// Release 0.6.0: a LOCAL turn on the parent with a child in flight —
+    /// the turn loop projects the child (native child-id notifications + the
+    /// announce on the parent card), while the LISTENER drops the child
+    /// events it also receives on the server-wide stream (the parent's
+    /// in-turn gate). No double projection.
+    #[tokio::test]
+    async fn background_drops_child_events_during_local_turn() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            // Start a LOCAL turn; wait until the in-turn flag is set.
+            let pending = cx.send_request(PromptRequest::new(
+                sid.clone(),
+                vec![ContentBlock::Text(TextContent::new("local"))],
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while backend.recorded_prompt_bodies().is_empty() {
+                assert!(std::time::Instant::now() < deadline, "prompt never recorded");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // A child session created while the parent turn is in flight +
+            // its events — pushed on the REMOTE bus (a second frontend's
+            // turn, or the server broadcast): the listener must drop them.
+            backend.remote_push(child_created("ses_mock_1"));
+            backend.remote_push(child_tool_started("call_remote_child"));
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_remote_child".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            // The LOCAL turn's own child (turn bus): the loop projects it.
+            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_p".into(),
+                    id: "call_task_1".into(),
+                },
+                name: "subagent".into(),
+            }));
+            backend.push(child_created("ses_mock_1"));
+            backend.push(child_tool_started("call_c1"));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_child_1".into(),
+            }));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            let prompt = pending.block_task().await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        // The child's tool call projects EXACTLY ONCE (the turn loop's
+        // child-id notifications), with the plain call id — never twice.
+        let child_updates: Vec<&SessionNotification> = notifications
+            .iter()
+            .filter(|n| matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_c1"
+            ))
+            .collect();
+        assert!(!child_updates.is_empty(), "the local turn projects its child");
+        assert!(
+            child_updates
+                .iter()
+                .all(|n| n.session_id.0.as_ref() == "ses_child_1"),
+            "child updates addressed to the child session"
+        );
+        // The REMOTE child's call never appears (dropped by the in-turn gate).
+        assert!(
+            notifications.iter().all(|n| !matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCallUpdate(u)
+                    if u.tool_call_id.0.as_ref() == "call_remote_child"
+            )),
+            "no listener projection of child events during the local turn"
+        );
+    }
+
+    /// Release 0.6.0: child events with NO local turn in flight — the
+    /// listener routes them to the child's OWN session id and drives the
+    /// parent's task card (a remote TUI turn's subagent becomes visible,
+    /// plus the completion meta on the remote spawner call).
+    #[tokio::test]
+    async fn background_projects_child_to_its_own_session() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let _sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            // A remote turn on the REGISTERED parent: the spawner call, the
+            // child's session.created, the child's traffic, the spawner's
+            // success, the parent's terminal.
+            backend.remote_push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_p".into(),
+                    id: "call_task_1".into(),
+                },
+                name: "subagent".into(),
+            }));
+            backend.remote_push(child_created("ses_mock_1"));
+            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                inboxID: "msg_in_child".into(),
+                sessionID: Some("ses_child_1".into()),
+                item: Some(dto::InboxEventItem {
+                    kind: Some("user".into()),
+                    payload: Some(dto::InboxPayload {
+                        text: Some("remote child prompt".into()),
+                    }),
+                }),
+            }));
+            backend.remote_push(child_tool_started("call_c1"));
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_c1".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_child_1".into(),
+            }));
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_p".into(),
+                    id: "call_task_1".into(),
+                },
+                content: Some(vec![dto::ToolContent::Text { text: "remote done".into() }]),
+                metadata: None,
+                executed: None,
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            // Wait for the last event's projection (the parent's terminal
+            // closes the projector; everything before it is processed).
+            wait_for(&collected, |n| {
+                n.iter().any(|x| matches!(
+                    &x.update,
+                    acp::SessionUpdate::ToolCallUpdate(u)
+                        if u.tool_call_id.0.as_ref() == "call_task_1"
+                            && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                ))
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        // The announce rode the parent's stream BEFORE any child traffic.
+        let announce_idx = notifications
+            .iter()
+            .position(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCallUpdate(u)
+                            if u.tool_call_id.0.as_ref() == "call_task_1"
+                                && u.meta.as_ref().and_then(|m| m.get("subagent_session_info")).is_some()
+                    )
+            })
+            .expect("announce on the parent stream");
+        let first_child_idx = notifications
+            .iter()
+            .position(|n| n.session_id.0.as_ref() == "ses_child_1")
+            .expect("child-addressed notifications");
+        assert!(announce_idx < first_child_idx, "announce precedes child traffic");
+        // Child content is addressed to the CHILD id with plain tool ids.
+        assert!(notifications.iter().any(|n| {
+            n.session_id.0.as_ref() == "ses_child_1"
+                && matches!(&n.update, acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_c1")
+        }));
+        assert!(notifications.iter().any(|n| {
+            n.session_id.0.as_ref() == "ses_child_1"
+                && matches!(&n.update, acp::SessionUpdate::UserMessageChunk(c)
+                    if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "remote child prompt"))
+        }));
+        // The completion meta closed the slice on the parent's spawner
+        // call: entries = prompt + tool = 2.
+        let completion = notifications
+            .iter()
+            .find(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCallUpdate(u)
+                            if u.tool_call_id.0.as_ref() == "call_task_1"
+                                && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                    )
+            })
+            .expect("remote spawner call completed");
+        let acp::SessionUpdate::ToolCallUpdate(cu) = &completion.update else {
+            unreachable!()
+        };
+        let info = cu.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        assert_eq!(info["message_end_index"], serde_json::json!(2));
+    }
+
+    /// Release 0.6.0: a BACKGROUND subagent outliving the parent turn — the
+    /// local turn ends (parent execution.succeeded) while the child is
+    /// still working; the LISTENER then projects the child's later events
+    /// to its own session id (the v0.5.0 gap: they used to vanish).
+    #[tokio::test]
+    async fn background_child_outliving_turn_projects_to_child_id() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
+            let sid = ns.session_id;
+            wait_for_listener(&backend).await;
+
+            // The LOCAL turn: spawner call + child created + child start,
+            // then the parent turn ends BEFORE the child finishes.
+            backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_p".into(),
+                    id: "call_task_1".into(),
+                },
+                name: "subagent".into(),
+            }));
+            backend.push(child_created("ses_mock_1"));
+            // The server broadcasts `session.created` to every subscriber —
+            // the listener learns the child from its own copy (the mock's
+            // turn bus and remote bus are separate by design).
+            backend.remote_push(child_created("ses_mock_1"));
+            backend.push(child_tool_started("call_c1"));
+            backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_mock_1".into(),
+            }));
+            let prompt = cx
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("spawn background"))],
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+            // The child keeps working AFTER the parent turn: a text delta
+            // + a tool call + its completion. Now the LISTENER routes them
+            // (the parent has no local turn any more).
+            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    ordinal: Some(0),
+                },
+                delta: "still working".into(),
+            }));
+            backend.remote_push(child_tool_started("call_c2"));
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_c1".into(),
+                    id: "call_c2".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                sessionID: "ses_child_1".into(),
+            }));
+            // The spawner call eventually completes (background job done) —
+            // the listener attaches the closing meta.
+            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: dto::ToolRef {
+                    sessionID: "ses_mock_1".into(),
+                    assistantMessageID: "msg_p".into(),
+                    id: "call_task_1".into(),
+                },
+                content: None,
+                metadata: None,
+                executed: None,
+            }));
+            wait_for(&collected, |n| {
+                n.iter().any(|x| {
+                    x.session_id.0.as_ref() == "ses_child_1"
+                        && matches!(
+                            &x.update,
+                            acp::SessionUpdate::AgentMessageChunk(c)
+                                if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "still working")
+                        )
+                }) && n.iter().any(|x| matches!(
+                    &x.update,
+                    acp::SessionUpdate::ToolCallUpdate(u)
+                        if u.tool_call_id.0.as_ref() == "call_task_1"
+                            && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                ))
+            })
+            .await;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        // The child's post-turn events reached the client (child id).
+        assert!(notifications.iter().any(|n| {
+            n.session_id.0.as_ref() == "ses_child_1"
+                && matches!(&n.update, acp::SessionUpdate::AgentMessageChunk(c)
+                    if matches!(&c.content, acp::ContentBlock::Text(t) if t.text == "still working"))
+        }));
+        assert!(notifications.iter().any(|n| {
+            n.session_id.0.as_ref() == "ses_child_1"
+                && matches!(&n.update, acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_c2")
+        }));
+        // The closing meta on the spawner call: the full slice (entries
+        // include the post-turn child traffic: 1 tool + 1 tool = 2 tools
+        // + the text message = 3).
+        let completion = notifications
+            .iter()
+            .find(|n| {
+                n.session_id.0.as_ref() == "ses_mock_1"
+                    && matches!(
+                        &n.update,
+                        acp::SessionUpdate::ToolCallUpdate(u)
+                            if u.tool_call_id.0.as_ref() == "call_task_1"
+                                && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                    )
+            })
+            .expect("spawner call completed by the listener");
+        let acp::SessionUpdate::ToolCallUpdate(cu) = &completion.update else {
+            unreachable!()
+        };
+        let info = cu.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        // call_c1 + text message + call_c2 = 3 entries.
+        assert_eq!(info["message_end_index"], serde_json::json!(3));
     }
 
     /// The session-scoped projector is cleared at the turn's terminal

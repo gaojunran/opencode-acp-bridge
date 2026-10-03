@@ -238,6 +238,15 @@ impl OpenCodeBackend for HttpBackend {
         Box::pin(async move { Ok(client.get_session(&session_id).await?) })
     }
 
+    fn list_children(
+        &self,
+        parent_id: &str,
+    ) -> BoxFuture<'_, Result<Vec<crate::dto::SessionInfo>, anyhow::Error>> {
+        let client = self.client.clone();
+        let parent_id = parent_id.to_string();
+        Box::pin(async move { Ok(client.list_children(&parent_id).await?) })
+    }
+
     fn set_model(
         &self,
         session_id: &str,

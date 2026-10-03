@@ -264,6 +264,18 @@ impl OpencodeClient {
         Ok(self.send_json::<SessionInfo>(Method::GET, url, None).await?.data)
     }
 
+    /// `GET /api/session?parentID=<id>` — the child (subagent) sessions of
+    /// a parent (wire-verified on 2.0.21: the response `data` array carries
+    /// the children with their own `parentID`, `agent`, `time` and
+    /// `outcome`). Used at `session/load` replay time to discover the
+    /// children of a loaded parent session.
+    pub async fn list_children(&self, parent_id: &str) -> Result<Vec<SessionInfo>, ApiError> {
+        let mut url = self.endpoint_url("/session");
+        url.query_pairs_mut().append_pair("parentID", parent_id);
+        self.send_json::<Vec<SessionInfo>>(Method::GET, url, None).await
+            .map(|env| env.data)
+    }
+
     /// `PATCH /api/session/{id}` — updates title (204, no body returned).
     ///
     /// OpenAPI also allows `metadata` / `permissions` on this endpoint; add

@@ -586,8 +586,8 @@ probe confirmed the server fans every event out to all subscribers).
    session).
 2. Session NOT in the bridge's registry (`self.sessions`, populated by
    `session/new`, `session/load`, `session/resume`, `session/fork`) →
-   ignored. Child (subagent) sessions are not registered → their traffic is
-   ignored too (remote subagent projection is out of scope).
+   ignored. CHILD (subagent) sessions are not registered but route via
+   their PARENT's entry — see the [native subagent section](#native-subagent-sessions-release-060) below.
 3. Session HAS an in-flight LOCAL turn (`in_turn` flag, set by the turn loop
    around its full lifecycle including the cancel drain) → the event is
    DROPPED, no state, no push: the turn loop's own subscription delivers it.
@@ -647,3 +647,104 @@ turn's own tail. Residual loss — no worse than today's full loss:
   but must not rename/remove without updating this doc + dto together.
 - Fixtures are read-only evidence; if a live probe contradicts a fixture, trust the
   live probe and update both.
+
+## Native subagent sessions (Release 0.6.0)
+
+Zed's native subagent mechanism replaces the namespaced child-tool projection
+(the `#48232` fallback) with Zed's own subagent cards: the bridge attaches
+`_meta.subagent_session_info` to the PARENT's task tool call, Zed renders the
+card in subagent mode and routes child-session `session/update` notifications
+into the embedded transcript. Contract verified against Zed main 2026-08-16
+and against the live 2.0.21 wire.
+
+### Empirical capture (live 2.0.21 server, 2026-10-03)
+
+Full capture: `tests/fixtures/subagent-native.sse.jsonl` (fresh spawn +
+continuation). Wire facts the pairing relies on:
+
+- **The spawner tool is named `subagent`** on the bridge's production server
+  (`task` in stock 2.0.21 docs, `subagent` aliased) — matched by BOTH names
+  (`updates::is_spawner_name`).
+- **Event order on a fresh spawn**: parent `tool.input.started` → `input.ended`
+  → `called` (input `{agent, description, prompt}` — NO session id) →
+  `session.created {parentID, title, agent}` (~17 ms later) → `tool.progress`
+  with `metadata: {"sessionID": "<child>", "status": "running"}` → child
+  inbox/step/tool events (child's own session id).
+- **The direct child linkage rides `tool.progress.metadata.sessionID`** (and is
+  echoed on the spawner's `tool.success.metadata` as `status: "completed"`) —
+  an authoritative call→child map that needs no ordering assumptions.
+- **Continuation calls carry `sessionID` inside the tool input** (`called` /
+  `input.ended`) and fire NO `session.created` — paired directly by the input
+  field (verified: second prompt on the same child, input
+  `{"agent": "explorer", "prompt": "...", "sessionID": "ses_..."}`).
+- **The persisted task tool part carries NO child id in `state.metadata`** —
+  the child id appears inside the result content
+  (`<subagent sessionID="..." state="completed">`) and in the success
+  metadata. Replay-time pairing therefore uses `GET /api/session?parentID=`
+  (verified: returns the children array) + order-matching, not the part shape.
+- **The child's task prompt arrives as `session.inbox.enqueued`** with
+  `item.type == "user"` and `payload.text` (prefixed
+  `You are a subagent spawned by another session.\n`) — projected as the
+  child's `user_message_chunk` (messageId = the inbox id).
+
+### Pairing (turn loop AND background listener, shared `SubagentTracker`)
+
+The tracker lives on the parent's `SessionEntry` (shared, mutex-serialized):
+
+1. Spawner-call `input.started` (`subagent`/`task`) → joins an unpaired FIFO.
+2. `session.created {parentID == parent}` → pairs with the OLDEST unpaired
+   call; `_meta.subagent_session_info {session_id, message_start_index:
+   <accumulated entry count>, message_end_index: null}` is announced on the
+   parent's task call BEFORE any child traffic.
+3. Direct linkages pair immediately: input `sessionID` (continuation) and
+   `tool.progress.metadata.sessionID` (also the fallback when the FIFO is
+   empty). Re-announce suppressed when the values are unchanged.
+4. A spawner call that terminates unpaired is retired (a later child creation
+   never pairs with a dead call).
+5. Children with no observed spawner call buffer their events (cap 256,
+   drop-oldest with a warn); the announce → flush happens in order.
+
+### Live child streaming
+
+Child events map through the SAME `MappingState` machinery but are addressed
+to the CHILD's session id with PLAIN tool ids (no `${child}:` namespace):
+inbox user item → `user_message_chunk`; text/reasoning deltas → chunks (per
+assistant message id); tool events → declaration-before-update; usage →
+`usage_update`. `permission.asked` from a child is forwarded as an ACP
+request addressed to the CHILD session (Zed loaded it via the card), plain
+ids/titles, reply routed to the ask's own session id.
+
+Transcript slice indices (Zed's `message_start_index` / `message_end_index`):
+entries = 1 per user message, 1 per distinct assistant message id, 1 per
+distinct tool call id, counted persistently across turns. The announce opens
+the slice at the current count (0 fresh / accumulated for a continuation);
+the spawner's terminal `tool_call_update` closes it (`message_end_index` =
+the count then, inclusive) and carries the final output as content. Tool
+boundaries (`input.started` name, `called` name+first-string-arg) aggregate
+as title-prefixed content lines on the parent card, kept to the trailing 6,
+throttled at call boundaries only.
+
+### Background listener routing (the v0.5.0 gap fix)
+
+`session.created {parentID, title}` is learned globally; a child's events
+resolve to its parent and gate on the PARENT's in-turn flag: a local parent
+turn → drop (the turn loop owns the child); otherwise → project to the
+child's own id (live child streaming after Zed loaded the child; background
+subagents outliving the parent turn stay visible — the exact v0.5.0 gap) +
+drive the parent's task card while the spawner call is still declared. Remote
+(TUI) turns announce/pair/close exactly like local ones.
+
+### Replay (`session/load` of a parent)
+
+The parent's replay keeps parent content only (task call + its result — the
+child thread is NOT inlined). The replayed spawner declaration + terminal
+update carry `_meta.subagent_session_info` so Zed's view-creation scan
+discovers and loads the children: children discovered via
+`GET /api/session?parentID=<parent>`, ordered by creation time and zipped
+with the parent's spawner calls in chronological order — ONLY when the counts
+match (ambiguous pairings — e.g. prior-turn continuations with n children ≠ m
+calls — attach nothing rather than a wrong meta). `message_end_index` = the
+child's total entry count from its own history (Zed caps the embedded
+display to the trailing 8). Loading a CHILD id uses the existing generic
+load path (child history replays as child-id notifications — correct by
+construction).

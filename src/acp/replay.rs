@@ -15,10 +15,34 @@ use crate::dto::{MessageRecord, Part, ToolState};
 
 use super::updates::tool_result_blocks;
 
+/// Release 0.6.0: a child (subagent) session matched to ONE replayed
+/// spawner tool call of the parent — the replay attaches
+/// `_meta.subagent_session_info` to the replayed declaration + terminal
+/// update so Zed's view-creation scan discovers and loads the child.
+/// `entries` is the child's total transcript entry count (its own
+/// history: user messages + assistant messages + tool parts) — the
+/// closed-slice end index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayChildMeta {
+    /// The spawner tool call id on the parent (the replayed `Part::Tool` id).
+    pub call_id: String,
+    /// The child session id.
+    pub session_id: String,
+    /// Total transcript entries of the child (`message_end_index`).
+    pub entries: usize,
+}
+
 /// Build the full ACP transcript for a session's persisted messages.
 /// `no_aft` — see [`MappingState::with_no_aft`]: replays drop File/image
-/// passthrough (diffs stay — dialect-neutral).
-pub fn replay_updates(records: &[MessageRecord], no_aft: bool) -> Vec<SessionUpdate> {
+/// passthrough (diffs stay — dialect-neutral). `children` — the child
+/// metas for the parent's spawner calls (see [`ReplayChildMeta`]); the
+/// parent's own replay keeps PARENT content only — the child thread is
+/// NOT inlined (Zed loads the children itself, keyed by the meta).
+pub fn replay_updates(
+    records: &[MessageRecord],
+    no_aft: bool,
+    children: &[ReplayChildMeta],
+) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
     for record in records.iter().rev() {
         match record.kind.as_str() {
@@ -31,7 +55,7 @@ pub fn replay_updates(records: &[MessageRecord], no_aft: bool) -> Vec<SessionUpd
             }
             "assistant" => {
                 for part in record.content.iter().flatten() {
-                    out.extend(assistant_part(part, &record.id, no_aft));
+                    out.extend(assistant_part(part, &record.id, no_aft, children));
                 }
             }
             // Execution bookkeeping records — nothing to show the client.
@@ -44,7 +68,12 @@ pub fn replay_updates(records: &[MessageRecord], no_aft: bool) -> Vec<SessionUpd
     out
 }
 
-fn assistant_part(part: &Part, message_id: &str, no_aft: bool) -> Vec<SessionUpdate> {
+fn assistant_part(
+    part: &Part,
+    message_id: &str,
+    no_aft: bool,
+    children: &[ReplayChildMeta],
+) -> Vec<SessionUpdate> {
     match part {
         Part::Text { text, .. } => vec![SessionUpdate::AgentMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
@@ -54,15 +83,27 @@ fn assistant_part(part: &Part, message_id: &str, no_aft: bool) -> Vec<SessionUpd
             ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
                 .message_id(message_id),
         )],
-        Part::Tool { id, name, state, .. } => tool_part(id, name, state, no_aft),
+        Part::Tool { id, name, state, .. } => {
+            let child = children.iter().find(|c| c.call_id == *id);
+            tool_part(id, name, state, no_aft, child)
+        }
         Part::Unknown => vec![],
     }
 }
 
 /// A persisted tool part becomes an initial `pending` `ToolCall` (ACP requires
 /// the call to exist before it can be updated) followed by the terminal update
-/// matching the persisted state.
-fn tool_part(id: &str, name: &str, state: &ToolState, no_aft: bool) -> Vec<SessionUpdate> {
+/// matching the persisted state. `child` — the subagent meta for a spawner
+/// call (Release 0.6.0): both the declaration and the terminal update carry
+/// `_meta.subagent_session_info` so Zed's view-creation scan discovers the
+/// child and shows the completed slice.
+fn tool_part(
+    id: &str,
+    name: &str,
+    state: &ToolState,
+    no_aft: bool,
+    child: Option<&ReplayChildMeta>,
+) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
 
     // The opening `ToolCall` — mirrors `session.tool.input.started` in the
@@ -80,6 +121,9 @@ fn tool_part(id: &str, name: &str, state: &ToolState, no_aft: bool) -> Vec<Sessi
     };
     if let Some(input) = raw_input {
         call = call.raw_input(input);
+    }
+    if let Some(child) = child {
+        call = call.meta(subagent_meta_of(child));
     }
     out.push(SessionUpdate::ToolCall(call));
 
@@ -104,7 +148,7 @@ fn tool_part(id: &str, name: &str, state: &ToolState, no_aft: bool) -> Vec<Sessi
             if !blocks.is_empty() {
                 fields = fields.content(Some(blocks));
             }
-            out.push(tool_update(id, fields));
+            out.push(tool_update_meta(id, fields, child));
         }
 
         ToolState::Error { error, content, metadata, .. } => {
@@ -122,15 +166,46 @@ fn tool_part(id: &str, name: &str, state: &ToolState, no_aft: bool) -> Vec<Sessi
             let fields = ToolCallUpdateFields::new()
                 .status(ToolCallStatus::Failed)
                 .content(Some(blocks));
-            out.push(tool_update(id, fields));
+            out.push(tool_update_meta(id, fields, child));
         }
     }
 
     out
 }
 
+/// The `_meta.subagent_session_info` map for a replayed child: the open
+/// slice is closed — start 0, end = the child's total entry count (Zed caps
+/// the embedded transcript display to the trailing 8 anyway).
+fn subagent_meta_of(child: &ReplayChildMeta) -> serde_json::Map<String, serde_json::Value> {
+    let mut info = serde_json::Map::new();
+    info.insert("session_id".into(), serde_json::Value::from(child.session_id.as_str()));
+    info.insert("message_start_index".into(), serde_json::Value::from(0));
+    info.insert(
+        "message_end_index".into(),
+        serde_json::Value::from(child.entries),
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert("subagent_session_info".into(), serde_json::Value::Object(info));
+    meta
+}
+
 fn tool_update(tool_call_id: &str, fields: ToolCallUpdateFields) -> SessionUpdate {
     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string(), fields))
+}
+
+/// `tool_update` with the replayed subagent meta attached (if any).
+fn tool_update_meta(
+    tool_call_id: &str,
+    fields: ToolCallUpdateFields,
+    child: Option<&ReplayChildMeta>,
+) -> SessionUpdate {
+    match child {
+        Some(child) => SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(tool_call_id.to_string(), fields)
+                .meta(subagent_meta_of(child)),
+        ),
+        None => tool_update(tool_call_id, fields),
+    }
 }
 
 /// Small helper trait to read the input value of a tool state (all variants).
@@ -173,7 +248,7 @@ mod tests {
 
     #[test]
     fn replay_orders_history_and_maps_transcript() {
-        let updates = replay_updates(&fixture_records(), false);
+        let updates = replay_updates(&fixture_records(), false, &[]);
 
         // 1. Chronological order: the OLDEST user message comes first.
         let first = &updates[0];
@@ -228,7 +303,7 @@ mod tests {
         // semantics in the live path).
         let streaming = replay_updates(&[record_with_tool(ToolState::Streaming {
             input: r#"{"x":1}"#.into(),
-        })], false);
+        })], false, &[]);
         assert_eq!(streaming.len(), 1);
         let SessionUpdate::ToolCall(call) = &streaming[0] else { panic!() };
         assert_eq!(call.raw_input, Some(serde_json::Value::String(r#"{"x":1}"#.into())));
@@ -237,7 +312,7 @@ mod tests {
         let running = replay_updates(&[record_with_tool(ToolState::Running {
             input: serde_json::json!({"x": 1}),
             metadata: None,
-        })], false);
+        })], false, &[]);
         assert_eq!(running.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &running[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
@@ -254,7 +329,7 @@ mod tests {
             content: None,
             metadata: None,
         })];
-        let updates = replay_updates(&records, false);
+        let updates = replay_updates(&records, false, &[]);
         assert_eq!(updates.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &updates[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::Failed));
@@ -268,7 +343,7 @@ mod tests {
 
     #[test]
     fn reasoning_and_text_parts_share_the_assistant_message_id() {
-        let updates = replay_updates(&fixture_records(), false);
+        let updates = replay_updates(&fixture_records(), false, &[]);
         // The write-tool assistant message carries a reasoning part (and no
         // text part in this capture) — the thought chunk must keep the
         // message id so clients can anchor it under the right assistant turn.
@@ -305,5 +380,88 @@ mod tests {
             tokens: None,
             time: None,
         }
+    }
+
+    fn spawner_record(state: ToolState) -> MessageRecord {
+        let mut r = record_with_tool(state);
+        if let Some(parts) = &mut r.content {
+            if let Some(Part::Tool { name, id, .. }) = parts.first_mut() {
+                *name = "subagent".into();
+                *id = "call_task_1".into();
+            }
+        }
+        r
+    }
+
+    // ==================== Release 0.6.0: replay child metas ====================
+
+    /// A matched child attaches `_meta.subagent_session_info` to BOTH the
+    /// replayed spawner declaration and its terminal update — the closed
+    /// slice {session_id, 0, entries}.
+    #[test]
+    fn spawner_replay_carries_subagent_meta() {
+        let records = [spawner_record(ToolState::Completed {
+            input: serde_json::json!({ "agent": "explorer" }),
+            content: Some(vec![crate::dto::ToolContent::Text {
+                text: "found".into(),
+            }]),
+            metadata: None,
+        })];
+        let children = [ReplayChildMeta {
+            call_id: "call_task_1".into(),
+            session_id: "ses_child_1".into(),
+            entries: 5,
+        }];
+        let updates = replay_updates(&records, false, &children);
+        assert_eq!(updates.len(), 2, "declaration + terminal");
+        // Declaration carries the meta (the view-creation scan reads it HERE
+        // to discover + load the child).
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        let info = call.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_start_index"], serde_json::json!(0));
+        assert_eq!(info["message_end_index"], serde_json::json!(5));
+        // Terminal update carries the same closed slice + the final output.
+        let SessionUpdate::ToolCallUpdate(update) = &updates[1] else {
+            panic!("terminal update expected")
+        };
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        let info = update.meta.as_ref().unwrap()["subagent_session_info"]
+            .as_object()
+            .unwrap();
+        assert_eq!(info["session_id"], serde_json::json!("ses_child_1"));
+        assert_eq!(info["message_end_index"], serde_json::json!(5));
+    }
+
+    /// Unmatched calls carry no meta; an EMPTY child list replays the parent
+    /// content only (the pre-0.6.0 shape).
+    #[test]
+    fn unmatching_child_pairs_leave_the_replay_plain() {
+        let records = [spawner_record(ToolState::Completed {
+            input: serde_json::json!({ "agent": "explorer" }),
+            content: None,
+            metadata: None,
+        })];
+        // Different call id → no meta.
+        let wrong = [ReplayChildMeta {
+            call_id: "call_other".into(),
+            session_id: "ses_child_1".into(),
+            entries: 5,
+        }];
+        let updates = replay_updates(&records, false, &wrong);
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert!(call.meta.is_none(), "unmatched call stays plain");
+        // Empty children → plain too.
+        let updates = replay_updates(&records, false, &[]);
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert!(call.meta.is_none());
     }
 }

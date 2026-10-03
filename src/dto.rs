@@ -629,6 +629,29 @@ pub struct ToolSuccess {
     pub executed: Option<bool>,
 }
 
+/// Payload of `session.tool.progress` (wire-verified, native-subagent
+/// capture): the PARENT's subagent-spawner call carries `metadata:
+/// {"sessionID": "<child>", "status": "running"}` — the direct child
+/// linkage used to pair the parent's task tool call with its child session
+/// (the linkage is also echoed on the spawner's `tool.success` metadata as
+/// `status: "completed"`). All other tools carry `metadata: {}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolProgress {
+    #[serde(flatten)]
+    pub base: ToolRef,
+    #[serde(default)]
+    pub metadata: Option<ToolProgressMeta>,
+}
+
+/// Tolerant decode of the progress metadata object (unknown keys ignored).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolProgressMeta {
+    #[serde(default)]
+    pub sessionID: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 /// Payload of a `session.tool.failed` event: a tool call ended in error.
 /// Official-adapter shape (`{assistantMessageID, error, …}`); extra fields
 /// are tolerated so an unobserved real shape degrades to a silent skip.
@@ -729,7 +752,7 @@ pub struct SessionRenamed {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SessionCreated {
     #[serde(default)]
     pub sessionID: Option<String>,
@@ -871,7 +894,7 @@ pub enum SessionEvent {
     ToolInputStarted(ToolInputStarted),
     ToolInputEnded(ToolInputEnded),
     ToolCalled(ToolCalled),
-    ToolProgress(ToolRef),
+    ToolProgress(ToolProgress),
     ToolSuccess(ToolSuccess),
     /// Failure kind for a tool call (`session.tool.failed`, consumed by the
     /// official 2.0.21 adapter; not yet on the bridge's own captures —

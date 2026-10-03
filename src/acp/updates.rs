@@ -10,7 +10,7 @@
 //! chunks of the same assistant message (each chunk type gets its own
 //! `message_id` from the same ID; the client groups by that ID).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
@@ -21,53 +21,6 @@ use agent_client_protocol::schema::v1::{
 use crate::dto::{self, ToolContent, ToolMetadata};
 
 use super::diff;
-
-/// Namespace of a subagent (child) session whose tool events are projected
-/// into the parent turn (official `#48232` behavior: when the client does not
-/// declare `opencode/child-session-updates`, child tool events surface in the
-/// parent stream as nested tool calls).
-///
-/// Wire facts (captured in tests/fixtures/subagent-child.sse.jsonl): child
-/// events flow through the shared `/api/event` stream carrying the CHILD's
-/// own sessionID; `session.created` announces the child with `parentID` +
-/// `title` + `agent`. The ACP mapping prefixes every projected tool call id
-/// with `${child.id}:` and every title with `${child.title}: …`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolNs {
-    /// Child session id (`ses_...`).
-    pub child_id: String,
-    /// Child session title (from `session.created`).
-    pub child_title: String,
-}
-
-impl ToolNs {
-    /// The ACP toolCallId for a raw opencode `call_...` id of this child.
-    pub fn tool_call_id(&self, raw: &str) -> String {
-        format!("{}:{}", self.child_id, raw)
-    }
-
-    /// The ACP display title for a raw title of this child.
-    pub fn title(&self, raw: &str) -> String {
-        format!("{}: {}", self.child_title, raw)
-    }
-}
-
-/// The identity of an opencode tool event's call — raw `call_...` id, plus
-/// the child namespace when the event belongs to a projected subagent.
-fn tool_call_id(ns: Option<&ToolNs>, raw: &str) -> String {
-    match ns {
-        Some(ns) => ns.tool_call_id(raw),
-        None => raw.to_string(),
-    }
-}
-
-fn tool_title(ns: Option<&ToolNs>, raw: &str) -> String {
-    match ns {
-        Some(ns) => ns.title(raw),
-        None => raw.to_string(),
-    }
-}
-
 
 /// Per-session bookkeeping for the event → update mapping.
 ///
@@ -123,6 +76,19 @@ impl MappingState {
     /// / `tool.called`). Used to build the permission prompt's `state.input`.
     pub fn tool_input(&self, tool_call_id: &str) -> Option<&serde_json::Value> {
         self.tool_inputs.get(tool_call_id)
+    }
+
+    /// The display title (tool name) indexed for a tool call id, if seen
+    /// this turn (`tool.input.started`).
+    pub(crate) fn tool_title(&self, tool_call_id: &str) -> Option<&str> {
+        self.tool_titles.get(tool_call_id).map(String::as_str)
+    }
+
+    /// Whether a tool call id was already DECLARED to the client (Release
+    /// 0.3.2 introduce-on-first-sight bookkeeping). Used by the background
+    /// listener to avoid card updates for calls the client never saw.
+    pub(crate) fn is_introduced(&self, tool_call_id: &str) -> bool {
+        self.introduced_tools.contains(tool_call_id)
     }
 
     /// Mark a tool call open. `id` must be the FINAL (namespaced) toolCallId.
@@ -208,7 +174,7 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
         | dto::SessionEvent::ToolInputEnded(_)
         | dto::SessionEvent::ToolCalled(_)
         | dto::SessionEvent::ToolSuccess(_)
-        | dto::SessionEvent::ToolFailed(_) => to_tool_updates(event, None, state),
+        | dto::SessionEvent::ToolFailed(_) => to_tool_updates(event, state, None),
         dto::SessionEvent::ToolProgress(_) => {
             // No-op: the call is already `in_progress` since `tool.called`.
             // Kept as its own arm so the mapping is explicit and greppable.
@@ -326,19 +292,635 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
     }
 }
 
-/// Tool-event arms shared by the parent namespace (`to_updates`) and the
-/// child projection (`to_child_updates`). `ns` is `Some` only for child
-/// events: every id is prefixed `${child.id}:`, every title `${child.title}:`.
+// ============================================================
+// Release 0.6.0: native subagent sessions
+// ============================================================
+//
+// Zed's native subagent mechanism (verified against Zed main 2026-08-16 and
+// against the live 2.0.21 wire, capture in
+// tests/fixtures/subagent-native.sse.jsonl): the bridge attaches
+// `_meta.subagent_session_info` {session_id, message_start_index,
+// message_end_index} to the PARENT's task tool call — Zed then renders the
+// card in a subagent mode and routes `session/update` notifications
+// addressed to the CHILD's own session id into the embedded transcript.
+//
+// Wire facts the pairing relies on (live capture):
+// - The spawner tool is named `subagent` (aliased) or `task` (stock); its
+//   input events precede the child's `session.created {parentID, title}`.
+// - `session.tool.progress` on the PARENT's spawner call carries
+//   `metadata: {"sessionID": "<child>", "status": "running"}` — the direct
+//   child linkage, also echoed on the spawner's `tool.success` metadata.
+// - Continuation calls carry `sessionID` inside the tool input (`called` /
+//   `input.ended`) and fire NO `session.created` (the child already exists).
+
+/// The `_meta` key Zed consumes on a tool call (declaration or update).
+pub const SUBAGENT_META_KEY: &str = "subagent_session_info";
+
+/// Tool names that spawn child sessions on the wire: `task` (stock
+/// opencode 2.0.21) and `subagent` (the aliased name on the bridge's
+/// production server — wire-verified in both captures).
+pub fn is_spawner_name(name: &str) -> bool {
+    matches!(name, "task" | "subagent")
+}
+
+/// The `_meta.subagent_session_info` object: `message_end_index` None → the
+/// open slice (announce), Some → the completed slice (task call success).
+pub fn subagent_meta(
+    session_id: &str,
+    start: usize,
+    end: Option<usize>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut info = serde_json::Map::new();
+    info.insert("session_id".into(), serde_json::Value::from(session_id));
+    info.insert("message_start_index".into(), serde_json::Value::from(start));
+    info.insert(
+        "message_end_index".into(),
+        end.map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert(SUBAGENT_META_KEY.into(), serde_json::Value::Object(info));
+    meta
+}
+
+/// Cap of buffered child events awaiting pair completion (drop-oldest).
+const PENDING_CAP: usize = 256;
+/// Cap of card content lines aggregated on the parent's task card.
+pub const MAX_CARD_LINES: usize = 6;
+
+/// Persistent (across turns) state of one child (subagent) session, keyed
+/// by child session id on the PARENT's [`SessionEntry`]-owned tracker.
+#[derive(Debug, Default)]
+pub struct ChildTrack {
+    /// Child session id (`ses_...`).
+    pub child_id: String,
+    /// Child session title (from `session.created`).
+    pub title: String,
+    /// The spawner tool call id on the parent (plain id); `None` while the
+    /// pairing is unresolved.
+    pub parent_call: Option<String>,
+    /// `message_start_index` of the CURRENT announced meta (the slice start
+    /// of the live turn). Guards re-announcing identical state.
+    announced_start: Option<usize>,
+    /// Total transcript entries emitted for this child (across turns) —
+    /// the index space Zed slices with `message_start/end_index`.
+    pub entries: usize,
+    /// User/assistant message ids already counted as transcript entries.
+    counted_messages: HashSet<String>,
+    /// Tool call ids already counted as transcript entries.
+    counted_tools: HashSet<String>,
+    /// Aggregated card content lines (title-prefixed, capped at
+    /// [`MAX_CARD_LINES`]).
+    card_lines: Vec<String>,
+    /// Child events buffered while the pairing is unresolved (the announce
+    /// must precede any child traffic; flush after pairing, in order).
+    pending: VecDeque<dto::SessionEvent>,
+}
+
+impl ChildTrack {
+    fn new(child_id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            child_id: child_id.into(),
+            title: title.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Count a user/assistant message as a transcript entry; `1` when new.
+    pub fn record_message(&mut self, id: &str) -> usize {
+        if self.counted_messages.insert(id.to_string()) {
+            self.entries += 1;
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Count a tool call id as a transcript entry; `1` when new.
+    pub fn record_tool(&mut self, id: &str) -> usize {
+        if self.counted_tools.insert(id.to_string()) {
+            self.entries += 1;
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Append a card content line (`"{title}: {label}"`), keeping the last
+    /// [`MAX_CARD_LINES`].
+    pub fn push_card_line(&mut self, label: String) {
+        self.card_lines.push(format!("{}: {}", self.title, label));
+        if self.card_lines.len() > MAX_CARD_LINES {
+            self.card_lines.remove(0);
+        }
+    }
+
+    /// The aggregated card content (text lines).
+    pub fn card_content(&self) -> Vec<ToolCallContent> {
+        self.card_lines
+            .iter()
+            .map(|line| ToolCallContent::from(ContentBlock::Text(TextContent::new(line.clone()))))
+            .collect()
+    }
+
+    /// The open-slice meta to announce on the parent's task call: the slice
+    /// starts at the CURRENT entry count and stays open (end: null).
+    pub fn meta_open(&self) -> serde_json::Map<String, serde_json::Value> {
+        subagent_meta(&self.child_id, self.entries, None)
+    }
+
+    /// The closed-slice meta for the task call's terminal update: the
+    /// announced start, end = the current entry count (inclusive).
+    pub fn meta_closed(&self) -> serde_json::Map<String, serde_json::Value> {
+        let start = self.announced_start.unwrap_or(self.entries);
+        subagent_meta(&self.child_id, start, Some(self.entries))
+    }
+
+    /// Whether a meta with this start was already announced (spam guard).
+    pub fn should_announce(&self, start: usize) -> bool {
+        self.announced_start != Some(start)
+    }
+
+    /// Record the announced slice start.
+    pub fn mark_announced(&mut self, start: usize) {
+        self.announced_start = Some(start);
+    }
+
+    /// Buffer a child event while the pairing is unresolved. Returns `false`
+    /// when the oldest buffered event was dropped (cap reached).
+    pub fn buffer(&mut self, event: dto::SessionEvent) -> bool {
+        if self.pending.len() >= PENDING_CAP {
+            tracing::warn!(
+                child = %self.child_id,
+                "subagent pending buffer full — dropping oldest buffered child event"
+            );
+            self.pending.pop_front();
+            self.pending.push_back(event);
+            false
+        } else {
+            self.pending.push_back(event);
+            true
+        }
+    }
+
+    /// Take the buffered events (in order) for post-pairing flush.
+    pub fn drain(&mut self) -> Vec<dto::SessionEvent> {
+        self.pending.drain(..).collect()
+    }
+}
+
+/// Per-parent-session tracker pairing the parent's spawner tool calls with
+/// their child sessions + the persistent per-child state. Shared between
+/// the turn loop and the background listener (serialized by the owning
+/// `SessionEntry`'s mutex).
+#[derive(Debug, Default)]
+pub struct SubagentTracker {
+    /// Unpaired spawner call ids, FIFO (`note_spawner_call`).
+    unpaired_calls: VecDeque<String>,
+    /// Child session id → persistent track.
+    children: HashMap<String, ChildTrack>,
+    /// Spawner call id → child session id (paired).
+    call_to_child: HashMap<String, String>,
+}
+
+impl SubagentTracker {
+    /// Register a spawner tool call (its `input.started` carried a spawner
+    /// name) as a pairing candidate. Idempotent.
+    pub fn note_spawner_call(&mut self, call_id: &str) {
+        if self.call_to_child.contains_key(call_id)
+            || self.unpaired_calls.iter().any(|c| c == call_id)
+        {
+            return;
+        }
+        self.unpaired_calls.push_back(call_id.to_string());
+    }
+
+    /// The child session id a spawner call is paired with, if any.
+    pub fn call_child(&self, call_id: &str) -> Option<&str> {
+        self.call_to_child.get(call_id).map(String::as_str)
+    }
+
+    /// Whether `session_id` is a tracked child.
+    pub fn is_child(&self, session_id: &str) -> bool {
+        self.children.contains_key(session_id)
+    }
+
+    pub fn child(&self, child_id: &str) -> Option<&ChildTrack> {
+        self.children.get(child_id)
+    }
+
+    pub fn child_mut(&mut self, child_id: &str) -> Option<&mut ChildTrack> {
+        self.children.get_mut(child_id)
+    }
+
+    /// Drop a still-unpaired spawner call (its terminal arrived without a
+    /// child — the child creation failed; never pair a dead call later).
+    fn retire_unpaired(&mut self, call_id: &str) {
+        self.unpaired_calls.retain(|c| c != call_id);
+    }
+
+    /// Pair `call_id` with `child_id` DIRECTLY (input `sessionID` or
+    /// progress-metadata linkage). Returns `(child_id, call_id)` when a NEW
+    /// announce must go out (never for already-announced pairs).
+    #[allow(clippy::type_complexity)]
+    fn pair_direct(
+        &mut self,
+        call_id: &str,
+        child_id: &str,
+        title: &str,
+    ) -> Option<(String, String)> {
+        self.unpaired_calls.retain(|c| c != call_id);
+        self.call_to_child
+            .insert(call_id.to_string(), child_id.to_string());
+        let track = self
+            .children
+            .entry(child_id.to_string())
+            .or_insert_with(|| ChildTrack::new(child_id, title));
+        if track.parent_call.is_some() {
+            // Already announced paired (a continuation call). Re-announce
+            // only when the slice start changed (new turn → new slice).
+            let start = track.entries;
+            if track.should_announce(start) {
+                track.mark_announced(start);
+                return Some((child_id.to_string(), call_id.to_string()));
+            }
+            return None;
+        }
+        track.parent_call = Some(call_id.to_string());
+        if track.title.is_empty() {
+            track.title = title.to_string();
+        }
+        let start = track.entries;
+        track.mark_announced(start);
+        Some((child_id.to_string(), call_id.to_string()))
+    }
+
+    /// Pair a NEW child (`session.created`) with the OLDEST unpaired
+    /// spawner call. Returns `(child_id, call_id)` when an announce must go
+    /// out; `(child_id, "")` when the child is tracked but unpaired; `None`
+    /// when the child was already paired.
+    fn pair_created(&mut self, child_id: &str, title: &str) -> Option<(String, String)> {
+        if self.children.get(child_id).map(|t| t.parent_call.is_some()) == Some(true) {
+            return None;
+        }
+        let track = self
+            .children
+            .entry(child_id.to_string())
+            .or_insert_with(|| ChildTrack::new(child_id, title));
+        if track.title.is_empty() {
+            track.title = title.to_string();
+        }
+        match self.unpaired_calls.pop_front() {
+            Some(call_id) => {
+                self.call_to_child
+                    .insert(call_id.clone(), child_id.to_string());
+                track.parent_call = Some(call_id.clone());
+                let start = track.entries;
+                track.mark_announced(start);
+                Some((child_id.to_string(), call_id))
+            }
+            None => {
+                // No observed spawner call yet — the child is tracked
+                // unpaired (its events buffer until a pairing lands).
+                tracing::warn!(
+                    child = %child_id,
+                    "child session created without a matching spawner call observed — buffering its events"
+                );
+                Some((child_id.to_string(), String::new()))
+            }
+        }
+    }
+}
+
+/// What the pairing bookkeeping of ONE parent event produced.
+#[derive(Debug, Default)]
+pub struct TrackerOutcome {
+    /// A new open-slice meta to announce on the parent session:
+    /// (child_id, spawner call id, meta). Followed by the pending flush.
+    pub announce: Option<(String, String, serde_json::Map<String, serde_json::Value>)>,
+    /// The completion meta for the spawner call's terminal update:
+    /// (call id, meta) — attach to the mapped update.
+    pub complete: Option<(String, serde_json::Map<String, serde_json::Value>)>,
+}
+
+fn input_session_id(input: &serde_json::Value) -> Option<&str> {
+    input
+        .as_object()
+        .and_then(|o| o.get("sessionID"))
+        .and_then(|v| v.as_str())
+}
+
+/// Feed one event of the PARENT session (or a `session.created` on the
+/// shared stream) into the tracker: spawner-call registration, pairing
+/// (input `sessionID`, progress-metadata, `session.created` queue), and the
+/// spawner-termination completion meta. Pure tracker bookkeeping — the
+/// caller sends the notifications.
+pub fn track_event(
+    tracker: &mut SubagentTracker,
+    event: &dto::SessionEvent,
+    parent_id: &str,
+) -> TrackerOutcome {
+    match event {
+        dto::SessionEvent::SessionCreated(created) => {
+            let Some(child_id) = created.sessionID.as_deref() else {
+                return TrackerOutcome::default();
+            };
+            if created.parentID.as_deref() != Some(parent_id) {
+                return TrackerOutcome::default();
+            }
+            let title = created.title.clone().unwrap_or_default();
+            match tracker.pair_created(child_id, &title) {
+                Some((child_id, call_id)) if !call_id.is_empty() => {
+                    let meta = tracker
+                        .child(&child_id)
+                        .expect("paired child tracked")
+                        .meta_open();
+                    TrackerOutcome {
+                        announce: Some((child_id, call_id, meta)),
+                        ..TrackerOutcome::default()
+                    }
+                }
+                // Unpaired (no spawner call observed) or already paired.
+                _ => TrackerOutcome::default(),
+            }
+        }
+        dto::SessionEvent::ToolInputStarted(t) => {
+            if is_spawner_name(&t.name) {
+                tracker.note_spawner_call(&t.base.id);
+            }
+            TrackerOutcome::default()
+        }
+        dto::SessionEvent::ToolInputEnded(t) => {
+            if tracker.call_child(&t.base.id).is_some() {
+                return TrackerOutcome::default();
+            }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                if let Some(child) = input_session_id(&parsed) {
+                    return pair_announce(tracker, &t.base.id, child);
+                }
+            }
+            TrackerOutcome::default()
+        }
+        dto::SessionEvent::ToolCalled(t) => {
+            if tracker.call_child(&t.base.id).is_some() {
+                return TrackerOutcome::default();
+            }
+            if let Some(child) = input_session_id(&t.input) {
+                return pair_announce(tracker, &t.base.id, child);
+            }
+            TrackerOutcome::default()
+        }
+        // The parent's spawner call announces its child on the wire:
+        // `metadata.sessionID` — the direct linkage. (Child tools ride
+        // their own session id, so this arm only ever sees parent calls.)
+        dto::SessionEvent::ToolProgress(p) => {
+            if p.base.sessionID != parent_id {
+                return TrackerOutcome::default();
+            }
+            let Some(child) = p
+                .metadata
+                .as_ref()
+                .and_then(|m| m.sessionID.as_deref())
+                .filter(|c| !c.is_empty())
+            else {
+                return TrackerOutcome::default();
+            };
+            if tracker.call_child(&p.base.id) == Some(child) {
+                return TrackerOutcome::default();
+            }
+            pair_announce(tracker, &p.base.id, child)
+        }
+        dto::SessionEvent::ToolSuccess(t) => {
+            terminal_call(tracker, &t.base.id)
+        }
+        dto::SessionEvent::ToolFailed(t) => {
+            terminal_call(tracker, &t.base.id)
+        }
+        _ => TrackerOutcome::default(),
+    }
+}
+
+/// Terminal bookkeeping for a paired/unpaired spawner call.
+fn terminal_call(
+    tracker: &mut SubagentTracker,
+    id: &str,
+) -> TrackerOutcome {
+    match tracker.call_child(id) {
+        Some(child_id) => {
+            let meta = tracker
+                .child(child_id)
+                .expect("paired child tracked")
+                .meta_closed();
+            TrackerOutcome {
+                complete: Some((id.to_string(), meta)),
+                ..TrackerOutcome::default()
+            }
+        }
+        None => {
+            tracker.retire_unpaired(id);
+            TrackerOutcome::default()
+        }
+    }
+}
+
+/// The shared tail of the direct-pairing arms: pair + build the announce.
+fn pair_announce(
+    tracker: &mut SubagentTracker,
+    call_id: &str,
+    child: &str,
+) -> TrackerOutcome {
+    let title = tracker.child(child).map(|t| t.title.clone()).unwrap_or_default();
+    match tracker.pair_direct(call_id, child, &title) {
+        Some((child_id, call_id)) => {
+            let meta = tracker.child(&child_id).expect("paired child tracked").meta_open();
+            TrackerOutcome {
+                announce: Some((child_id, call_id, meta)),
+                ..TrackerOutcome::default()
+            }
+        }
+        None => TrackerOutcome::default(),
+    }
+}
+
+/// Map one CHILD-session event to ACP updates addressed at the CHILD's own
+/// session id (native subagent mode). Returns (updates, card) — `card` is a
+/// refreshed content payload for the PARENT's task card when a child tool
+/// boundary advanced (the caller sends it as a parent-session
+/// `tool_call_update`).
+///
+/// Transcript entries are counted inside `track` (persistent across turns):
+/// the child's user message (inbox), one per distinct assistant message id,
+/// one per distinct tool call id — the index space `message_start/end_index`
+/// slices on the parent's task card.
+pub fn to_child_updates(
+    event: &dto::SessionEvent,
+    state: &mut MappingState,
+    track: &mut ChildTrack,
+) -> (Vec<SessionUpdate>, Option<(String, Vec<ToolCallContent>)>) {
+    match event {
+        // The child's task prompt: the user inbox item → user chunk.
+        dto::SessionEvent::InboxEnqueued(inbox)
+            if inbox.item.as_ref().and_then(|i| i.kind.as_deref()) == Some("user") =>
+        {
+            let Some(text) = inbox
+                .item
+                .as_ref()
+                .and_then(|i| i.payload.as_ref())
+                .and_then(|p| p.text.clone())
+            else {
+                return (Vec::new(), None);
+            };
+            track.record_message(&inbox.inboxID);
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+                .message_id(inbox.inboxID.as_str());
+            (vec![SessionUpdate::UserMessageChunk(chunk)], None)
+        }
+        dto::SessionEvent::TextDelta(d) => {
+            track.record_message(&d.base.assistantMessageID);
+            (
+                vec![SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(d.delta.clone())))
+                        .message_id(d.base.assistantMessageID.as_str()),
+                )],
+                None,
+            )
+        }
+        dto::SessionEvent::ReasoningDelta(d) => {
+            track.record_message(&d.base.assistantMessageID);
+            (
+                vec![SessionUpdate::AgentThoughtChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(d.delta.clone())))
+                        .message_id(d.base.assistantMessageID.as_str()),
+                )],
+                None,
+            )
+        }
+        dto::SessionEvent::ToolInputStarted(_)
+        | dto::SessionEvent::ToolInputEnded(_)
+        | dto::SessionEvent::ToolCalled(_)
+        | dto::SessionEvent::ToolSuccess(_)
+        | dto::SessionEvent::ToolFailed(_) => {
+            let updates = to_tool_updates(event, state, None);
+            let card = child_tool_boundary(event, state, track);
+            // One transcript entry per distinct tool call id.
+            if let Some(id) = tool_event_id(event) {
+                track.record_tool(id);
+            }
+            (updates, card)
+        }
+        other => (to_updates(other, state), None),
+    }
+}
+
+/// The raw opencode call id of a tool event.
+fn tool_event_id(event: &dto::SessionEvent) -> Option<&str> {
+    match event {
+        dto::SessionEvent::ToolInputStarted(t) => Some(&t.base.id),
+        dto::SessionEvent::ToolInputEnded(t) => Some(&t.base.id),
+        dto::SessionEvent::ToolCalled(t) => Some(&t.base.id),
+        dto::SessionEvent::ToolSuccess(t) => Some(&t.base.id),
+        dto::SessionEvent::ToolFailed(t) => Some(&t.base.id),
+        _ => None,
+    }
+}
+
+/// One-line label of a child tool boundary for the parent's task card: the
+/// tool name (at `input.started`), then `name <first string arg>` (at
+/// `called`). Keeps the card live without per-delta churn.
+fn child_tool_boundary(
+    event: &dto::SessionEvent,
+    state: &MappingState,
+    track: &mut ChildTrack,
+) -> Option<(String, Vec<ToolCallContent>)> {
+    match event {
+        dto::SessionEvent::ToolInputStarted(t) => {
+            track.push_card_line(t.name.clone());
+        }
+        dto::SessionEvent::ToolCalled(t) => {
+            let name = state.tool_title(&t.base.id).unwrap_or("tool").to_string();
+            let arg = t
+                .input
+                .as_object()
+                .and_then(|o| o.values().find_map(|v| v.as_str().map(str::to_string)))
+                .filter(|a| !a.is_empty());
+            let label = match arg {
+                Some(arg) if arg.len() <= 60 => format!("{name} {arg}"),
+                Some(mut arg) => {
+                    arg.truncate(60);
+                    format!("{name} {arg}…")
+                }
+                None => name,
+            };
+            track.push_card_line(label);
+        }
+        _ => return None,
+    }
+    let parent_call = track.parent_call.clone()?;
+    Some((parent_call, track.card_content()))
+}
+
+/// Count the transcript entries a child's persisted message records
+/// represent (user messages + assistant messages + tool parts) — the
+/// replay-side mirror of the live [`ChildTrack`] counting, so the
+/// `message_end_index` attached at replay matches the live slice math.
+pub fn count_entry_records(records: &[crate::dto::MessageRecord]) -> usize {
+    records
+        .iter()
+        .map(|r| match r.kind.as_str() {
+            "user" => 1,
+            "assistant" => {
+                1 + r
+                    .content
+                    .as_ref()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|p| matches!(p, crate::dto::Part::Tool { .. }))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// `to_updates`, but the tool-event arms carry an optional `_meta` — the
+/// subagent-spawner completion meta (Release 0.6.0) attached to the
+/// terminal update of the paired task call. Non-tool events delegate to
+/// [`to_updates`] (only tool terminals can carry it).
+pub fn to_updates_annotated(
+    event: &dto::SessionEvent,
+    state: &mut MappingState,
+    completion_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<SessionUpdate> {
+    match event {
+        dto::SessionEvent::ToolInputStarted(_)
+        | dto::SessionEvent::ToolInputEnded(_)
+        | dto::SessionEvent::ToolCalled(_)
+        | dto::SessionEvent::ToolSuccess(_)
+        | dto::SessionEvent::ToolFailed(_) => to_tool_updates(event, state, completion_meta),
+        other => to_updates(other, state),
+    }
+}
+
+/// Tool-event arms shared by the parent path (`to_updates`) and the
+/// child-session path (`to_child_updates`). Native subagent mode uses PLAIN
+/// call ids everywhere (no child namespace — the child's events are
+/// addressed to the child session itself).
+///
+/// `completion_meta`: `_meta` for the terminal update of a subagent-spawner
+/// call (`subagent_session_info` with `message_end_index`) — the caller
+/// (turn loop / background listener) computes it from the pairing tracker.
 fn to_tool_updates(
     event: &dto::SessionEvent,
-    ns: Option<&ToolNs>,
     state: &mut MappingState,
+    completion_meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Vec<SessionUpdate> {
     match event {
         dto::SessionEvent::ToolInputStarted(t) => {
             // ACP convention (mirrors the TS bridge): while input streams, the
             // call is advertised as `pending` with the tool name as title.
-            let id = tool_call_id(ns, &t.base.id);
+            let id = t.base.id.clone();
             state.tool_titles.insert(id.clone(), t.name.clone());
             state.open_tool(id.clone());
             // Release 0.3.2: the initial `ToolCall` declaration rides the
@@ -346,7 +928,7 @@ fn to_tool_updates(
             let mut out = Vec::with_capacity(2);
             if let Some(decl) = state.introduce_tool(
                 &id,
-                tool_title(ns, &t.name),
+                t.name.clone(),
                 tool_kind(&t.name),
                 ToolCallStatus::Pending,
                 None,
@@ -357,7 +939,7 @@ fn to_tool_updates(
                 &id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Pending)
-                    .title(tool_title(ns, &t.name)),
+                    .title(t.name.clone()),
             ));
             out
         }
@@ -365,7 +947,7 @@ fn to_tool_updates(
             // `text` is the raw JSON input string — pass it through verbatim
             // (the pending call's streaming input, as a JSON string value).
             // Also cache the parsed input for the permission prompt.
-            let id = tool_call_id(ns, &t.base.id);
+            let id = t.base.id.clone();
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t.text) {
                 state.tool_inputs.insert(id.clone(), parsed);
             }
@@ -390,7 +972,7 @@ fn to_tool_updates(
         }
         dto::SessionEvent::ToolCalled(t) => {
             // Parsed input now available → mark in progress.
-            let id = tool_call_id(ns, &t.base.id);
+            let id = t.base.id.clone();
             state.tool_inputs.insert(id.clone(), t.input.clone());
             let mut out = Vec::with_capacity(2);
             if let Some(decl) = state.introduce_tool(
@@ -411,7 +993,7 @@ fn to_tool_updates(
             out
         }
         dto::SessionEvent::ToolSuccess(t) => {
-            let id = tool_call_id(ns, &t.base.id);
+            let id = t.base.id.clone();
             state.close_tool(&id);
             // Introduce-with-terminal when the whole lifecycle was missed
             // (no input events at all): the event's own title field, then
@@ -431,7 +1013,7 @@ fn to_tool_updates(
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             if let Some(meta) = &t.metadata {
                 if let Some(title) = &meta.title {
-                    fields = fields.title(tool_title(ns, title));
+                    fields = fields.title(title.clone());
                 }
             }
             if let Some(content) = &t.content {
@@ -444,11 +1026,11 @@ fn to_tool_updates(
                     fields = fields.content(Some(blocks));
                 }
             }
-            out.push(tool_update(&id, fields));
+            out.push(tool_update_meta(&id, fields, completion_meta));
             out
         }
         dto::SessionEvent::ToolFailed(t) => {
-            let id = tool_call_id(ns, &t.base.id);
+            let id = t.base.id.clone();
             state.close_tool(&id);
             let mut out = Vec::with_capacity(2);
             let title = state
@@ -472,27 +1054,21 @@ fn to_tool_updates(
                 .message
                 .clone()
                 .unwrap_or_else(|| "Tool execution failed".to_string());
-            out.push(tool_update(
-                &id,
+            let update = ToolCallUpdate::new(
+                id.clone(),
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Failed)
                     .raw_output(serde_json::Value::String(message)),
-            ));
+            );
+            let update = match completion_meta {
+                Some(meta) => update.meta(meta.clone()),
+                None => update,
+            };
+            out.push(SessionUpdate::ToolCallUpdate(update));
             out
         }
         _ => vec![],
     }
-}
-
-/// Map a projected CHILD-session event to ACP updates. Only tool events have
-/// a projection (nested tool calls); child lifecycle/text/reasoning events
-/// are not surfaced (the parent's own stream carries the orchestration).
-pub fn to_child_updates(
-    event: &dto::SessionEvent,
-    ns: &ToolNs,
-    state: &mut MappingState,
-) -> Vec<SessionUpdate> {
-    to_tool_updates(event, Some(ns), state)
 }
 
 /// `_meta` object for a `session_info_update` (retry / compaction pushes).
@@ -599,7 +1175,7 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
         dto::SessionEvent::ToolInputStarted(t) => Some(&t.base.sessionID),
         dto::SessionEvent::ToolInputEnded(t) => Some(&t.base.sessionID),
         dto::SessionEvent::ToolCalled(t) => Some(&t.base.sessionID),
-        dto::SessionEvent::ToolProgress(t) => Some(&t.sessionID),
+        dto::SessionEvent::ToolProgress(t) => Some(&t.base.sessionID),
         dto::SessionEvent::ToolSuccess(t) => Some(&t.base.sessionID),
         dto::SessionEvent::ToolFailed(t) => Some(&t.base.sessionID),
         dto::SessionEvent::StepFailed(s) => Some(&s.session.sessionID),
@@ -624,6 +1200,20 @@ fn tool_update(
     fields: ToolCallUpdateFields,
 ) -> SessionUpdate {
     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string(), fields))
+}
+
+/// `tool_update` with an optional `_meta` (the subagent completion meta).
+fn tool_update_meta(
+    tool_call_id: &str,
+    fields: ToolCallUpdateFields,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> SessionUpdate {
+    match meta {
+        Some(meta) => SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(tool_call_id.to_string(), fields).meta(meta.clone()),
+        ),
+        None => tool_update(tool_call_id, fields),
+    }
 }
 
 /// Release 0.3.2: conservative ACP `ToolKind` from an opencode tool name —
@@ -1005,10 +1595,13 @@ mod tests {
                 snapshot: None,
                 started: None,
             }),
-            dto::SessionEvent::ToolProgress(dto::ToolRef {
-                sessionID: "ses_x".into(),
-                assistantMessageID: "msg_x".into(),
-                id: "call_x".into(),
+            dto::SessionEvent::ToolProgress(dto::ToolProgress {
+                base: dto::ToolRef {
+                    sessionID: "ses_x".into(),
+                    assistantMessageID: "msg_x".into(),
+                    id: "call_x".into(),
+                },
+                metadata: None,
             }),
         ] {
             assert!(to_updates(&ev, &mut state).is_empty(), "{ev:?} must map to nothing");
@@ -1483,82 +2076,450 @@ mod tests {
         );
     }
 
+// ================== Release 0.6.0: native subagent sessions ==================
+
+    fn child_track(id: &str, title: &str) -> ChildTrack {
+        let mut t = ChildTrack::new(id, title);
+        t.parent_call = Some(format!("call_task_{id}"));
+        t
+    }
+
+    fn subagent_info(
+        meta: &serde_json::Map<String, serde_json::Value>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        meta.get(SUBAGENT_META_KEY)
+            .and_then(|v| v.as_object())
+            .cloned()
+            .expect("subagent_session_info present")
+    }
+
+    /// Child tool events map with PLAIN ids (no `${child}:` namespace) and
+    /// count one transcript entry per call; the parent card gets a
+    /// title-prefixed content line per tool boundary.
     #[test]
-    fn child_projection_prefixes_ids_and_titles() {
+    fn child_events_map_to_plain_ids_and_count_entries() {
         let mut state = MappingState::new();
-        let ns = ToolNs {
-            child_id: "ses_child_1".into(),
-            child_title: "Explore the repo".into(),
-        };
+        let mut track = child_track("ses_child_1", "Explore the repo");
+
         let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
             base: tool_ref("ses_child_1", "msg_c1", "call_c1"),
             name: "grep".into(),
         });
-        let updates = to_child_updates(&started, &ns, &mut state);
-        // Release 0.3.2: the initial declaration precedes the update.
-        assert_eq!(updates.len(), 2);
+        let (updates, card) = to_child_updates(&started, &mut state, &mut track);
+        assert_eq!(updates.len(), 2, "declaration + update");
         let acp::SessionUpdate::ToolCall(c) = &updates[0] else {
             panic!("expected the initial tool_call declaration")
         };
-        assert_eq!(c.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
-        assert_eq!(c.title, "Explore the repo: grep");
-        assert_eq!(c.kind, acp::ToolKind::Read, "grep is a read-family tool");
-        assert_eq!(c.status, acp::ToolCallStatus::Pending);
-        let acp::SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
-            panic!("expected a tool_call update")
+        // PLAIN ids — the child session is addressed by the notification.
+        assert_eq!(c.tool_call_id.0.as_ref(), "call_c1");
+        assert_eq!(c.title, "grep");
+        assert_eq!(c.kind, acp::ToolKind::Read);
+        let (call_id, content) = card.expect("input.started is a card boundary");
+        assert_eq!(call_id, "call_task_ses_child_1");
+        let acp::ToolCallContent::Content(block) = &content[0] else {
+            panic!("card line is a text block")
         };
-        assert_eq!(u.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
-        assert_eq!(u.fields.title, Some("Explore the repo: grep".into()));
-        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Pending));
+        let acp::ContentBlock::Text(t) = &block.content else { panic!("text") };
+        assert_eq!(t.text, "Explore the repo: grep");
+        assert_eq!(track.entries, 1, "one tool call entry");
 
-        // Success closes the NAMESPACED id and prefixes the meta title.
-        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+        // called → richer label (name + first string arg).
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
             base: tool_ref("ses_child_1", "msg_c1", "call_c1"),
-            content: None,
-            metadata: Some(dto::ToolMetadata {
-                title: Some("grep *.rs".into()),
-                diff: None,
-                filediff: None,
-                files: None,
-                truncated: None,
-                diagnostics: None,
-            }),
+            input: serde_json::json!({ "pattern": "**/*.rs" }),
             executed: None,
         });
-        let updates = to_child_updates(&success, &ns, &mut state);
+        let (updates, card) = to_child_updates(&called, &mut state, &mut track);
+        assert_eq!(updates.len(), 1, "already declared — update only");
         let acp::SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
-            panic!("expected a tool_call update")
+            panic!("called maps to an update")
         };
-        assert_eq!(u.tool_call_id.0.as_ref(), "ses_child_1:call_c1");
-        assert_eq!(u.fields.title, Some("Explore the repo: grep *.rs".into()));
-        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Completed));
-        assert!(state.abandon_open_tools().is_empty(), "namespaced call closed");
+        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::InProgress));
+        let (_, content) = card.expect("called is a card boundary");
+        let acp::ToolCallContent::Content(block) = content.last().expect("newest line") else {
+            panic!()
+        };
+        let acp::ContentBlock::Text(t) = &block.content else { panic!() };
+        assert_eq!(t.text, "Explore the repo: grep **/*.rs");
+        assert_eq!(track.entries, 1, "same call id counts once");
 
-        // Non-tool child events do not project.
-        let exec = dto::SessionEvent::ExecutionStarted(dto::SessionRef {
-            sessionID: "ses_child_1".into(),
+        // A second call: new entry + the line list keeps both (cap 6).
+        let started2 = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_child_1", "msg_c2", "call_c2"),
+            name: "read".into(),
         });
-        assert!(to_child_updates(&exec, &ns, &mut state).is_empty());
+        let _ = to_child_updates(&started2, &mut state, &mut track);
+        assert_eq!(track.entries, 2);
+        assert_eq!(track.card_content().len(), 3, "started + called + started2 lines");
+
+        // The card line list wraps at MAX_CARD_LINES.
+        for i in 0..8 {
+            let ev = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_child_1", "msg_c2", &format!("call_more_{i}")),
+                name: "bash".into(),
+            });
+            let _ = to_child_updates(&ev, &mut state, &mut track);
+        }
+        assert_eq!(track.card_content().len(), MAX_CARD_LINES);
+    }
+
+    /// The child's user prompt (inbox, user item) → user chunk addressed to
+    /// the child session; text/reasoning chunks count per assistant message.
+    #[test]
+    fn child_prompt_and_text_chunks_address_the_child_and_count_entries() {
+        let mut state = MappingState::new();
+        let mut track = child_track("ses_child_1", "t");
+
+        let inbox = dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+            inboxID: "msg_inbox_child".into(),
+            sessionID: Some("ses_child_1".into()),
+            item: Some(dto::InboxEventItem {
+                kind: Some("user".into()),
+                payload: Some(dto::InboxPayload {
+                    text: Some(
+                        "You are a subagent spawned by another session.\nDo the thing".into(),
+                    ),
+                }),
+            }),
+        });
+        let (updates, card) = to_child_updates(&inbox, &mut state, &mut track);
+        assert!(card.is_none(), "inbox is not a card boundary");
+        assert_eq!(updates.len(), 1);
+        let acp::SessionUpdate::UserMessageChunk(c) = &updates[0] else {
+            panic!("expected user chunk")
+        };
+        assert_eq!(c.message_id.as_ref().map(|m| m.0.as_ref()), Some("msg_inbox_child"));
+        assert_eq!(track.entries, 1, "the user prompt is one entry");
+
+        // Many deltas of the SAME assistant message count once.
+        for _ in 0..3 {
+            let ev = dto::SessionEvent::ReasoningDelta(dto::TextDelta {
+                base: dto::OrdinalRef {
+                    sessionID: "ses_child_1".into(),
+                    assistantMessageID: "msg_child_a".into(),
+                    ordinal: Some(0),
+                },
+                delta: "think".into(),
+            });
+            let (updates, card) = to_child_updates(&ev, &mut state, &mut track);
+            assert!(card.is_none());
+            assert!(matches!(&updates[0], acp::SessionUpdate::AgentThoughtChunk(_)));
+        }
+        assert_eq!(track.entries, 2, "one entry per distinct assistant message");
         let text = dto::SessionEvent::TextDelta(dto::TextDelta {
             base: dto::OrdinalRef {
                 sessionID: "ses_child_1".into(),
-                assistantMessageID: "msg_c1".into(),
+                assistantMessageID: "msg_child_b".into(),
                 ordinal: Some(0),
             },
-            delta: "child thinking".into(),
+            delta: "answer".into(),
         });
-        assert!(to_child_updates(&text, &ns, &mut state).is_empty());
-        // …and the permission input cache is keyed by the namespaced id.
-        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
-            base: tool_ref("ses_child_1", "msg_c1", "call_c2"),
-            text: r#"{"command": "ls"}"#.into(),
+        let (updates, _) = to_child_updates(&text, &mut state, &mut track);
+        assert!(matches!(&updates[0], acp::SessionUpdate::AgentMessageChunk(_)));
+        assert_eq!(track.entries, 3);
+    }
+
+    /// The replayed-message entry math mirrors the live counting.
+    #[test]
+    fn count_entry_records_matches_live_slice_math() {
+        let record = |kind: &str, tools: usize| crate::dto::MessageRecord {
+            kind: kind.into(),
+            id: "msg_x".into(),
+            text: None,
+            agent: None,
+            model: None,
+            content: Some(
+                (0..tools)
+                    .map(|i| crate::dto::Part::Tool {
+                        id: format!("call_{i}"),
+                        name: "read".into(),
+                        executed: Some(true),
+                        state: crate::dto::ToolState::Completed {
+                            input: serde_json::Value::Null,
+                            content: None,
+                            metadata: None,
+                        },
+                        time: None,
+                    })
+                    .collect(),
+            ),
+            finish: None,
+            rawFinish: None,
+            cost: None,
+            tokens: None,
+            time: None,
+        };
+        // 1 user + 2 assistants (one with 2 tool parts) = 1 + 2 + 2 = 5.
+        let records = vec![
+            record("user", 0),
+            record("assistant", 2),
+            record("assistant", 0),
+            record("idle", 0),
+        ];
+        assert_eq!(count_entry_records(&records), 5);
+    }
+
+    /// Pairing via the `session.created` FIFO queue: the spawner call is
+    /// registered from its input events; the child's `session.created` pairs
+    /// with the OLDEST unpaired call and produces the open announce meta.
+    #[test]
+    fn tracker_pairs_created_child_with_oldest_spawner_call() {
+        let mut tracker = SubagentTracker::default();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_parent", "msg_p", "call_task_1"),
+            name: "subagent".into(),
         });
-        let _ = to_child_updates(&ended, &ns, &mut state);
+        let out = track_event(&mut tracker, &started, "ses_parent");
+        assert!(out.announce.is_none() && out.complete.is_none());
+        // A second spawner call inside the SAME turn (parallel subagents).
+        let started2 = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_parent", "msg_p", "call_task_2"),
+            name: "task".into(),
+        });
+        let _ = track_event(&mut tracker, &started2, "ses_parent");
+
+        let created = dto::SessionEvent::SessionCreated(dto::SessionCreated {
+            sessionID: Some("ses_child_a".into()),
+            parentID: Some("ses_parent".into()),
+            title: Some("Child A".into()),
+            ..Default::default()
+        });
+        let out = track_event(&mut tracker, &created, "ses_parent");
+        let (child_id, call_id, meta) = out.announce.expect("first child announces");
+        assert_eq!(child_id, "ses_child_a");
+        assert_eq!(call_id, "call_task_1", "oldest unpaired call wins");
+        let info = subagent_info(&meta);
+        assert_eq!(info.get("session_id").and_then(|v| v.as_str()), Some("ses_child_a"));
+        assert_eq!(info.get("message_start_index"), Some(&serde_json::json!(0)));
+        assert_eq!(info.get("message_end_index"), Some(&serde_json::Value::Null));
+
+        let created2 = dto::SessionEvent::SessionCreated(dto::SessionCreated {
+            sessionID: Some("ses_child_b".into()),
+            parentID: Some("ses_parent".into()),
+            title: Some("Child B".into()),
+            ..Default::default()
+        });
+        let out = track_event(&mut tracker, &created2, "ses_parent");
+        let (_, call_id, _) = out.announce.expect("second child announces");
+        assert_eq!(call_id, "call_task_2");
+        assert_eq!(tracker.call_child("call_task_1"), Some("ses_child_a"));
+        assert_eq!(tracker.call_child("call_task_2"), Some("ses_child_b"));
+
+        // Duplicate session.created for an already-paired child: no re-announce.
+        let out = track_event(&mut tracker, &created2, "ses_parent");
+        assert!(out.announce.is_none() && out.complete.is_none());
+    }
+
+    /// Continuation: the spawner call's input carries `sessionID` — paired
+    /// DIRECTLY with no `session.created`; the announce re-slices from the
+    /// accumulated entry count.
+    #[test]
+    fn tracker_pairs_continuation_via_input_session_id() {
+        let mut tracker = SubagentTracker::default();
+        // Turn 1: created-pairing.
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_parent", "msg_p", "call_task_1"),
+            name: "subagent".into(),
+        });
+        let _ = track_event(&mut tracker, &started, "ses_parent");
+        let created = dto::SessionEvent::SessionCreated(dto::SessionCreated {
+            sessionID: Some("ses_child".into()),
+            parentID: Some("ses_parent".into()),
+            title: Some("Child".into()),
+            ..Default::default()
+        });
+        let _ = track_event(&mut tracker, &created, "ses_parent");
+        // Simulate a full turn-1 child stream: prompt + one tool call.
+        tracker.child_mut("ses_child").unwrap().record_message("msg_in1");
+        tracker.child_mut("ses_child").unwrap().record_tool("call_c1");
+        assert_eq!(tracker.child("ses_child").unwrap().entries, 2);
+
+        // Turn 2 continuation: called carries sessionID; NO session.created.
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_parent", "msg_p2", "call_task_2"),
+            input: serde_json::json!({
+                "agent": "explorer",
+                "prompt": "continue",
+                "sessionID": "ses_child"
+            }),
+            executed: None,
+        });
+        let out = track_event(&mut tracker, &called, "ses_parent");
+        let (child_id, call_id, meta) = out.announce.expect("continuation announces");
+        assert_eq!(child_id, "ses_child");
+        assert_eq!(call_id, "call_task_2");
+        let info = subagent_info(&meta);
         assert_eq!(
-            state.tool_input("ses_child_1:call_c2"),
-            Some(&serde_json::json!({"command": "ls"}))
+            info.get("message_start_index"),
+            Some(&serde_json::json!(2)),
+            "the re-slice starts at the accumulated entry count"
         );
-        assert_eq!(state.tool_input("call_c2"), None);
+        // The continuation call completes: end = entries INCLUDING the new
+        // turn's traffic.
+        tracker.child_mut("ses_child").unwrap().record_tool("call_c2");
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_parent", "msg_p2", "call_task_2"),
+            content: Some(vec![dto::ToolContent::Text { text: "done".into() }]),
+            metadata: None,
+            executed: None,
+        });
+        let out = track_event(&mut tracker, &success, "ses_parent");
+        let (_, meta) = out.complete.expect("completion meta");
+        let info = subagent_info(&meta);
+        assert_eq!(info.get("message_start_index"), Some(&serde_json::json!(2)));
+        assert_eq!(info.get("message_end_index"), Some(&serde_json::json!(3)));
+    }
+
+    /// The progress-metadata linkage (`metadata.sessionID` on the parent's
+    /// spawner call) pairs DIRECTLY — the fallback when the queue is empty
+    /// or the pairing signal arrives late.
+    #[test]
+    fn tracker_pairs_via_progress_metadata() {
+        let mut tracker = SubagentTracker::default();
+        // No input.started observed (e.g. mid-turn attach): the progress
+        // linkage still pairs.
+        let progress = dto::SessionEvent::ToolProgress(dto::ToolProgress {
+            base: tool_ref("ses_parent", "msg_p", "call_task_1"),
+            metadata: Some(dto::ToolProgressMeta {
+                sessionID: Some("ses_child".into()),
+                status: Some("running".into()),
+            }),
+        });
+        let out = track_event(&mut tracker, &progress, "ses_parent");
+        let (child_id, call_id, meta) = out.announce.expect("progress announces");
+        assert_eq!((child_id.as_str(), call_id.as_str()), ("ses_child", "call_task_1"));
+        assert!(meta.contains_key(SUBAGENT_META_KEY));
+        // Idempotent: the same linkage again does not re-announce.
+        let out = track_event(&mut tracker, &progress, "ses_parent");
+        assert!(out.announce.is_none());
+        // A child's OWN tool progress (metadata {}) or other sessions'
+        // events never pair.
+        let child_progress = dto::SessionEvent::ToolProgress(dto::ToolProgress {
+            base: tool_ref("ses_child", "msg_c", "call_c1"),
+            metadata: Some(dto::ToolProgressMeta::default()),
+        });
+        assert!(track_event(&mut tracker, &child_progress, "ses_parent").announce.is_none());
+        let foreign = dto::SessionEvent::ToolProgress(dto::ToolProgress {
+            base: tool_ref("ses_other", "msg_o", "call_o"),
+            metadata: Some(dto::ToolProgressMeta {
+                sessionID: Some("ses_child".into()),
+                status: Some("running".into()),
+            }),
+        });
+        assert!(track_event(&mut tracker, &foreign, "ses_parent").announce.is_none());
+    }
+
+    /// A spawner call that dies without a child is retired — a later child
+    /// creation must not pair with the dead call.
+    #[test]
+    fn tracker_retires_unpaired_calls_on_terminal() {
+        let mut tracker = SubagentTracker::default();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_parent", "msg_p", "call_dead"),
+            name: "subagent".into(),
+        });
+        let _ = track_event(&mut tracker, &started, "ses_parent");
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_parent", "msg_p", "call_dead"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("child spawn failed".into()),
+            },
+        });
+        let out = track_event(&mut tracker, &failed, "ses_parent");
+        assert!(out.complete.is_none(), "unpaired calls get no completion meta");
+        let created = dto::SessionEvent::SessionCreated(dto::SessionCreated {
+            sessionID: Some("ses_child".into()),
+            parentID: Some("ses_parent".into()),
+            title: Some("Child".into()),
+            ..Default::default()
+        });
+        let out = track_event(&mut tracker, &created, "ses_parent");
+        assert!(
+            out.announce.is_none(),
+            "the dead call must not be paired (no card to announce)"
+        );
+        assert!(tracker.call_child("call_dead").is_none());
+    }
+
+    /// The full 0.6.0 subagent fixture (live 2.0.21 capture): pairing via
+    /// session.created, meta announce, child-id content, completion meta.
+    fn decode_native_fixture() -> Vec<dto::SessionEvent> {
+        let raw = include_str!("../../tests/fixtures/subagent-native.sse.jsonl");
+        let mut events = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") || line == "data: " {
+                continue;
+            }
+            let env: dto::EventEnvelope =
+                serde_json::from_str(&line[6..]).expect("envelope parses");
+            if let Some(ev) = dto::decode_event(&env.kind, &env.data) {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
+    /// Drive the captured live turn through the native machinery: the
+    /// pairing, the announce, child-id updates, card lines, and the terminal
+    /// completion meta all fall out of the real event order.
+    #[test]
+    fn native_fixture_drives_pairing_announce_and_completion() {
+        let events = decode_native_fixture();
+        let mut tracker = SubagentTracker::default();
+        let parent = "ses_efe9caf88ffeMl8ZrxaWo8sgoR";
+        let child = "ses_efe9c6aceffeAbuU5CkcIR1kH0";
+        let mut child_state = MappingState::new();
+        let mut announces = Vec::new();
+        let mut completions = Vec::new();
+        let mut cards = 0usize;
+        let mut child_updates = 0usize;
+        for ev in &events {
+            let out = track_event(&mut tracker, ev, parent);
+            if let Some((_, call_id, meta)) = out.announce {
+                announces.push((call_id, meta));
+            }
+            if let Some((call_id, meta)) = out.complete {
+                completions.push((call_id, meta));
+            }
+            let sid = event_session_id(ev);
+            if sid == Some(child) {
+                if let Some(track) = tracker.child_mut(child) {
+                    // Unpaired children buffer; paired ones map.
+                    if track.parent_call.is_some() {
+                        let (updates, card) = to_child_updates(ev, &mut child_state, track);
+                        child_updates += updates.len();
+                        if card.is_some() {
+                            cards += 1;
+                        }
+                    } else {
+                        track.buffer(ev.clone());
+                    }
+                }
+            }
+        }
+        // Two spawner turns (fresh + continuation) → two announces, two
+        // completion metas, all on the same child.
+        assert_eq!(announces.len(), 2, "fresh + continuation announce");
+        assert_eq!(completions.len(), 2);
+        assert!(announces[0].0.starts_with("call_"), "announce rides the spawner call");
+        assert!(completions[0].0.starts_with("call_"));
+        let first = subagent_info(&announces[0].1);
+        assert_eq!(first.get("session_id").and_then(|v| v.as_str()), Some(child));
+        assert_eq!(first.get("message_start_index"), Some(&serde_json::json!(0)));
+        let second = subagent_info(&announces[1].1);
+        assert_eq!(second.get("session_id").and_then(|v| v.as_str()), Some(child));
+        let second_start = second.get("message_start_index").and_then(|v| v.as_u64()).unwrap();
+        assert!(second_start > 0, "continuation re-slices from the accumulated count");
+        let end = subagent_info(&completions[1].1)["message_end_index"]
+            .as_u64()
+            .unwrap();
+        assert!(end >= second_start, "the closed slice covers the second turn");
+        assert!(child_updates > 0, "child events project");
+        assert!(cards > 0, "card lines appear on child tool boundaries");
+        let track = tracker.child(child).expect("child tracked");
+        assert_eq!(track.entries as u64, end, "end index = total child entries");
     }
 
     #[test]

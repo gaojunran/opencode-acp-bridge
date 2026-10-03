@@ -865,6 +865,10 @@ const SUBAGENT_PROMPT: &str = "Use the subagent tool with agent \"explorer\" and
 #[tokio::test]
 #[ignore = "requires BRIDGE_IT=1, the scratch server, and the subagent tool (OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS)"]
 async fn wave4_child_projection_e2e() {
+    // Release 0.6.0: NATIVE subagent mode — the parent's spawner call
+    // announces `_meta.subagent_session_info` (the open slice), child
+    // events stream to the CHILD's own session id with plain tool ids, and
+    // the spawner's terminal update closes the slice.
     if !it_enabled() {
         eprintln!("skipped: BRIDGE_IT=1 not set");
         return;
@@ -994,56 +998,98 @@ async fn wave4_child_projection_e2e() {
     let sid = sid_seen.lock().expect("sid lock").clone();
     let updates = all_updates.lock().expect("updates lock");
     assert!(!updates.is_empty(), "no session updates collected");
+    let parent_updates: Vec<&SessionNotification> =
+        updates.iter().filter(|n| &*n.session_id.0 == sid.as_str()).collect();
 
-    // 1. Every notification is addressed to the PARENT session — child
-    //    events ride the parent's ACP session (#48232 projection).
-    for n in updates.iter() {
-        assert_eq!(
-            n.session_id.0.as_ref(),
-            sid.as_str(),
-            "update addressed to the parent session, got {:?}",
-            n.update
-        );
-    }
-
-    // 2. The parent spawned a subagent: an unprefixed tool call titled
-    //    "subagent".
-    assert!(
-        updates.iter().any(|n| matches!(
-            &n.update,
-            SessionUpdate::ToolCallUpdate(u)
-                if !u.tool_call_id.0.contains(':')
-                    && u.fields.title.as_deref() == Some("subagent")
-        )),
-        "the subagent spawn is a normal parent tool call ({} updates)",
-        updates.len()
-    );
-
-    // 3. Child tool events project under the `${child.id}:` namespace, and
-    //    at least one child call completed.
-    let child_calls: Vec<_> = updates
+    // 1. Release 0.6.0 native subagents: the parent spawned a subagent —
+    //    the announce (`tool_call_update` carrying `_meta.subagent_session_info`
+    //    with the open slice) lands on the parent BEFORE any child traffic.
+    let announce_idx = parent_updates
         .iter()
-        .filter_map(|n| match &n.update {
-            SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.contains(":call_") => Some(u),
-            _ => None,
+        .position(|n| {
+            matches!(
+                &n.update,
+                SessionUpdate::ToolCallUpdate(u)
+                    if !u.tool_call_id.0.contains(':')
+                        && u.fields.status.is_none()
+                        && u.meta.as_ref().and_then(|m| m.get("subagent_session_info")).is_some()
+            )
         })
-        .collect();
+        .expect("the subagent announce on the parent stream");
+    let child_sid = {
+        let SessionUpdate::ToolCallUpdate(u) = &parent_updates[announce_idx].update else {
+            unreachable!()
+        };
+        u.meta.as_ref().unwrap()["subagent_session_info"]["session_id"]
+            .as_str()
+            .expect("child session id in the meta")
+            .to_string()
+    };
     assert!(
-        !child_calls.is_empty(),
-        "child tool calls projected with prefixed ids ({} updates)",
-        updates.len()
+        child_sid.starts_with("ses_"),
+        "the meta carries a real child session id: {child_sid}"
+    );
+
+    // 2. Child events are addressed to the CHILD session (Zed routes them
+    //    into the embedded subagent transcript) and use PLAIN tool ids.
+    let child_updates: Vec<&SessionNotification> = updates
+        .iter()
+        .filter(|n| &*n.session_id.0 == child_sid)
+        .collect();
+    assert!(!child_updates.is_empty(), "child-addressed notifications exist");
+    assert!(
+        child_updates.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::ToolCallUpdate(u) if u.fields.status == Some(ToolCallStatus::Completed)
+        )),
+        "at least one child tool call completed"
     );
     assert!(
-        child_calls
-            .iter()
-            .any(|u| u.fields.status == Some(ToolCallStatus::Completed)),
-        "at least one child tool call completed"
+        child_updates.iter().any(|n| matches!(
+            &n.update,
+            SessionUpdate::UserMessageChunk(_)
+        )),
+        "the child's task prompt projects as its user message"
+    );
+
+    // 3. Completion: the spawner's terminal update on the parent closes the
+    //    slice (message_end_index set, same session_id) and carries the
+    //    final output.
+    let completion = parent_updates
+        .iter()
+        .find(|n| {
+            matches!(
+                &n.update,
+                SessionUpdate::ToolCallUpdate(u)
+                    if u.fields.status == Some(ToolCallStatus::Completed)
+                        && u.meta.as_ref().and_then(|m| m.get("subagent_session_info")).is_some()
+            )
+        })
+        .expect("the spawner call completed with the closing meta");
+    let SessionUpdate::ToolCallUpdate(cu) = &completion.update else {
+        unreachable!()
+    };
+    let info = cu.meta.as_ref().unwrap()["subagent_session_info"].as_object().unwrap().clone();
+    assert_eq!(info["session_id"].as_str(), Some(child_sid.as_str()));
+    let start = info["message_start_index"].as_u64().unwrap();
+    let end = info["message_end_index"].as_u64().expect("the closed slice has an end");
+    assert!(end >= start, "slice covers the child transcript");
+
+    // 4. The parent's own stream keeps parent content only; the announce
+    //    preceded the first child-addressed notification.
+    let first_child_idx = updates
+        .iter()
+        .position(|n| &*n.session_id.0 == child_sid)
+        .expect("child notifications exist");
+    assert!(
+        announce_idx < first_child_idx,
+        "announce precedes any child traffic"
     );
 
     eprintln!(
-        "wave4 child projection: {} updates, {} child calls",
-        updates.len(),
-        child_calls.len()
+        "wave4 native subagent: {} parent updates, {} child updates, slice [{start}, {end}]",
+        parent_updates.len(),
+        child_updates.len()
     );
 }
 
