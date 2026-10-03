@@ -104,6 +104,10 @@ usage error.
   sessions
 - **Modes** — opencode agents (build/plan/…) exposed as ACP modes, switchable
   live, with remote switches reflected
+- **Model & agent pickers** — session model and agent as ACP config options
+  (what Zed renders as its pickers), switchable live via
+  `session/set_config_option`, with remote switches and catalog reloads
+  reflected as `config_option_update` pushes
 - **Slash commands** pushed to the editor as they become available
 - **aft plugin compatible** — image reads map to ACP image content blocks;
   `--no-aft` opts out of the hoist adaptations

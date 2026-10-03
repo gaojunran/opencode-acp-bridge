@@ -195,6 +195,7 @@ mod tests {
             Renamed(_) => "session.renamed",
             SessionCreated(_) => "session.created",
             AgentSelected(_) => "session.agent.selected",
+            ModelSelected(_) => "session.model.selected",
         }
     }
 

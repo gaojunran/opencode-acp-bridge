@@ -434,6 +434,68 @@ Self-heal: a `step.started.agent` differing from the tracked value (e.g. the
 server config changed the default agent) updates the tracked mode and emits
 `current_mode_update` once.
 
+## Config options (model + agent pickers, Release 0.3.0, wire-verified)
+
+Zed renders the model picker ONLY via ACP `configOptions`, and config options
+are UI-mutually-exclusive with the modes dropdown, so the bridge exposes BOTH
+pickers as session config options (`session/set_config_option`):
+
+1. **Capability gate**: `config_options` is sent ONLY when the client
+   declared `clientCapabilities.session.configOptions` (non-null) in
+   initialize. Zed declares it. The `modes` payload keeps flowing in ALL
+   cases (other clients use it; Zed ignores it when config options exist).
+2. **Agent option**: id `"agent"`, name `"Agent"`, category `mode`,
+   ungrouped select over the SAME visible-agent filter as the modes payload
+   (`mode ∈ {primary, all}` && `!hidden`); current value = the tracked agent
+   id. Omitted when the agents catalog is empty/failed **or** the current
+   agent drifted out of the visible list (never an unmatched current value).
+3. **Model option**: id `"model"`, name `"Model"`, category `model`, select
+   GROUPED by providerID (group id + name = providerID, first-seen order);
+   option value scheme `<providerID>/<id>` (CLI notation, split on the FIRST
+   `/` when resolving), display name = `name` falling back to `modelID` then
+   `id` (`GET /api/model` → `{data: [{id, modelID, providerID, name}…]}`).
+   Omitted when the model catalog is empty/failed.
+4. **UNKNOWN current model → `__default__`**: newSession cannot know the
+   model (session create sends none, the server assigns the config default;
+   the create response and fresh `GET /api/session/{id}` carry no model;
+   `/api/config` documents carry no default-model field; primary agents have
+   `model: null`). The current value is then the synthetic `"__default__"`,
+   and a synthetic `SessionConfigSelectOption{value:"__default__",
+   name:"Default"}` is PREPENDED to the first group — an unmatched current
+   value would render "Unknown" in Zed. There is no server API to unset a
+   model, so once the model is concrete the Default option is no longer
+   listed.
+5. **Current values for load/resume**: `GET /api/session/{id}` — its `agent`
+   and `model` fields are authoritative (includes post-switch state).
+   Fallbacks when absent/failed: agent = last assistant message's agent, then
+   the derived default; model = last assistant message's `model`, then
+   `__default__` (with Default listed).
+6. **`session/set_config_option` dispatch**:
+   - `config_id "model"` + `"<provider>/<model>"` → catalog lookup (the value
+     is a verbatim echo of what was pushed) → `POST /api/session/{id}/model`
+     body `{model: {id, providerID}}` → 204 → tracked model updated →
+     response + push carry the full state. `"__default__"` → no-op success
+     (echoes the current state; NO set-model call). Value not in the catalog
+     (e.g. a stale Zed-persisted default like `codebuddy/gpt-6-sol`) or a
+     failed switch → invalid-params error followed by a current-state push —
+     the client self-corrects.
+   - `config_id "agent"` → the exact `session/set_mode` wire (set_agent +
+     tracked mode + remote-echo suppression), kept alongside `set_mode` for
+     protocol compat.
+   - unknown config id → invalid-params error.
+7. **Push triggers** — `config_option_update` with the FULL state (both
+   options, current values) fires on: catalog reload (`model.updated` /
+   `provider.updated`, both `{}`, catalogs re-fetched), a remote
+   `session.model.selected {sessionID, model}` / `session.agent.selected`
+   switch, and `step.started` self-heals (the event carries `model` and
+   `agent` every step; a tracked-value mismatch updates + pushes). Echo
+   suppression: the bridge tracks the value BEFORE responding to
+   set_config_option/set_mode, so the server's own-switch echo diffs to zero.
+8. **Degrade**: agents fetch failed → agent option omitted; models fetch
+   failed → model option omitted; both failed or capability absent → no
+   `config_options` field at all. A config option is NEVER emitted with an
+   empty/blank current value that is not a listed option value.
+
 ## Governance for lanes
 
 - `src/dto.rs` is the shared contract. Lanes may **add** fields (with serde defaults)
