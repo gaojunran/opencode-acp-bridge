@@ -34,7 +34,7 @@ only — the wire contract is what this document says.
 | Run command | `POST /api/session/{id}/command` | `{command, arguments?…}` (verify vs openapi) |
 | Compact/summarize | `POST /api/session/{id}/compact` | |
 | Cancel turn | `POST /api/session/{id}/interrupt` | (dev calls this `abort`) |
-| Fork | `POST /api/session/{id}/fork` | |
+| Fork | `POST /api/session/{id}/fork` | `{"before": "msg_…"` \| `null`} → the NEW session's info (agent/model/location inherited from the parent) |
 | Switch model | `POST /api/session/{id}/model` | `{model: {id, providerID, variant?}}` → 204 |
 | Messages | `GET /api/session/{id}/message` | → `{data: [MessageRecord…], cursor}` (newest first) |
 | Message detail | `GET /api/session/{id}/message/{msgID}` | → message record |
@@ -65,6 +65,9 @@ for request/response schemas; fixtures are authoritative for real-world shapes.
 - `POST …/compact` and `POST …/fork` **require a JSON object body** (empty body →
   `400 InvalidRequestError "Expected object"`); use `{}` for compact, `{"before": …}`
   for fork.
+- `POST …/fork` on a session with **no messages** → `400 InvalidRequestError`
+  `{"message": "Cannot fork empty session: <id>", "kind": "empty_session"}`
+  (live-verified 2026-10-03).
 
 ## SSE event taxonomy (verified on the wire)
 
@@ -519,6 +522,40 @@ pickers as session config options (`session/set_config_option`):
    failed → model option omitted; both failed or capability absent → no
    `config_options` field at all. A config option is NEVER emitted with an
    empty/blank current value that is not a listed option value.
+
+## Session lifecycle close + fork (Release 0.4.0, wire-verified 2.0.21)
+
+1. **`session/close` is bridge-local — opencode has NO close concept.** The
+   2.0.21 OpenAPI (`/openapi.json`, probed 2026-10-03) contains no close-like
+   endpoint; sessions live in the server store until deleted. The ACP
+   contract (cancel ongoing work as if `session/cancel` was called, then free
+   resources) therefore maps to: flag the in-flight turn loop + best-effort
+   `POST /api/session/{id}/interrupt`, then drop the bridge's tracked entry.
+   The opencode session itself is left intact (a later `session/load`/
+   `session/resume` still works). Unknown sessions → no-op `{}` success.
+   Advertised via `sessionCapabilities.close` (stable schema 1.5.0).
+2. **`session/fork` is native opencode**: `POST /api/session/{id}/fork` with
+   body `{"before": "msg_…"}` or `{"before": null}` → `{data: Session.Info}`
+   of the NEW session. The ACP request has no boundary field, so the bridge
+   always sends `before: null` — the fork copies the full transcript up to
+   now.
+3. **Fork inheritance (live-verified on a real fork)**: the new session's
+   `Session.Info` carries `agent` and `model` inherited from the parent
+   (these are the authoritative current values for the ACP modes payload and
+   config options — NOT the synthetic `__default__` that newSession must
+   use), `location.directory` inherited from the parent, `title` suffixed
+   `" (fork #N)"`, and a `fork: {sessionID, boundary: {type: "before",
+   messageID}}` lineage field.
+4. **Bridge-side only fields**: `ForkSessionRequest.cwd` is used for the
+   agent-catalog fetch / mode derivation and the tracked entry — opencode
+   has no fork-into-directory support, the server session keeps the parent's
+   location. `additional_directories` and `mcp_servers` are not modeled on
+   the wire and are ignored.
+5. **Error path**: an empty parent (no messages) → the 400
+   `empty_session` above, surfaced by the bridge as an internal error (the
+   request itself was valid — the parent just has no history to fork).
+   Advertised via `sessionCapabilities.fork` (unstable, enabled by the
+   `unstable_session_fork` umbrella feature the bridge pins).
 
 ## Governance for lanes
 

@@ -1,9 +1,12 @@
 //! ACP agent assembly.
 //!
 //! Protocol surface: initialize / newSession / loadSession / resume / list /
-//! delete / prompt / cancel (Wave 6a closes the session-management ring:
-//! `session/list`, `session/resume`, `session/delete` + the
-//! `available_commands_update` initial push). The ACP ↔ opencode wiring runs
+//! delete / close / fork / prompt / cancel (Wave 6a closed the
+//! session-management ring — `session/list`, `session/resume`, `session/delete`
+//! + the `available_commands_update` initial push; Release 0.4.0 added
+//! `session/close` (bridge-local cleanup — opencode has no close concept) and
+//! `session/fork` (the `unstable_session_fork` wire, backed by opencode's
+//! native `POST /api/session/{id}/fork`)). The ACP ↔ opencode wiring runs
 //! through the [`OpenCodeBackend`] trait (implemented by the HTTP/SSE lane),
 //! which keeps this module fully mock-testable.
 //!
@@ -114,6 +117,19 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     /// unavailable — same wave boundary as [`Self::list_models`].
     fn delete_session(&self, _session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         Box::pin(async { Err(anyhow::anyhow!("delete_session not available on this backend")) })
+    }
+
+    /// Release 0.4.0: fork a session (`session/fork` backend) — `POST
+    /// /api/session/{id}/fork` at the LATEST boundary (`before: null`; the
+    /// ACP fork request has no boundary field). Returns the NEW session's
+    /// wire record — its `agent`/`model` are authoritative for the forked
+    /// session's mode/config-option current values (wire-verified: a fork
+    /// inherits the parent's agent + model). Default: unavailable.
+    fn fork_session(
+        &self,
+        _session_id: &str,
+    ) -> BoxFuture<'_, Result<dto::SessionInfo, anyhow::Error>> {
+        Box::pin(async { Err(anyhow::anyhow!("fork_session not available on this backend")) })
     }
 
     /// Wave 6b: the agent catalog for a directory (`GET /api/agent` with
@@ -279,6 +295,26 @@ impl AgentService {
                 },
                 on_receive_request!(),
             )
+            // ---------- closeSession (Release 0.4.0) ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::CloseSessionRequest, responder, _cx| {
+                        svc.close_session(req, responder).await
+                    }
+                },
+                on_receive_request!(),
+            )
+            // ---------- forkSession (Release 0.4.0, unstable_session_fork) ----------
+            .on_receive_request(
+                {
+                    let svc = Arc::clone(&self);
+                    async move |req: acp::ForkSessionRequest, responder, cx| {
+                        svc.fork_session(req, responder, cx).await
+                    }
+                },
+                on_receive_request!(),
+            )
             // ---------- setMode ----------
             .on_receive_request(
                 {
@@ -353,12 +389,17 @@ impl AgentService {
     ) -> Result<(), AcpError> {
         // Wave 6a: advertise the session-management ring. Each sub-capability
         // is a marker struct — `{}` on the wire (schema 1.5.0 stable; only
-        // `fork` is unstable-feature-gated, we do not advertise it).
+        // `fork` is unstable-feature-gated, which the `unstable` umbrella
+        // enables — so the bridge advertises and serves `session/fork`).
         let caps = acp::AgentCapabilities::new().load_session(true).session_capabilities(
             acp::SessionCapabilities::new()
                 .list(acp::SessionListCapabilities::new())
                 .delete(acp::SessionDeleteCapabilities::new())
-                .resume(acp::SessionResumeCapabilities::new()),
+                .resume(acp::SessionResumeCapabilities::new())
+                // Release 0.4.0: close (bridge-local cleanup — see the
+                // handler docs) + fork (unstable_session_fork).
+                .close(acp::SessionCloseCapabilities::new())
+                .fork(acp::SessionForkCapabilities::new()),
         );
         // Release 0.3.0: the config-options capability gate. Zed declares
         // `clientCapabilities.session.configOptions` → it renders the model
@@ -852,6 +893,121 @@ impl AgentService {
                 ))
             }
         }
+    }
+
+    /// Release 0.4.0 `session/close`: the client is done with the session.
+    /// Per the ACP contract, ongoing work is cancelled (the exact
+    /// `session/cancel` semantics: flag the turn loop + best-effort
+    /// interrupt) and the session's resources are freed. opencode has NO
+    /// close concept (OpenAPI probe: no close endpoint exists; sessions
+    /// live in the server store until deleted), so this is a bridge-local
+    /// cleanup: the tracked entry is dropped and the opencode session is
+    /// left intact. Unknown sessions are a no-op success (nothing to free).
+    async fn close_session(
+        &self,
+        req: acp::CloseSessionRequest,
+        responder: Responder<acp::CloseSessionResponse>,
+    ) -> Result<(), AcpError> {
+        let Some(entry) = self.sessions.lock().expect("sessions lock").remove(&req.session_id) else {
+            tracing::info!(session = %req.session_id, "ACP session/close (unknown session — no-op)");
+            return responder.respond(acp::CloseSessionResponse::new());
+        };
+        // Cancel semantics of `session/cancel`: flag the in-flight turn
+        // loop, then interrupt opencode best-effort (the spawned prompt task
+        // holds its own Arc to the entry, so removing the registry entry
+        // does not strand it — the drained turn still answers its prompt
+        // with Cancelled).
+        entry.cancel.store(true, Ordering::Release);
+        if let Err(e) = self.backend.interrupt(&req.session_id.0).await {
+            tracing::warn!(error = %e, session = %req.session_id, "close: interrupt call failed");
+        }
+        tracing::info!(session = %req.session_id, "ACP session/close -> unregistered (opencode session kept)");
+        responder.respond(acp::CloseSessionResponse::new())
+    }
+
+    /// Release 0.4.0 `session/fork`: fork an opencode session at its LATEST
+    /// boundary (`POST /api/session/{id}/fork`, body `{"before": null}` —
+    /// the ACP request has no boundary field, so the fork copies the full
+    /// transcript up to now). The fork response's `agent`/`model` are
+    /// authoritative for the new session's mode/config-option current values
+    /// (wire-verified: a forked session inherits the parent's agent and
+    /// model). The request `cwd` is bridge-side only — opencode forks
+    /// inherit the parent's location (no fork-into-directory support), so it
+    /// is used for the catalog fetch and the tracked entry, while the
+    /// response carries the server's real values. `additional_directories`
+    /// and `mcp_servers` are not modeled on the wire and are ignored.
+    async fn fork_session(
+        self: &Arc<Self>,
+        req: acp::ForkSessionRequest,
+        responder: Responder<acp::ForkSessionResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), AcpError> {
+        if !req.cwd.is_absolute() {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "message": "fork.cwd must be an absolute path"
+                })),
+            );
+        }
+        let info = match self.backend.fork_session(&req.session_id.0).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::error!(error = %e, session = %req.session_id, "backend fork_session failed");
+                return responder.respond_with_internal_error(format!(
+                    "opencode session fork failed: {e}"
+                ));
+            }
+        };
+        let new_id = acp::SessionId::from(info.id.clone());
+        let cwd = req.cwd.to_string_lossy().to_string();
+        // Modes + derived default from the catalog for the client-declared
+        // cwd; the forked session's own agent (inherited from the parent) is
+        // authoritative for the current mode when present.
+        let agents = self.fetch_agents(&cwd).await;
+        let current = info
+            .agent
+            .clone()
+            .or_else(|| default_mode_id(&agents));
+        // Same as load/resume: the new session's model from the wire record
+        // (inherited from the parent), else UNKNOWN -> "__default__".
+        let current_model = info.model.clone();
+        let modes = to_session_modes(&agents);
+        // Register the fork so a subsequent prompt routes (like load/resume:
+        // unconditional — the wire session exists server-side).
+        self.sessions.lock().expect("sessions lock").insert(
+            new_id.clone(),
+            Arc::new(SessionEntry {
+                cancel: AtomicBool::new(false),
+                cwd: cwd.clone(),
+                mode: Mutex::new(current.clone()),
+                model: Mutex::new(current_model.clone()),
+            }),
+        );
+        let mut response = if modes.is_empty() {
+            acp::ForkSessionResponse::new(new_id.clone())
+        } else {
+            acp::ForkSessionResponse::new(new_id.clone()).modes(acp::SessionModeState::new(
+                current.clone().expect("modes non-empty ⇒ a derived default exists"),
+                modes,
+            ))
+        };
+        if self.config_options_supported.load(Ordering::SeqCst) {
+            let options = build_config_options(
+                &agents,
+                self.backend.list_models().await.as_deref().unwrap_or(&[]),
+                current.as_deref(),
+                current_model.as_ref(),
+            );
+            if !options.is_empty() {
+                response = response.config_options(options);
+            }
+        }
+        tracing::info!(session = %req.session_id, fork = %new_id, "ACP session/fork -> opencode");
+        responder.respond(response)?;
+        // Same session-establishment push as new/load/resume (spawned — it
+        // must never gate the fork).
+        self.spawn_commands_push(&new_id, &cx);
+        Ok(())
     }
 
     async fn load_session(
@@ -2092,6 +2248,12 @@ mod tests {
         /// Release 0.3.0: force `set_model` to fail (proves the error+push
         /// degrade path).
         set_model_fail: AtomicBool,
+        /// Release 0.4.0: canned fork result (the NEW session's wire record).
+        fork_out: Mutex<Option<dto::SessionInfo>>,
+        /// Release 0.4.0: session ids passed to `fork_session`.
+        forked: Mutex<Vec<String>>,
+        /// Release 0.4.0: force `fork_session` to fail (proves the error path).
+        fork_fail: AtomicBool,
     }
 
     impl MockBackend {
@@ -2120,6 +2282,9 @@ mod tests {
                 get_session_calls: Mutex::new(Vec::new()),
                 set_model_calls: Mutex::new(Vec::new()),
                 set_model_fail: AtomicBool::new(false),
+                fork_out: Mutex::new(None),
+                forked: Mutex::new(Vec::new()),
+                fork_fail: AtomicBool::new(false),
             })
         }
 
@@ -2217,6 +2382,20 @@ mod tests {
         /// path must still push the current state).
         fn fail_set_model(&self) {
             self.set_model_fail.store(true, Ordering::SeqCst);
+        }
+
+        /// Canned fork result: the NEW session's wire record.
+        fn set_fork(&self, info: dto::SessionInfo) {
+            *self.fork_out.lock().expect("fork lock") = Some(info);
+        }
+
+        fn recorded_forked(&self) -> Vec<String> {
+            self.forked.lock().expect("fork lock").clone()
+        }
+
+        /// Make the next `fork_session` call fail (the error path).
+        fn fail_fork(&self) {
+            self.fork_fail.store(true, Ordering::SeqCst);
         }
     }
 
@@ -2345,6 +2524,22 @@ mod tests {
         fn delete_session(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
             self.deleted.lock().expect("deleted lock").push(session_id.to_string());
             Box::pin(async { Ok(()) })
+        }
+
+        fn fork_session(
+            &self,
+            session_id: &str,
+        ) -> BoxFuture<'_, Result<dto::SessionInfo, anyhow::Error>> {
+            self.forked.lock().expect("fork lock").push(session_id.to_string());
+            let out = self.fork_out.lock().expect("fork lock").clone();
+            let fail = self.fork_fail.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(anyhow::anyhow!("mock fork failure"))
+                } else {
+                    out.ok_or_else(|| anyhow::anyhow!("no canned fork result"))
+                }
+            })
         }
 
         fn agents(&self, _directory: &str) -> BoxFuture<'_, Result<Vec<dto::AgentInfo>, anyhow::Error>> {
@@ -3687,7 +3882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_advertises_list_delete_resume_capabilities() {
+    async fn initialize_advertises_list_delete_resume_close_fork_capabilities() {
         let backend = MockBackend::new();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
@@ -3701,8 +3896,11 @@ mod tests {
             assert!(caps.session_capabilities.list.is_some(), "session/list advertised");
             assert!(caps.session_capabilities.delete.is_some(), "session/delete advertised");
             assert!(caps.session_capabilities.resume.is_some(), "session/resume advertised");
-            // Not advertised: close, fork (unstable), additionalDirectories.
-            assert!(caps.session_capabilities.close.is_none());
+            // Release 0.4.0: close (stable) + fork (unstable_session_fork,
+            // enabled by the `unstable` umbrella) are advertised too.
+            assert!(caps.session_capabilities.close.is_some(), "session/close advertised");
+            assert!(caps.session_capabilities.fork.is_some(), "session/fork advertised");
+            // Not advertised: additionalDirectories.
             assert!(caps.session_capabilities.additional_directories.is_none());
             Ok(())
         })
@@ -3844,6 +4042,235 @@ mod tests {
         .await;
         outcome.expect("client run ok");
         assert_eq!(backend.recorded_deleted(), vec!["ses_mock_1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn close_cancels_inflight_turn_and_unregisters() {
+        let backend = MockBackend::new();
+        let interrupt_seen = backend.install_interrupt_seen();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let sid = ns.session_id.clone();
+            // Empty response `{}` on success.
+            let _ = cx
+                .send_request(acp::CloseSessionRequest::new(sid.clone()))
+                .block_task()
+                .await?;
+            // The registry entry is gone: a prompt must fail as unknown.
+            let err = cx
+                .send_request(PromptRequest::new(
+                    sid,
+                    vec![ContentBlock::Text(TextContent::new("hi"))],
+                ))
+                .block_task()
+                .await
+                .expect_err("closed session must be unknown");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        // Close cancels ongoing work exactly like `session/cancel`: the
+        // turn loop is flagged AND opencode is interrupted (best-effort).
+        tokio::time::timeout(std::time::Duration::from_secs(5), interrupt_seen)
+            .await
+            .expect("close must interrupt opencode")
+            .expect("interrupt oneshot fired");
+        assert!(
+            backend.interrupted.load(Ordering::SeqCst),
+            "interrupt call observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_unknown_session_is_noop_success() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            // Nothing to free for a session this bridge never tracked: `{}`.
+            let _ = cx
+                .send_request(acp::CloseSessionRequest::new("ses_never_opened"))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(
+            !backend.interrupted.load(Ordering::SeqCst),
+            "no interrupt without a tracked session"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_registers_new_session_and_prompt_routes() {
+        let backend = MockBackend::new();
+        // The fork answer mirrors the live wire: the NEW session's record,
+        // with the parent's agent+model inherited (wire-verified).
+        let mut fork_info =
+            wire_session("ses_fork_1", None, Some("/tmp/opencode/acp-fixture-project"), None);
+        fork_info.agent = Some("orchestrator".into());
+        backend.set_fork(fork_info);
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(
+            svc,
+            Arc::clone(&backend),
+            move |backend, _collected, cx| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let parent = ns.session_id.clone();
+                // No catalog → empty modes → the modes payload is omitted
+                // (same degrade as newSession/load/resume).
+                let fork = cx
+                    .send_request(acp::ForkSessionRequest::new(
+                        parent.clone(),
+                        "/tmp/opencode/acp-fixture-project",
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(fork.session_id.0.as_ref(), "ses_fork_1");
+                assert!(fork.modes.is_none(), "empty catalog omits the modes payload");
+                assert!(fork.config_options.is_none());
+                // The forked session is registered: a prompt must route
+                // (and end) on the NEW id.
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_fork_1".into(),
+                }));
+                let prompt = cx
+                    .send_request(PromptRequest::new(
+                        fork.session_id,
+                        vec![ContentBlock::Text(TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(prompt.stop_reason, acp::StopReason::EndTurn);
+                Ok(())
+            },
+        )
+        .await;
+        outcome.expect("client run ok");
+        assert_eq!(
+            backend.recorded_forked(),
+            vec!["ses_mock_1".to_string()],
+            "fork called on the parent session"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_agent_and_model_into_modes_and_config_options() {
+        let backend = MockBackend::new();
+        backend.set_agents(vec![wire_agent("orchestrator", "primary", false, None)]);
+        backend.set_models(catalog_models());
+        // The fork record's agent/model are authoritative (inherited from
+        // the parent — the exact real-wire shape).
+        backend.set_fork({
+            let mut info = wire_session("ses_fork_1", None, Some("/tmp"), None);
+            info.agent = Some("orchestrator".into());
+            info.model = Some(dto::ModelRef {
+                id: "GLM-5.3-astra".into(),
+                providerID: "astra".into(),
+                variant: Some("default".into()),
+            });
+            info
+        });
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _collected, cx| async move {
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let fork = cx
+                .send_request(acp::ForkSessionRequest::new(
+                    ns.session_id,
+                    "/tmp/opencode/acp-fixture-project",
+                ))
+                .block_task()
+                .await?;
+            // Modes: current = the forked session's inherited agent.
+            let modes = fork.modes.as_ref().expect("modes payload present");
+            assert_eq!(modes.current_mode_id.0.as_ref(), "orchestrator");
+            assert_eq!(modes.available_modes.len(), 1);
+            // Config options: current values from the fork record, NOT
+            // "__default__" (the fork knows the model — unlike newSession).
+            let opts = fork.config_options.as_ref().expect("config options present");
+            let agent = as_select(option_by_id(opts, "agent"));
+            assert_eq!(agent.current_value.0.as_ref(), "orchestrator");
+            let model = as_select(option_by_id(opts, "model"));
+            assert_eq!(model.current_value.0.as_ref(), "astra/GLM-5.3-astra");
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn fork_backend_error_surfaces_as_internal_error() {
+        let backend = MockBackend::new();
+        backend.fail_fork();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let ns = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let err = cx
+                .send_request(acp::ForkSessionRequest::new(ns.session_id, "/tmp"))
+                .block_task()
+                .await
+                .expect_err("backend fork failure must surface");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InternalError);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_relative_cwd_without_backend_call() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
+        let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_backend, _c, cx| async move {
+            let _ = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let err = cx
+                .send_request(acp::ForkSessionRequest::new("ses_any", "relative/path"))
+                .block_task()
+                .await
+                .expect_err("relative cwd must be rejected");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+            Ok(())
+        })
+        .await;
+        outcome.expect("client run ok");
+        assert!(
+            backend.recorded_forked().is_empty(),
+            "a rejected fork must not reach the backend"
+        );
     }
 
     #[tokio::test]

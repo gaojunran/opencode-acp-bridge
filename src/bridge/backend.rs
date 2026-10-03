@@ -165,6 +165,18 @@ impl OpenCodeBackend for HttpBackend {
         })
     }
 
+    fn fork_session(
+        &self,
+        session_id: &str,
+    ) -> BoxFuture<'_, Result<crate::dto::SessionInfo, anyhow::Error>> {
+        let client = self.client.clone();
+        let session_id = session_id.to_string();
+        // Fork at the latest boundary (`before: null`): the ACP fork request
+        // has no boundary field, so the new session copies the full
+        // transcript up to now.
+        Box::pin(async move { Ok(client.fork(&session_id, None).await?) })
+    }
+
     fn agents(&self, directory: &str) -> BoxFuture<'_, Result<Vec<crate::dto::AgentInfo>, anyhow::Error>> {
         let client = self.client.clone();
         let directory = directory.to_string();

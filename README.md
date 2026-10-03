@@ -93,7 +93,9 @@ usage error.
 ## Features
 
 - **Sessions, shared everywhere** — create, resume with full history replay,
-  list, delete; every window sees the same sessions on the same server
+  list, delete, close (bridge-local cancellation + unregister), fork
+  (native opencode fork with full-transcript copy); every window sees the
+  same sessions on the same server
 - **Streaming turns** — text, reasoning, and tool-call events; cancel maps to
   interrupt with a bounded drain of in-flight tools
 - **Editor attachments** — `@`-file references and pasted images travel to
@@ -125,7 +127,7 @@ behavior verified against a real server:
 | Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | private `opencode serve` per window — ~255 MB + ~8 s each, sessions invisible across windows | one shared server — ~10–20 MB bridge process, ms-scale startup, sessions shared |
 | Diff blocks for file edits ([#52636](https://github.com/anomalyco/opencode/issues/52636)) | only from the `edit` tool's inputs; `write` / `apply_patch` / plugin tools produce none | result-metadata driven, covers every edit path incl. plugin tools |
 | Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | replies hang — they never reach the child session that asked | routed to the asking session, round-trip verified |
-| Session & mode surface | `session/list` / `resume` / `delete`, `set_mode`, command pushes (present in source) | full parity, plus `current_mode_update` on remote switches |
+| Session & mode surface | `session/list` / `resume` / `delete` / `fork`, `set_mode`, command pushes (present in source) | full parity, plus `current_mode_update` on remote switches and `session/close` (bridge-local; official has no close surface) |
 
 Not mappable on either side: todo/plan outlines
 ([#40745](https://github.com/anomalyco/opencode/issues/40745)) — the
