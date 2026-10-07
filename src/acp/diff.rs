@@ -201,13 +201,37 @@ fn strip_git_prefix(p: &str) -> String {
         .to_string()
 }
 
+/// Which file-side a content line belongs to — the `\ No newline at end of
+/// file` marker annotates the content line directly above it.
+#[derive(Clone, Copy)]
+enum Side {
+    /// A context line (` ` prefix) — belongs to both sides.
+    Both,
+    Old,
+    New,
+}
+
 /// Parse one file's body (after the `Index:` line) into hunks and rebuild
 /// old/new text. Returns `Ok(None)` when there is nothing to diff.
 fn parse_section(file: &str, body: &[&str]) -> Result<Option<ParsedDiff>, String> {
     let mut old_lines: Vec<String> = Vec::new();
     let mut new_lines: Vec<String> = Vec::new();
+    // `\ No newline at end of file` marker state: true ⇒ the side's last
+    // line carries NO terminating newline. A marker sets its side(s); any
+    // later content line on that side clears it again — so only a marker
+    // on the side's final line survives.
+    //
+    // Release 0.8.3: without marker-aware trailing newlines (and
+    // `join_lines` defaulting to `\n`), EOF-appended blocks whose tail
+    // repeats the old file's closing lines rendered shifted in Zed —
+    // imara-diff tokenizes the final "x" and the mid-file "x\n"
+    // differently, so the common-suffix match latched onto the wrong
+    // duplicate.
+    let mut old_no_nl = false;
+    let mut new_no_nl = false;
 
     let mut in_hunk = false;
+    let mut prev: Option<Side> = None;
     for line in body {
         if line.starts_with("@@") {
             // Loose hunk-header validation: `@@ -a[,b] +c[,d] @@`.
@@ -215,6 +239,7 @@ fn parse_section(file: &str, body: &[&str]) -> Result<Option<ParsedDiff>, String
                 return Err(format!("malformed hunk header: {line:?}"));
             }
             in_hunk = true;
+            prev = None;
             continue;
         }
         if !in_hunk {
@@ -223,12 +248,34 @@ fn parse_section(file: &str, body: &[&str]) -> Result<Option<ParsedDiff>, String
         match line.chars().next() {
             Some(' ') => {
                 let content = line[1..].to_string();
+                old_no_nl = false;
+                new_no_nl = false;
                 old_lines.push(content.clone());
                 new_lines.push(content);
+                prev = Some(Side::Both);
             }
-            Some('-') => old_lines.push(line[1..].to_string()),
-            Some('+') => new_lines.push(line[1..].to_string()),
-            // '\' = "\ No newline at end of file" markers; other junk ignored.
+            Some('-') => {
+                old_no_nl = false;
+                old_lines.push(line[1..].to_string());
+                prev = Some(Side::Old);
+            }
+            Some('+') => {
+                new_no_nl = false;
+                new_lines.push(line[1..].to_string());
+                prev = Some(Side::New);
+            }
+            // `\` = "\ No newline at end of file": flags the side(s) of the
+            // line directly above (context = both; `-` = old; `+` = new).
+            Some('\\') => match prev {
+                Some(Side::Both) => {
+                    old_no_nl = true;
+                    new_no_nl = true;
+                }
+                Some(Side::Old) => old_no_nl = true,
+                Some(Side::New) => new_no_nl = true,
+                None => {}
+            },
+            // Other junk ignored.
             _ => {}
         }
     }
@@ -237,8 +284,8 @@ fn parse_section(file: &str, body: &[&str]) -> Result<Option<ParsedDiff>, String
         return Ok(None);
     }
 
-    let old_text = join_lines(&old_lines);
-    let new_text = join_lines(&new_lines);
+    let old_text = join_lines(&old_lines, old_no_nl);
+    let new_text = join_lines(&new_lines, new_no_nl);
 
     // New-file detection: the old side is empty (git `-0,0`) or only carries
     // the fixture's phantom empty `-\n` trailer. ACP: old_text = None.
@@ -268,10 +315,18 @@ fn parse_section(file: &str, body: &[&str]) -> Result<Option<ParsedDiff>, String
     }))
 }
 
-/// Join diff lines without a trailing newline (the patch cannot tell us
-/// whether the last line was newline-terminated).
-fn join_lines(lines: &[String]) -> String {
-    lines.join("\n")
+/// Rebuild one side's text. Every line is newline-terminated by default —
+/// a unified diff only omits the file's final newline when that side's
+/// last line carries the `\ No newline at end of file` marker (`no_nl`).
+fn join_lines(lines: &[String], no_nl: bool) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut s = lines.join("\n");
+    if !no_nl {
+        s.push('\n');
+    }
+    s
 }
 
 #[cfg(test)]
@@ -311,7 +366,7 @@ mod tests {
         };
         assert_eq!(d.path.to_string_lossy(), "/tmp/opencode/hello-acp-test.txt");
         assert_eq!(d.old_text, None, "new file: old_text must be None (ACP contract)");
-        assert_eq!(d.new_text, "bridge test line");
+        assert_eq!(d.new_text, "bridge test line\n");
     }
 
     #[test]
@@ -327,7 +382,7 @@ mod tests {
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Diff(d) = &blocks[0] else { panic!("Diff expected") };
-        assert_eq!(d.new_text, "bridge test line");
+        assert_eq!(d.new_text, "bridge test line\n");
     }
 
     #[test]
@@ -353,11 +408,11 @@ mod tests {
         assert_eq!(d.path.to_string_lossy(), "/repo/src/main.rs");
         assert_eq!(
             d.old_text.as_deref(),
-            Some("use std::io;\nfn main() {\n   println!(\"hi\");\n}")
+            Some("use std::io;\nfn main() {\n   println!(\"hi\");\n}\n")
         );
         assert_eq!(
             d.new_text,
-            "use std::io;\nfn main() -> io::Result<()> {\n   println!(\"hi\");\n}"
+            "use std::io;\nfn main() -> io::Result<()> {\n   println!(\"hi\");\n}\n"
         );
     }
 
@@ -375,8 +430,170 @@ mod tests {
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Diff(d) = &blocks[0] else { panic!("Diff expected") };
-        assert_eq!(d.old_text.as_deref(), Some("line one\nline two\nline three"));
+        assert_eq!(
+            d.old_text.as_deref(),
+            Some("line one\nline two\nline three\n")
+        );
         assert_eq!(d.new_text, "");
+    }
+
+    // ============ Trailing-newline semantics (`\ No newline at end of file`) ============
+
+    /// No marker ⇒ both sides end with a bare `\n` appended by join_lines.
+    #[test]
+    fn eof_append_without_marker_keeps_both_trailing_newlines() {
+        let patch = concat!(
+            "Index: /repo/data.json\n",
+            "===\n",
+            "--- /repo/data.json\n",
+            "+++ /repo/data.json\n",
+            "@@ -1,3 +1,4 @@\n",
+            " {\n",
+            "   \"a\": 1\n",
+            "-}\n",
+            "+}\n",
+            "+  \"venus\": {}\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(d.old_text.as_deref(), Some("{\n  \"a\": 1\n}\n"));
+        assert_eq!(d.new_text, "{\n  \"a\": 1\n}\n  \"venus\": {}\n");
+    }
+
+    /// An insertion mid-file with trailing context lines: neither side
+    /// touches EOF, both keep the final newline.
+    #[test]
+    fn mid_file_insert_with_trailing_context_keeps_newlines() {
+        let patch = concat!(
+            "Index: /repo/main.rs\n",
+            "===\n",
+            "@@ -1,3 +1,4 @@\n",
+            " fn f() {\n",
+            "+    let x = 1;\n",
+            "     println!(\"{x}\");\n",
+            " }\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(
+            d.old_text.as_deref(),
+            Some("fn f() {\n    println!(\"{x}\");\n}\n")
+        );
+        assert_eq!(
+            d.new_text,
+            "fn f() {\n    let x = 1;\n    println!(\"{x}\");\n}\n"
+        );
+    }
+
+    /// Marker after a `-` line: only the OLD side loses its trailing
+    /// newline; the new side is untouched (no marker on its last line).
+    #[test]
+    fn old_side_marker_drops_only_old_trailing_newline() {
+        let patch = concat!(
+            "Index: /repo/x.txt\n",
+            "===\n",
+            "@@ -1 +1,2 @@\n",
+            "-last\n",
+            "\\ No newline at end of file\n",
+            "+last\n",
+            "+appended\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(d.old_text.as_deref(), Some("last"));
+        assert_eq!(d.new_text, "last\nappended\n");
+    }
+
+    /// Marker after a context line: both sides lose the trailing newline.
+    #[test]
+    fn context_marker_drops_both_trailing_newlines() {
+        let patch = concat!(
+            "Index: /repo/x.txt\n",
+            "===\n",
+            "@@ -1,2 +1,2 @@\n",
+            " one\n",
+            " two\n",
+            "\\ No newline at end of file\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(d.old_text.as_deref(), Some("one\ntwo"));
+        assert_eq!(d.new_text, "one\ntwo");
+    }
+
+    /// A marker mid-hunk is stale once another line follows on that side:
+    /// only a marker on the side's FINAL line counts.
+    #[test]
+    fn mid_hunk_marker_is_stale_after_later_lines() {
+        let patch = concat!(
+            "Index: /repo/x.txt\n",
+            "===\n",
+            "@@ -1,4 +1,4 @@\n",
+            "-a\n",
+            "\\ No newline at end of file\n",
+            "+b\n",
+            "-c\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(d.old_text.as_deref(), Some("a\nc\n"));
+        assert_eq!(d.new_text, "b\n");
+    }
+
+    /// The real jsdiff 8.0.4 wire shape (opencode's generator, captured):
+    /// the old file's final line is marked, the appended block's final
+    /// line is marked — neither side ends with a newline.
+    #[test]
+    fn jsdiff_eof_append_without_final_newlines() {
+        let patch = concat!(
+            "Index: /repo/data.json\n",
+            "===================================================================\n",
+            "--- /repo/data.json\n",
+            "+++ /repo/data.json\n",
+            "@@ -1,3 +1,4 @@\n",
+            " {\n",
+            "   \"a\": 1\n",
+            "-}\n",
+            "\\ No newline at end of file\n",
+            "+}\n",
+            "+  \"venus\": {}\n",
+            "\\ No newline at end of file\n",
+        );
+        let meta = meta_with(patch);
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("Diff expected")
+        };
+        assert_eq!(d.old_text.as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert_eq!(d.new_text, "{\n  \"a\": 1\n}\n  \"venus\": {}");
+    }
+
+    /// Empty side: no lines, no newline — regardless of the marker flag.
+    #[test]
+    fn join_lines_empty_side_is_empty_string() {
+        assert_eq!(join_lines(&[], false), "");
+        assert_eq!(join_lines(&[], true), "");
     }
 
     #[test]
@@ -405,8 +622,8 @@ mod tests {
         assert_eq!(d0.path.to_string_lossy(), "/tmp/opencode/hello-acp-test.txt");
         let ToolCallContent::Diff(d1) = &blocks[1] else { panic!() };
         assert_eq!(d1.path.to_string_lossy(), "/repo/util.rs");
-        assert_eq!(d1.old_text.as_deref(), Some("old util"));
-        assert_eq!(d1.new_text, "new util\nextra");
+        assert_eq!(d1.old_text.as_deref(), Some("old util\n"));
+        assert_eq!(d1.new_text, "new util\nextra\n");
     }
 
     #[test]
@@ -505,7 +722,7 @@ mod tests {
         };
         assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
         assert!(d.old_text.is_none(), "type=add drops the old side");
-        assert_eq!(d.new_text, "patched ok");
+        assert_eq!(d.new_text, "patched ok\n");
     }
 
     /// Synthetic: a files[] entry whose path disagrees with the combined
@@ -535,7 +752,7 @@ mod tests {
             panic!("expected a Diff block");
         };
         assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
-        assert_eq!(d.new_text, "patched ok");
+        assert_eq!(d.new_text, "patched ok\n");
     }
 
     /// files[] present but every entry malformed ⇒ NO fallback to the

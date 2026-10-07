@@ -1519,7 +1519,7 @@ mod tests {
         };
         assert_eq!(d.path.to_string_lossy(), "/tmp/opencode/hello-acp-test.txt");
         assert_eq!(d.old_text, None);
-        assert_eq!(d.new_text, "bridge test line");
+        assert_eq!(d.new_text, "bridge test line\n");
         // Single diff ⇒ the completion resolves the file location for the
         // clickable "Go to File" header (Zed renders it only with exactly
         // one location).
