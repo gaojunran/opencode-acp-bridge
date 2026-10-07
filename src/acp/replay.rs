@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
 
 use crate::dto::{AttachmentFile, MessageRecord, Part, ToolState};
 
-use super::updates::tool_result_blocks;
+use super::updates::{single_diff_location, tool_result_blocks};
 
 /// Release 0.6.0: a child (subagent) session matched to ONE replayed
 /// spawner tool call of the parent — the replay attaches
@@ -197,6 +197,12 @@ fn tool_part(
                 blocks = tool_result_blocks(&[], &Some(meta.clone()), no_aft);
             }
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+            // Release 0.8.2: single-diff results attach the file location
+            // so Zed's diff card header becomes clickable ("Go to File"),
+            // live-path parity.
+            if let Some(loc) = single_diff_location(&blocks) {
+                fields = fields.locations(vec![loc]);
+            }
             if !blocks.is_empty() {
                 fields = fields.content(Some(blocks));
             }
@@ -280,6 +286,7 @@ impl HasInput for ToolState {
 mod tests {
     use super::*;
     use crate::dto::{AttachmentSource, MessagesEnvelope, StructuredError};
+    use std::path::PathBuf;
 
     fn fixture_records() -> Vec<MessageRecord> {
         let raw = include_str!("../../tests/fixtures/messages-tool-turn.json");
@@ -340,6 +347,17 @@ mod tests {
         assert_eq!(d.path.to_string_lossy(), "/tmp/opencode/hello-acp-test.txt");
         assert_eq!(d.old_text, None);
         assert_eq!(d.new_text, "bridge test line");
+        // Single diff ⇒ the replayed completion resolves the file location
+        // too (live-path parity: the clickable "Go to File" header).
+        let locs = update
+            .fields
+            .locations
+            .as_ref()
+            .expect("replayed completion carries locations");
+        assert_eq!(locs.len(), 1);
+        let loc = &locs[0];
+        assert_eq!(loc.path, PathBuf::from("/tmp/opencode/hello-acp-test.txt"));
+        assert_eq!(loc.line, None, "line semantics unverified — path only");
 
         // 4. Final assistant text.
         let last = updates.last().unwrap();

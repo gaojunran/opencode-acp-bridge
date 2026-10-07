@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
-    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UsageUpdate,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 
 use crate::dto::{self, ToolContent, ToolMetadata};
@@ -1115,12 +1115,19 @@ fn to_tool_updates(
                 }
             }
             if let Some(content) = &t.content {
-                fields = fields.content(Some(tool_result_blocks(content, &t.metadata, state.no_aft)));
+                let blocks = tool_result_blocks(content, &t.metadata, state.no_aft);
+                if let Some(loc) = single_diff_location(&blocks) {
+                    fields = fields.locations(vec![loc]);
+                }
+                fields = fields.content(Some(blocks));
             } else if let Some(meta) = &t.metadata {
                 // Content-less success (e.g. progress-only tools) may still
                 // carry diffs — never drop the file changes.
                 let blocks = tool_result_blocks(&[], &Some(meta.clone()), state.no_aft);
                 if !blocks.is_empty() {
+                    if let Some(loc) = single_diff_location(&blocks) {
+                        fields = fields.locations(vec![loc]);
+                    }
                     fields = fields.content(Some(blocks));
                 }
             }
@@ -1383,9 +1390,25 @@ pub fn tool_result_blocks(
     blocks
 }
 
+/// Release 0.8.2: exactly one Diff block carries a file location for the
+/// diff card's clickable "Go to File" header — Zed renders it only when
+/// `locations` has exactly 1 entry, so multi-file results get none.
+pub fn single_diff_location(blocks: &[ToolCallContent]) -> Option<ToolCallLocation> {
+    let mut diffs = blocks.iter().filter_map(|b| match b {
+        ToolCallContent::Diff(d) => Some(d),
+        _ => None,
+    });
+    let d = diffs.next()?;
+    if diffs.next().is_some() {
+        return None;
+    }
+    Some(ToolCallLocation::new(d.path.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Text of a text content block, or panic.
     fn chunk_text(c: &ContentChunk) -> &str {
@@ -1497,6 +1520,18 @@ mod tests {
         assert_eq!(d.path.to_string_lossy(), "/tmp/opencode/hello-acp-test.txt");
         assert_eq!(d.old_text, None);
         assert_eq!(d.new_text, "bridge test line");
+        // Single diff ⇒ the completion resolves the file location for the
+        // clickable "Go to File" header (Zed renders it only with exactly
+        // one location).
+        let locs = completed
+            .fields
+            .locations
+            .as_ref()
+            .expect("completed carries locations");
+        assert_eq!(locs.len(), 1, "one diff block ⇒ exactly one location");
+        let loc = &locs[0];
+        assert_eq!(loc.path, PathBuf::from("/tmp/opencode/hello-acp-test.txt"));
+        assert_eq!(loc.line, None, "line semantics unverified — path only");
 
         // 6. Final text delta streams after the tool.
         let texts: Vec<&str> = updates
@@ -1515,6 +1550,85 @@ mod tests {
             .filter(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
             .count();
         assert_eq!(usage_count, 3);
+    }
+
+    /// Direct ToolMetadata construction (no fixture): `files[]` with ONE
+    /// entry resolves to its filePath; two entries resolve to no locations
+    /// (Zed's "Go to File" only renders for exactly one); no diffs at all
+    /// (e.g. a bash-style tool) resolve to none either.
+    #[test]
+    fn locations_follow_the_exactly_one_diff_rule() {
+        fn entry(path: &str, body: &str) -> dto::FileEntry {
+            dto::FileEntry {
+                file_path: path.into(),
+                relative_path: None,
+                r#type: Some("add".into()),
+                patch: format!("Index: {path}\n===\n@@ -0,0 +1 @@\n+{body}\n"),
+                additions: Some(1),
+                deletions: Some(0),
+                move_path: None,
+            }
+        }
+
+        fn completed_with(meta: dto::ToolMetadata) -> ToolCallUpdate {
+            let mut state = MappingState::new();
+            let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: tool_ref("ses_x", "msg_x", "call_x"),
+                content: None,
+                metadata: Some(meta),
+                executed: None,
+            });
+            to_updates(&success, &mut state)
+                .into_iter()
+                .find_map(|u| match u {
+                    SessionUpdate::ToolCallUpdate(t)
+                        if t.fields.status == Some(ToolCallStatus::Completed) =>
+                    {
+                        Some(t)
+                    }
+                    _ => None,
+                })
+                .expect("completed ToolCallUpdate")
+        }
+
+        let single = completed_with(dto::ToolMetadata {
+            diff: None,
+            filediff: None,
+            files: Some(vec![entry("/tmp/opencode/one.txt", "one")]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        });
+        let locs = single
+            .fields
+            .locations
+            .as_ref()
+            .expect("single files[] entry carries locations");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path.to_string_lossy(), "/tmp/opencode/one.txt");
+
+        let multi = completed_with(dto::ToolMetadata {
+            diff: None,
+            filediff: None,
+            files: Some(vec![
+                entry("/tmp/opencode/one.txt", "one"),
+                entry("/tmp/opencode/two.txt", "two"),
+            ]),
+            title: None,
+            truncated: None,
+            diagnostics: None,
+        });
+        assert!(multi.fields.locations.is_none(), "two diffs ⇒ no locations");
+
+        let none = completed_with(dto::ToolMetadata {
+            diff: None,
+            filediff: None,
+            files: None,
+            title: Some("bash".into()),
+            truncated: None,
+            diagnostics: None,
+        });
+        assert!(none.fields.locations.is_none(), "no diffs ⇒ no locations");
     }
 
     #[test]
