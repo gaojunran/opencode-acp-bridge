@@ -230,6 +230,12 @@ struct SessionEntry {
     /// `loadSession.cwd`), used as the tool-call location on permission
     /// prompts (mirrors the official adapter's `cwd` for shell tools).
     cwd: String,
+    /// Release 0.8.4: the current model's context-window size (tokens),
+    /// cached from the model catalog by `current_config_options` (only when
+    /// the catalog is available; an unknown model/limit leaves `None`).
+    /// Consumed by the usage mapping — a `None` skips `usage_update`
+    /// (official parity).
+    context_limit: Mutex<Option<u64>>,
     /// Tracked ACP mode (the opencode agent id). Established by the
     /// lifecycle responses (newSession → the derived default — the first
     /// visible primary agent; load/resume → the last assistant message's
@@ -704,6 +710,7 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: cwd.clone(),
+                context_limit: Mutex::new(None),
                 mode: Mutex::new(current.clone()),
                 // newSession cannot know the model: session creation sends no
                 // model (the server assigns the config default), the create
@@ -857,6 +864,7 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
+                context_limit: Mutex::new(None),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
@@ -1217,6 +1225,7 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: cwd.clone(),
+                context_limit: Mutex::new(None),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
@@ -1320,6 +1329,7 @@ impl AgentService {
             Arc::new(SessionEntry {
                 cancel: AtomicBool::new(false),
                 cwd: req.cwd.to_string_lossy().to_string(),
+                context_limit: Mutex::new(None),
                 mode: Mutex::new(current.clone()),
                 model: Mutex::new(current_model.clone()),
                 in_turn: AtomicBool::new(false),
@@ -1537,7 +1547,9 @@ impl AgentService {
             *entry.local_inbox_id.lock().expect("inbox lock") = Some(id);
         }
 
-        let mut state = updates::MappingState::new().with_no_aft(self.no_aft);
+        let mut state = updates::MappingState::new()
+            .with_no_aft(self.no_aft)
+            .with_cwd(entry.cwd.clone());
         // Release 0.6.0: per-CHILD mapping states (fresh per turn — a
         // child's call ids are unique per child session, so each turn's
         // declarations are its own). The pairing tracker + the persistent
@@ -1914,6 +1926,13 @@ impl AgentService {
                     }
                     // Release 0.6.0: the spawner call's terminal update
                     // carries the closing `subagent_session_info` meta.
+                    // Release 0.8.4: the usage mapping needs the current
+                    // model's context size (stashed by the config-options
+                    // refresh; unknown → the usage update is skipped).
+                    if matches!(&event, dto::SessionEvent::UsageUpdated(_)) {
+                        state.context_limit =
+                            *entry.context_limit.lock().expect("context_limit lock");
+                    }
                     let updates = if completion_meta.is_some() {
                         updates::to_updates_annotated(&event, &mut state, completion_meta.as_ref().map(|(_, m)| m))
                     } else {
@@ -2033,9 +2052,11 @@ impl AgentService {
         req: &acp::PromptRequest,
         cx: &ConnectionTo<Client>,
     ) -> Result<(), AcpError> {
-        let child_state = child_states
-            .entry(child_id.to_string())
-            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        let child_state = child_states.entry(child_id.to_string()).or_insert_with(|| {
+            updates::MappingState::new()
+                .with_no_aft(self.no_aft)
+                .with_cwd(entry.cwd.clone())
+        });
         // Release 0.8.0 (`--zed-git-add`): a CHILD's step snapshot diffs
         // accumulate under the ROOT (this prompt's session) pending set —
         // the child's own prompt never stages, the parent's next prompt
@@ -2409,6 +2430,24 @@ impl AgentService {
             }
         };
         let models = self.backend.list_models().await;
+        // Release 0.8.4: cache the current model's context-window size for
+        // the usage mapping (match key mirrors the official adapter:
+        // providerID + id). Only when the catalog is available — a failed
+        // fetch keeps the previous value.
+        if let Some(models) = &models {
+            let limit = entry
+                .model
+                .lock()
+                .expect("model lock")
+                .as_ref()
+                .and_then(|m| {
+                    models
+                        .iter()
+                        .find(|item| item.providerID == m.providerID && item.id == m.id)
+                })
+                .and_then(|item| item.limit.as_ref().and_then(|l| l.context));
+            *entry.context_limit.lock().expect("context_limit lock") = limit;
+        }
         let mode = entry.mode.lock().expect("mode lock").clone();
         let model = entry.model.lock().expect("model lock").clone();
         build_config_options(
@@ -2832,13 +2871,21 @@ impl AgentService {
         // window gets a synthesized declaration from its own fields).
         // Release 0.6.0: the spawner's terminal update carries the closing
         // `subagent_session_info` meta.
-        let state = projectors
-            .entry(session_id.clone())
-            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        let state = projectors.entry(session_id.clone()).or_insert_with(|| {
+            updates::MappingState::new()
+                .with_no_aft(self.no_aft)
+                .with_cwd(entry.cwd.clone())
+        });
         // Release 0.8.0 (`--zed-git-add`): REMOTE turns' step snapshot diffs
         // join the session's pending set too (staged on the session's next
         // user prompt — local or remote).
         self.collect_step_files(&session_id.0, event, &entry);
+        // Release 0.8.4: the usage mapping needs the current model's
+        // context size (stashed by the config-options refresh; unknown →
+        // the usage update is skipped).
+        if matches!(event, dto::SessionEvent::UsageUpdated(_)) {
+            state.context_limit = *entry.context_limit.lock().expect("context_limit lock");
+        }
         let updates = if completion_meta.is_some() {
             updates::to_updates_annotated(event, state, completion_meta.as_ref().map(|(_, m)| m))
         } else {
@@ -2884,9 +2931,11 @@ impl AgentService {
             projectors.remove(&child_sid);
             return true;
         }
-        let child_state = projectors
-            .entry(child_sid.clone())
-            .or_insert_with(|| updates::MappingState::new().with_no_aft(self.no_aft));
+        let child_state = projectors.entry(child_sid.clone()).or_insert_with(|| {
+            updates::MappingState::new()
+                .with_no_aft(self.no_aft)
+                .with_cwd(parent_entry.cwd.clone())
+        });
         // Release 0.8.0 (`--zed-git-add`): a background CHILD's step
         // snapshot diffs accumulate under the ROOT parent's pending set
         // (the card branch below resolves the parent session id — do the
@@ -6333,10 +6382,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
 
@@ -7051,6 +7097,7 @@ mod tests {
 
     /// The canned model catalog used across the config-options tests: two
     /// providers, one model without a display name (falls back to id).
+    /// Release 0.8.4: the GLM entry carries a context limit (usage size).
     fn catalog_models() -> Vec<dto::ModelInfo> {
         vec![
             dto::ModelInfo {
@@ -7058,18 +7105,23 @@ mod tests {
                 modelID: Some("GLM-5.3-astra".into()),
                 providerID: "astra".into(),
                 name: Some("GLM 5.3".into()),
+                limit: Some(dto::ModelLimit {
+                    context: Some(500_000),
+                }),
             },
             dto::ModelInfo {
                 id: "deepseek_v4_flash_code".into(),
                 modelID: None,
                 providerID: "astra".into(),
                 name: None,
+                limit: None,
             },
             dto::ModelInfo {
                 id: "gpt-6".into(),
                 modelID: None,
                 providerID: "openai".into(),
                 name: Some("GPT-6".into()),
+                limit: None,
             },
         ]
     }
@@ -7534,10 +7586,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let options = ns.config_options.expect("config options present");
             assert_eq!(options.len(), 2, "agent + model options");
@@ -7607,10 +7656,7 @@ mod tests {
         ]);
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let options = ns.config_options.expect("agent option present");
             assert_eq!(options.len(), 1);
@@ -7627,10 +7673,7 @@ mod tests {
         backend.fail_agents();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let options = ns.config_options.expect("model option present");
             assert_eq!(options.len(), 1);
@@ -7645,10 +7688,7 @@ mod tests {
         let backend = MockBackend::new();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             assert!(ns.config_options.is_none(), "nothing to render → omit the field");
             Ok(())
@@ -7667,10 +7707,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
             // Unknown session → invalid_params, no wire call.
@@ -7730,10 +7767,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
             // "__default__" → success no-op (no set-model wire), current
@@ -7813,10 +7847,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
             let resp = cx
@@ -7851,10 +7882,7 @@ mod tests {
         backend.fail_set_model();
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
             let err = cx
@@ -7890,10 +7918,7 @@ mod tests {
         backend.set_models(catalog_models());
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx.send_request(NewSessionRequest::new("/tmp")).block_task().await?;
             let sid = ns.session_id.clone();
             let exec_started = || {
@@ -7997,10 +8022,7 @@ mod tests {
         backend.set_messages(vec![wire_msg("user", None), wire_msg("assistant", Some("orchestrator"))]);
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let load = cx
                 .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
                 .block_task()
@@ -8054,10 +8076,7 @@ mod tests {
         ]);
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, _collected) = run_client(svc, Arc::clone(&backend), move |_b, _c, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let load = cx
                 .send_request(LoadSessionRequest::new("ses_mock_1", "/tmp/opencode/acp-fixture-project"))
                 .block_task()
@@ -8492,91 +8511,124 @@ mod tests {
     #[tokio::test]
     async fn background_projects_full_remote_turn() {
         let backend = MockBackend::new();
-        let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
-        let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
-            let _ = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            let ns = cx
-                .send_request(NewSessionRequest::new("/tmp"))
-                .block_task()
-                .await?;
-            let _sid = ns.session_id;
-            // Wait until the listener's server-wide subscription is live
-            // before pushing (broadcast events before subscribe are lost).
-            wait_for_listener(&backend).await;
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (outcome, collected) = run_client(
+            svc,
+            Arc::clone(&backend),
+            move |backend, collected, cx| async move {
+                // Release 0.8.4: the usage mapping needs the model catalog (for
+                // the context size) — declare the config-options capability AND
+                // seed the mock's catalog so the limit lookup succeeds.
+                backend.set_models(catalog_models());
+                let _ = cx
+                    .send_request(init_with_config_options())
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let _sid = ns.session_id;
+                // Wait until the listener's server-wide subscription is live
+                // before pushing (broadcast events before subscribe are lost).
+                wait_for_listener(&backend).await;
 
-            // The remote frontend's prompt text (session.inbox.enqueued).
-            backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
-                inboxID: "msg_remote_1".into(),
-                sessionID: Some("ses_mock_1".into()),
-                item: Some(dto::InboxEventItem {
-                    kind: Some("user".into()),
-                    payload: Some(dto::InboxPayload {
-                        text: Some("do the thing remotely".into()),
-                        files: None,
+                // The remote frontend's prompt text (session.inbox.enqueued).
+                backend.remote_push(dto::SessionEvent::InboxEnqueued(dto::InboxEnqueued {
+                    inboxID: "msg_remote_1".into(),
+                    sessionID: Some("ses_mock_1".into()),
+                    item: Some(dto::InboxEventItem {
+                        kind: Some("user".into()),
+                        payload: Some(dto::InboxPayload {
+                            text: Some("do the thing remotely".into()),
+                            files: None,
+                        }),
                     }),
-                }),
-            }));
-            backend.remote_push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
-                sessionID: "ses_mock_1".into(),
-            }));
-            let base = dto::ToolRef {
-                sessionID: "ses_mock_1".into(),
-                assistantMessageID: "msg_remote_1".into(),
-                id: "call_remote_1".into(),
-            };
-            backend.remote_push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
-                base: base.clone(),
-                name: "read".into(),
-            }));
-            backend.remote_push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
-                base: base.clone(),
-                input: serde_json::json!({ "path": "/tmp/x" }),
-                executed: Some(true),
-            }));
-            backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
-                base: base.clone(),
-                content: Some(vec![dto::ToolContent::Text { text: "file contents".into() }]),
-                metadata: None,
-                executed: Some(true),
-            }));
-            backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
-                base: dto::OrdinalRef {
+                }));
+                backend.remote_push(dto::SessionEvent::ExecutionStarted(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+                // Release 0.8.4: make the remote session's model KNOWN so the
+                // config-options refresh caches its context limit (the usage
+                // update below is gated on it).
+                backend.remote_push(dto::SessionEvent::ModelSelected(
+                    dto::SessionModelSelected {
+                        sessionID: "ses_mock_1".into(),
+                        model: dto::ModelRef {
+                            id: "GLM-5.3-astra".into(),
+                            providerID: "astra".into(),
+                            variant: None,
+                        },
+                    },
+                ));
+                let base = dto::ToolRef {
                     sessionID: "ses_mock_1".into(),
                     assistantMessageID: "msg_remote_1".into(),
-                    ordinal: Some(0),
-                },
-                delta: "remote reply".into(),
-            }));
-            backend.remote_push(dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
-                session: dto::SessionRef { sessionID: "ses_mock_1".into() },
-                cost: None,
-                tokens: Some(dto::Usage {
-                    input: Some(7),
-                    output: Some(3),
-                    reasoning: None,
-                    cache: None,
-                }),
-            }));
-            backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
-                sessionID: "ses_mock_1".into(),
-            }));
-            // Wait for the LAST projected notification (the usage update
-            // precedes the terminal event in stream order): everything
-            // before it has been processed and pushed in order.
-            wait_for(&collected, |n| {
-                n.iter().any(|x| matches!(&x.update, acp::SessionUpdate::UsageUpdate(u) if u.used == 10))
-            })
-            .await;
-            Ok(())
-        })
+                    id: "call_remote_1".into(),
+                };
+                backend.remote_push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                    base: base.clone(),
+                    name: "read".into(),
+                }));
+                backend.remote_push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: base.clone(),
+                    input: serde_json::json!({ "path": "/tmp/x" }),
+                    executed: Some(true),
+                }));
+                backend.remote_push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                    base: base.clone(),
+                    content: Some(vec![dto::ToolContent::Text {
+                        text: "file contents".into(),
+                    }]),
+                    metadata: None,
+                    executed: Some(true),
+                }));
+                backend.remote_push(dto::SessionEvent::TextDelta(dto::TextDelta {
+                    base: dto::OrdinalRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_remote_1".into(),
+                        ordinal: Some(0),
+                    },
+                    delta: "remote reply".into(),
+                }));
+                backend.remote_push(dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
+                    session: dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    },
+                    cost: None,
+                    tokens: Some(dto::Usage {
+                        input: Some(7),
+                        output: Some(3),
+                        reasoning: None,
+                        cache: None,
+                    }),
+                }));
+                backend.remote_push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+                // Wait for the LAST projected notification (the usage update
+                // precedes the terminal event in stream order): everything
+                // before it has been processed and pushed in order.
+                wait_for(&collected, |n| {
+                    n.iter().any(
+                        |x| matches!(&x.update, acp::SessionUpdate::UsageUpdate(u) if u.used == 10),
+                    )
+                })
+                .await;
+                Ok(())
+            },
+        )
         .await;
         outcome.expect("client run ok");
 
         let notifications = collected.lock().expect("collected lock");
-        assert!(notifications.iter().all(|n| &*n.session_id.0 == "ses_mock_1"));
+        assert!(
+            notifications
+                .iter()
+                .all(|n| &*n.session_id.0 == "ses_mock_1")
+        );
         // The remote user message: exactly one user chunk, its text + the
         // inbox id as the message id.
         let user_chunks: Vec<&acp::ContentChunk> = notifications
@@ -8586,7 +8638,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(user_chunks.len(), 1, "the remote user message projects once");
+        assert_eq!(
+            user_chunks.len(),
+            1,
+            "the remote user message projects once"
+        );
         assert!(matches!(
             &user_chunks[0].content,
             acp::ContentBlock::Text(t) if t.text == "do the thing remotely"
@@ -8604,10 +8660,12 @@ mod tests {
         )));
         // Tool: declaration BEFORE the first update (the v0.3.2 invariant),
         // then in-progress and completed updates.
-        let decl_idx = notifications.iter().position(|n| matches!(
-            &n.update,
-            acp::SessionUpdate::ToolCall(t) if t.tool_call_id.0.as_ref() == "call_remote_1"
-        ));
+        let decl_idx = notifications.iter().position(|n| {
+            matches!(
+                &n.update,
+                acp::SessionUpdate::ToolCall(t) if t.tool_call_id.0.as_ref() == "call_remote_1"
+            )
+        });
         let first_update_idx = notifications.iter().position(|n| matches!(
             &n.update,
             acp::SessionUpdate::ToolCallUpdate(u) if u.tool_call_id.0.as_ref() == "call_remote_1"
@@ -8615,17 +8673,21 @@ mod tests {
         let (Some(decl_idx), Some(first_update_idx)) = (decl_idx, first_update_idx) else {
             panic!("tool call declared and updated by the background path");
         };
-        assert!(decl_idx < first_update_idx, "declaration precedes the first update");
+        assert!(
+            decl_idx < first_update_idx,
+            "declaration precedes the first update"
+        );
         assert!(notifications.iter().any(|n| matches!(
             &n.update,
             acp::SessionUpdate::ToolCallUpdate(u)
                 if u.tool_call_id.0.as_ref() == "call_remote_1"
                     && u.fields.status == Some(acp::ToolCallStatus::Completed)
         )));
-        // Usage summary.
+        // Usage summary (Release 0.8.4: gated on the known model limit —
+        // the size now rides the update).
         assert!(notifications.iter().any(|n| matches!(
             &n.update,
-            acp::SessionUpdate::UsageUpdate(u) if u.used == 10
+            acp::SessionUpdate::UsageUpdate(u) if u.used == 10 && u.size == 500_000
         )));
     }
 
@@ -9329,10 +9391,7 @@ mod tests {
         backend.set_agents(vec![wire_agent("build", "build", false, None)]);
         let svc = Arc::new(AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>));
         let (outcome, collected) = run_client(svc, Arc::clone(&backend), move |backend, collected, cx| async move {
-            let _ = cx
-                .send_request(init_with_config_options())
-                .block_task()
-                .await?;
+            let _ = cx.send_request(init_with_config_options()).block_task().await?;
             let ns = cx
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()

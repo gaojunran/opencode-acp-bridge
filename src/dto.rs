@@ -117,6 +117,18 @@ pub struct ModelInfo {
     pub providerID: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Per-model token limits (`limit.context` = the context-window size the
+    /// usage mapping reports as `size`; Release 0.8.4).
+    #[serde(default)]
+    pub limit: Option<ModelLimit>,
+}
+
+/// One model-catalog `limit` object (Release 0.8.4).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelLimit {
+    /// Context-window size in tokens.
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 /// GET /api/provider item. `settings` deliberately NOT modeled (contains

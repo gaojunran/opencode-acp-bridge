@@ -11,6 +11,7 @@
 //! `message_id` from the same ID; the client groups by that ID).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
@@ -58,6 +59,16 @@ pub struct MappingState {
     /// passthrough). Diff extraction is NOT gated — `filediff`/`diff` are
     /// dialect-neutral and keep working under both.
     no_aft: bool,
+    /// Release 0.8.4: the session working directory — relative shell
+    /// `workdir`/`cwd` tool inputs (and the no-input fallback) resolve
+    /// against it for `locations`, mirroring the official adapter. Set by
+    /// the agent layer before mapping.
+    pub cwd: String,
+    /// Release 0.8.4: the current model's context-window size (tokens),
+    /// stashed by the agent layer from the model catalog before mapping
+    /// `usage.updated` events. `None` skips the usage update (the official
+    /// adapter's unknown-size gate).
+    pub context_limit: Option<u64>,
 }
 
 impl MappingState {
@@ -69,6 +80,20 @@ impl MappingState {
     /// content passthrough). Diff extraction stays enabled (dialect-neutral).
     pub fn with_no_aft(mut self, no_aft: bool) -> Self {
         self.no_aft = no_aft;
+        self
+    }
+
+    /// Builder: session working directory (Release 0.8.4) — see
+    /// [`MappingState::cwd`].
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = cwd.into();
+        self
+    }
+
+    /// Builder: current model context-window size (Release 0.8.4) — see
+    /// [`MappingState::context_limit`].
+    pub fn with_context_limit(mut self, limit: Option<u64>) -> Self {
+        self.context_limit = limit;
         self
     }
 
@@ -273,11 +298,23 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
 
         // ---------- meta ----------
         dto::SessionEvent::UsageUpdated(u) => {
-            let tokens = u.tokens.as_ref();
-            let used = tokens.map(|t| {
-                t.input.unwrap_or(0) + t.output.unwrap_or(0) + t.reasoning.unwrap_or(0)
+            // Release 0.8.4: mirror the official adapter's usage gate — the
+            // update is dropped when nothing was used or the current model's
+            // context size is unknown (the agent layer stashes it on the
+            // state from the model catalog). `used` sums EVERY token lane,
+            // cache reads/writes included (the pre-0.8.4 mapping missed them).
+            let used = u.tokens.as_ref().map(|t| {
+                t.input.unwrap_or(0)
+                    + t.output.unwrap_or(0)
+                    + t.reasoning.unwrap_or(0)
+                    + t.cache.as_ref().map_or(0, |c| c.read.unwrap_or(0))
+                    + t.cache.as_ref().map_or(0, |c| c.write.unwrap_or(0))
             });
-            let mut usage = UsageUpdate::new(used.unwrap_or(0), 0);
+            let size = state.context_limit;
+            if used.is_none() || used == Some(0) || size.is_none() || size == Some(0) {
+                return vec![];
+            }
+            let mut usage = UsageUpdate::new(used.unwrap_or(0), size.unwrap_or(0));
             if let Some(cost) = u.cost {
                 usage = usage.cost(Cost::new(cost, "USD"));
             }
@@ -1019,10 +1056,14 @@ fn to_tool_updates(
                     }
                 }
                 _ => {
+                    let kind = state
+                        .tool_titles
+                        .get(&id)
+                        .map_or(ToolKind::Other, |n| tool_kind(n));
                     if let Some(decl) = state.introduce_tool(
                         &id,
                         id.clone(),
-                        ToolKind::Other,
+                        kind,
                         ToolCallStatus::Pending,
                         raw_input,
                     ) {
@@ -1060,10 +1101,14 @@ fn to_tool_updates(
                     }
                 }
                 _ => {
+                    let kind = state
+                        .tool_titles
+                        .get(&id)
+                        .map_or(ToolKind::Other, |n| tool_kind(n));
                     if let Some(decl) = state.introduce_tool(
                         &id,
                         id.clone(),
-                        ToolKind::Other,
+                        kind,
                         ToolCallStatus::InProgress,
                         Some(t.input.clone()),
                     ) {
@@ -1071,10 +1116,16 @@ fn to_tool_updates(
                     }
                 }
             }
+            // Release 0.8.4: the running update carries kind + derived
+            // locations (official `runningToolUpdate`) — the empty-locations
+            // array is unconditional, exactly like the official adapter.
+            let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
             out.push(tool_update(
                 &id,
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::InProgress)
+                    .kind(tool_kind(name))
+                    .locations(tool_locations(name, &t.input, &state.cwd))
                     .raw_input(t.input.clone()),
             ));
             out
@@ -1092,9 +1143,16 @@ fn to_tool_updates(
                 .or_else(|| state.tool_titles.get(&id).cloned())
                 .unwrap_or_else(|| id.clone());
             let mut out = Vec::with_capacity(2);
-            if let Some(decl) =
-                state.introduce_tool(&id, title, ToolKind::Other, ToolCallStatus::Completed, None)
-            {
+            if let Some(decl) = state.introduce_tool(
+                &id,
+                title,
+                state
+                    .tool_titles
+                    .get(&id)
+                    .map_or(ToolKind::Other, |n| tool_kind(n)),
+                ToolCallStatus::Completed,
+                None,
+            ) {
                 out.push(decl);
             }
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
@@ -1146,23 +1204,35 @@ fn to_tool_updates(
             if let Some(decl) = state.introduce_tool(
                 &id,
                 title,
-                ToolKind::Other,
+                state
+                    .tool_titles
+                    .get(&id)
+                    .map_or(ToolKind::Other, |n| tool_kind(n)),
                 ToolCallStatus::Failed,
                 None,
             ) {
                 out.push(decl);
             }
             // v1 has no error field on tool updates: the failure surfaces as
-            // `Failed` with the error message in the raw output.
+            // `Failed` with the error message in the raw output. Release
+            // 0.8.4: kind + locations mirror the official `errorToolUpdate`
+            // (input from the cached parsed input — absent → no locations).
             let message = t
                 .error
                 .message
                 .clone()
                 .unwrap_or_else(|| "Tool execution failed".to_string());
+            let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
+            let input = state
+                .tool_input(&id)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Null);
             let update = ToolCallUpdate::new(
                 id.clone(),
                 ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Failed)
+                    .kind(tool_kind(name))
+                    .locations(tool_locations(name, &input, &state.cwd))
                     .raw_output(serde_json::Value::String(message)),
             );
             let update = match completion_meta {
@@ -1321,14 +1391,68 @@ fn tool_update_meta(
     }
 }
 
-/// Release 0.3.2: conservative ACP `ToolKind` from an opencode tool name —
-/// the obvious families only (file-modifying tools → `Edit`, read-family →
-/// `Read`); anything else stays `Other` (unknown tools are not guessed).
+/// Release 0.8.4: the full official ACP `ToolKind` mapping (mirrors the
+/// 2.0.21 adapter's `toToolKind`) — case-insensitive, `Other` fallback.
+/// Note the pre-0.8.4 families moved: grep/glob are Search, not Read.
 fn tool_kind(name: &str) -> ToolKind {
-    match name {
-        "edit" | "write" | "apply_patch" => ToolKind::Edit,
-        "read" | "grep" | "glob" => ToolKind::Read,
+    match name.to_ascii_lowercase().as_str() {
+        "bash" | "shell" => ToolKind::Execute,
+        "webfetch" => ToolKind::Fetch,
+        "edit" | "apply_patch" | "patch" | "write" => ToolKind::Edit,
+        "grep"
+        | "glob"
+        | "context"
+        | "context7_resolve_library_id"
+        | "context7_get_library_docs" => ToolKind::Search,
+        "read" => ToolKind::Read,
+        "task" | "subagent" => ToolKind::Think,
         _ => ToolKind::Other,
+    }
+}
+
+/// Release 0.8.4: the file locations of a STARTING tool call — mirrors the
+/// official adapter's `toLocations` plus the v2 input-field reconciliation:
+/// the permission layer's full `filePath()` read is `path ?? filePath ??
+/// filepath` (the official event stream only reads the latter two — its own
+/// v1/v2 drift; v2 tool inputs carry `path`). Path-only — no line.
+pub fn tool_locations(name: &str, input: &serde_json::Value, cwd: &str) -> Vec<ToolCallLocation> {
+    fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "bash" | "shell" => {
+            // Explicit workdir/cwd wins; relative joins the session cwd;
+            // absent → the session cwd itself (shellWorkdir semantics);
+            // empty cwd → nowhere to point (the official falsy skip).
+            let workdir = str_field(input, "workdir").or_else(|| str_field(input, "cwd"));
+            let resolved = match workdir {
+                Some(w) if Path::new(&w).is_absolute() => w,
+                Some(w) => Path::new(cwd).join(w).to_string_lossy().into_owned(),
+                None => cwd.to_string(),
+            };
+            if resolved.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolCallLocation::new(resolved)]
+            }
+        }
+        "read"
+        | "grep"
+        | "glob"
+        | "context"
+        | "context7_resolve_library_id"
+        | "context7_get_library_docs" => str_field(input, "path")
+            .map(|p| vec![ToolCallLocation::new(p)])
+            .unwrap_or_default(),
+        "edit" | "write" | "patch" | "apply_patch" => str_field(input, "path")
+            .or_else(|| str_field(input, "filePath"))
+            .or_else(|| str_field(input, "filepath"))
+            .map(|p| vec![ToolCallLocation::new(p)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -1438,7 +1562,12 @@ mod tests {
     #[test]
     fn full_tool_turn_maps_to_acp_updates() {
         let events = decode_fixture();
-        let mut state = MappingState::new();
+        // Release 0.8.4: the usage mapping needs the model context size
+        // (the fixture's session model limit is synthetic) and the session
+        // cwd resolves relative tool input paths for locations.
+        let mut state = MappingState::new()
+            .with_context_limit(Some(168_000))
+            .with_cwd("/tmp/opencode/acp-fixture-project");
         let updates: Vec<SessionUpdate> = events
             .iter()
             .flat_map(|e| to_updates(e, &mut state))
@@ -1502,6 +1631,17 @@ mod tests {
             tool[2].fields.raw_input,
             Some(serde_json::json!({"content": "bridge test line", "path": "hello-acp-test.txt"}))
         );
+        // Release 0.8.4: the running update carries kind (write → Edit)
+        // and the derived locations (the write input's `path`, verbatim —
+        // only shell tools resolve relative inputs against the cwd).
+        assert_eq!(tool[2].fields.kind, Some(acp::ToolKind::Edit));
+        let called_locs = tool[2]
+            .fields
+            .locations
+            .as_ref()
+            .expect("called carries locations");
+        assert_eq!(called_locs.len(), 1);
+        assert_eq!(called_locs[0].path, PathBuf::from("hello-acp-test.txt"));
 
         // 5. Completed carries text + the #52636 diff block.
         let completed = &tool[3];
@@ -1544,12 +1684,19 @@ mod tests {
         assert_eq!(texts, vec!["done"]);
 
         // 7. Usage updates exist (usage.updated fires three times in the
-        //    fixture: session start, after the tool input, after the run).
+        //    fixture: session start, after the tool input, after the run) —
+        //    `used` sums every token lane INCLUDING cache reads, `size` is
+        //    the model's context limit (Release 0.8.4).
         let usage_count = updates
             .iter()
             .filter(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
             .count();
         assert_eq!(usage_count, 3);
+        let SessionUpdate::UsageUpdate(first) = &updates[0] else {
+            panic!("first update is the usage bump")
+        };
+        assert_eq!(first.used, 712, "20+180+0+512(cache read)+0(cache write)");
+        assert_eq!(first.size, 168_000, "the model's context limit");
     }
 
     /// Direct ToolMetadata construction (no fixture): `files[]` with ONE
@@ -1860,6 +2007,18 @@ mod tests {
         };
         assert_eq!(u.tool_call_id.0.as_ref(), "call_x");
         assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+        // Release 0.8.4: the failed update carries kind + locations like the
+        // running update (no cached input here → the empty array).
+        assert_eq!(
+            u.fields.kind,
+            Some(acp::ToolKind::Execute),
+            "bash → Execute"
+        );
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![]),
+            "no input/cwd → empty locations"
+        );
         // v1 has no error field on tool updates — the message rides raw_output.
         assert_eq!(u.fields.raw_output, Some(serde_json::Value::String("boom".into())));
         // The call is closed: the cancel drain must not re-abandon it.
@@ -2023,19 +2182,27 @@ mod tests {
         assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
     }
 
-    /// The kind mapping is deliberately conservative: write/edit/apply_patch
-    /// → Edit, read/grep/glob → Read, everything else → Other.
+    /// Release 0.8.4: the kind mapping mirrors the official adapter's
+    /// `toToolKind` table (case-insensitive) — execute/fetch/edit/search/
+    /// read/think families, everything else → Other.
     #[test]
-    fn tool_kind_mapping_is_conservative() {
+    fn tool_kind_mapping_follows_the_official_table() {
         let mut state = MappingState::new();
         for (name, kind) in [
-            ("write", acp::ToolKind::Edit),
+            ("bash", acp::ToolKind::Execute),
+            ("shell", acp::ToolKind::Execute),
+            ("BASH", acp::ToolKind::Execute),
+            ("webfetch", acp::ToolKind::Fetch),
             ("edit", acp::ToolKind::Edit),
             ("apply_patch", acp::ToolKind::Edit),
+            ("patch", acp::ToolKind::Edit),
+            ("write", acp::ToolKind::Edit),
+            ("grep", acp::ToolKind::Search),
+            ("glob", acp::ToolKind::Search),
+            ("context", acp::ToolKind::Search),
+            ("context7_resolve_library_id", acp::ToolKind::Search),
+            ("context7_get_library_docs", acp::ToolKind::Search),
             ("read", acp::ToolKind::Read),
-            ("grep", acp::ToolKind::Read),
-            ("glob", acp::ToolKind::Read),
-            ("bash", acp::ToolKind::Other),
             ("weird_custom_tool", acp::ToolKind::Other),
         ] {
             let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
@@ -2048,6 +2215,140 @@ mod tests {
             };
             assert_eq!(c.kind, kind, "kind for {name}");
         }
+        // Spawners declare later (at input.ended) — assert the mapping
+        // directly (their input.started arm emits nothing).
+        assert_eq!(tool_kind("task"), acp::ToolKind::Think);
+        assert_eq!(tool_kind("subagent"), acp::ToolKind::Think);
+    }
+
+    /// Release 0.8.4: the running update derives `locations` from the tool
+    /// input (official `toLocations`): shell workdir/cwd (absolute kept,
+    /// relative joined to the session cwd, absent → cwd), read-family
+    /// `path`, edit-family `path`/`filePath`/`filepath`; unknown tools get
+    /// the empty array (official parity — unconditional attachment).
+    #[test]
+    fn called_update_derives_kind_and_locations() {
+        fn called(name: &str, input: serde_json::Value) -> ToolCallUpdate {
+            let mut state = MappingState::new().with_cwd("/home/u/proj");
+            let ev = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_x", "msg_x", "call_x"),
+                name: name.into(),
+            });
+            let _ = to_updates(&ev, &mut state);
+            let updates = to_updates(
+                &dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: tool_ref("ses_x", "msg_x", "call_x"),
+                    input,
+                    executed: None,
+                }),
+                &mut state,
+            );
+            updates
+                .into_iter()
+                .find_map(|u| match u {
+                    SessionUpdate::ToolCallUpdate(u) => Some(u),
+                    _ => None,
+                })
+                .expect("called update")
+        }
+
+        // Shell: explicit absolute workdir wins; relative joins the cwd;
+        // `cwd` field is the fallback; nothing → the session cwd.
+        let u = called("bash", serde_json::json!({ "command": "ls" }));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/home/u/proj")])
+        );
+        let u = called("bash", serde_json::json!({ "workdir": "/abs/dir" }));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/abs/dir")])
+        );
+        let u = called("SHELL", serde_json::json!({ "workdir": "rel/dir" }));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/home/u/proj/rel/dir")])
+        );
+        let u = called("bash", serde_json::json!({ "cwd": "/fallback" }));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/fallback")])
+        );
+
+        // Read family: `path`.
+        let u = called("read", serde_json::json!({ "path": "/etc/hosts" }));
+        assert_eq!(u.fields.kind, Some(acp::ToolKind::Read));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/etc/hosts")])
+        );
+
+        // Edit family: the full `path ?? filePath ?? filepath` read.
+        let u = called("edit", serde_json::json!({ "filePath": "/a.txt" }));
+        assert_eq!(u.fields.kind, Some(acp::ToolKind::Edit));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/a.txt")])
+        );
+        let u = called("apply_patch", serde_json::json!({ "filepath": "/b.txt" }));
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/b.txt")])
+        );
+        let u = called(
+            "write",
+            serde_json::json!({ "path": "/c.txt", "filePath": "/skip.txt" }),
+        );
+        assert_eq!(
+            u.fields.locations,
+            Some(vec![ToolCallLocation::new("/c.txt")])
+        );
+
+        // Unknown tool: empty array, attached unconditionally.
+        let u = called("custom_tool", serde_json::json!({ "path": "/x" }));
+        assert_eq!(u.fields.kind, Some(acp::ToolKind::Other));
+        assert_eq!(u.fields.locations, Some(vec![]));
+    }
+
+    /// Release 0.8.4: usage mapping mirrors the official adapter — `used`
+    /// sums every lane including cache, `size` is the model's context
+    /// limit; unknown size or zero used ⇒ no update at all.
+    #[test]
+    fn usage_update_gates_on_size_and_used() {
+        fn map(limit: Option<u64>, tokens: Option<dto::Usage>) -> Vec<SessionUpdate> {
+            let mut state = MappingState::new().with_context_limit(limit);
+            let ev = dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
+                session: dto::SessionRef {
+                    sessionID: "ses_x".into(),
+                },
+                cost: Some(0.5),
+                tokens,
+            });
+            to_updates(&ev, &mut state)
+        }
+        let tokens = Some(dto::Usage {
+            input: Some(10),
+            output: Some(20),
+            reasoning: Some(4),
+            cache: Some(dto::CacheUsage {
+                read: Some(100),
+                write: Some(8),
+            }),
+        });
+        // 1. used includes the cache lanes; size comes from the catalog.
+        let out = map(Some(200_000), tokens.clone());
+        assert_eq!(out.len(), 1);
+        let SessionUpdate::UsageUpdate(u) = &out[0] else {
+            panic!("usage update expected")
+        };
+        assert_eq!(u.used, 142, "10+20+4+100(cache read)+8(cache write)");
+        assert_eq!(u.size, 200_000);
+        assert_eq!(u.cost.as_ref().map(|c| c.amount), Some(0.5));
+        assert_eq!(u.cost.as_ref().map(|c| c.currency.as_str()), Some("USD"));
+        // 2. Unknown size → no update.
+        assert!(map(None, tokens.clone()).is_empty());
+        // 3. Zero used → no update.
+        assert!(map(Some(200_000), Some(dto::Usage::default())).is_empty());
     }
 
     // ======================= Wave 5: aft hoist dialect =======================
@@ -2325,7 +2626,11 @@ mod tests {
         // PLAIN ids — the child session is addressed by the notification.
         assert_eq!(c.tool_call_id.0.as_ref(), "call_c1");
         assert_eq!(c.title, "grep");
-        assert_eq!(c.kind, acp::ToolKind::Read);
+        assert_eq!(
+            c.kind,
+            acp::ToolKind::Search,
+            "grep → Search (official table)"
+        );
         let (call_id, content) = card.expect("input.started is a card boundary");
         assert_eq!(call_id, "call_task_ses_child_1");
         let acp::ToolCallContent::Content(block) = &content[0] else {
