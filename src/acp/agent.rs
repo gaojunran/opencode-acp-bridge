@@ -263,6 +263,11 @@ pub struct AgentService {
     /// flag, synthetic/compaction/move inbox items NEVER trigger
     /// turn-scoped staging.
     show_synthetic: bool,
+    /// Release 0.8.6: `--shell-terminal` — mount the display-only terminal
+    /// card for bash/shell calls (declaration attachments + a ~1s output
+    /// poller until the call ends). Off by default — the card takes
+    /// vertical space.
+    shell_terminal: bool,
     /// Release 0.3.0: whether the client declared the session config-options
     /// capability (`clientCapabilities.session.configOptions` non-null) in
     /// its initialize request. Gates the `config_options` payload in
@@ -369,6 +374,7 @@ impl AgentService {
             no_aft: false,
             zed_git_add: false,
             show_synthetic: false,
+            shell_terminal: false,
             config_options_supported: AtomicBool::new(false),
             form_elicitation_supported: AtomicBool::new(false),
         }
@@ -385,6 +391,13 @@ impl AgentService {
     /// system-injected inbox messages as user chunks (live and replay).
     pub fn with_show_synthetic(mut self, show_synthetic: bool) -> Self {
         self.show_synthetic = show_synthetic;
+        self
+    }
+
+    /// Derive a service with `--shell-terminal` (Release 0.8.6): mount
+    /// the display-only terminal card for bash/shell calls.
+    pub fn with_shell_terminal(mut self, shell_terminal: bool) -> Self {
+        self.shell_terminal = shell_terminal;
         self
     }
 
@@ -1657,6 +1670,7 @@ impl AgentService {
         let mut state = updates::MappingState::new()
             .with_no_aft(self.no_aft)
             .with_cwd(entry.cwd.clone())
+            .with_shell_terminal(self.shell_terminal)
             .with_terminal_registry(Arc::clone(&terminal_registry));
         // Release 0.6.0: per-CHILD mapping states (fresh per turn — a
         // child's call ids are unique per child session, so each turn's
@@ -1966,6 +1980,7 @@ impl AgentService {
             // routing below (no poller, reported as a follow-up).
             if let dto::SessionEvent::ToolProgress(p) = &event
                 && !is_child_event
+                && self.shell_terminal
                 && let (Some(shell_id), Some(name)) = (
                     p.metadata.as_ref().and_then(|m| m.shellID.as_ref()),
                     state.tool_name(&p.base.id),
@@ -2263,6 +2278,7 @@ impl AgentService {
             updates::MappingState::new()
                 .with_no_aft(self.no_aft)
                 .with_cwd(entry.cwd.clone())
+                .with_shell_terminal(self.shell_terminal)
         });
         // Release 0.8.0 (`--zed-git-add`): a CHILD's step snapshot diffs
         // accumulate under the ROOT (this prompt's session) pending set —
@@ -3336,6 +3352,7 @@ impl AgentService {
             updates::MappingState::new()
                 .with_no_aft(self.no_aft)
                 .with_cwd(entry.cwd.clone())
+                .with_shell_terminal(self.shell_terminal)
         });
         // Release 0.8.0 (`--zed-git-add`): REMOTE turns' step snapshot diffs
         // join the session's pending set too (staged on the session's next
@@ -3396,6 +3413,7 @@ impl AgentService {
             updates::MappingState::new()
                 .with_no_aft(self.no_aft)
                 .with_cwd(parent_entry.cwd.clone())
+                .with_shell_terminal(self.shell_terminal)
         });
         // Release 0.8.0 (`--zed-git-add`): a background CHILD's step
         // snapshot diffs accumulate under the ROOT parent's pending set
@@ -7097,9 +7115,10 @@ mod tests {
         // One known shell: every poll (cursor 12 caught up) returns an
         // empty Ok page — never an error.
         backend.set_shell_output("sh_z", vec![("z\n".to_string(), 12, 12)]);
-        let svc = Arc::new(AgentService::new(
-            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
-        ));
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                .with_shell_terminal(true),
+        );
         let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
         let agent_task = tokio::spawn({
             let svc = Arc::clone(&svc);
@@ -9884,9 +9903,10 @@ mod tests {
     async fn shell_terminal_streams_output_then_exits() {
         let backend = MockBackend::new();
         backend.set_shell_output("sh_9", vec![("hello world\n".to_string(), 12, 12)]);
-        let svc = Arc::new(AgentService::new(
-            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
-        ));
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                .with_shell_terminal(true),
+        );
         let (outcome, collected) = run_client(
             svc,
             Arc::clone(&backend),
@@ -10076,6 +10096,122 @@ mod tests {
         assert_eq!(exit.get("exit_code"), Some(&serde_json::json!(0)));
         // The poller actually called the shell endpoint.
         assert_eq!(backend.recorded_shell_outputs(), vec!["sh_9".to_string()]);
+    }
+
+    /// Release 0.8.6 (default-off gate): a service WITHOUT
+    /// `--shell-terminal` never mounts the card and never polls — the
+    /// shell's declaration stays plain, recorded_shell_outputs stays
+    /// empty (the mock would happily serve pages).
+    #[tokio::test]
+    async fn shell_terminal_stays_off_without_the_flag() {
+        let backend = MockBackend::new();
+        backend.set_shell_output("sh_9", vec![("secret\n".to_string(), 12, 12)]);
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (outcome, collected) = run_client(
+            svc,
+            Arc::clone(&backend),
+            move |backend, _collected, cx| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+
+                backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_s2".into(),
+                        id: "call_s2".into(),
+                    },
+                    name: "bash".into(),
+                }));
+                backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_s2".into(),
+                        id: "call_s2".into(),
+                    },
+                    input: serde_json::json!({ "command": "echo secret" }),
+                    executed: Some(true),
+                }));
+                // A progress event with a shellID would spawn the poller
+                // under the flag — without it, nothing starts.
+                backend.push(dto::SessionEvent::ToolProgress(dto::ToolProgress {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_s2".into(),
+                        id: "call_s2".into(),
+                    },
+                    metadata: Some(dto::ToolProgressMeta {
+                        sessionID: Some("ses_mock_1".into()),
+                        status: Some("running".into()),
+                        shellID: Some("sh_9".into()),
+                    }),
+                }));
+                backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_s2".into(),
+                        id: "call_s2".into(),
+                    },
+                    content: Some(vec![dto::ToolContent::Text {
+                        text: "done\n".into(),
+                    }]),
+                    metadata: Some(dto::ToolMetadata {
+                        status: Some("completed".into()),
+                        exit: Some(0),
+                        signal: None,
+                        ..Default::default()
+                    }),
+                    executed: Some(true),
+                }));
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+
+                let prompt_req = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("run a shell"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                Ok(())
+            },
+        )
+        .await;
+        outcome.expect("client run ok");
+
+        // No poller ever ran.
+        assert!(
+            backend.recorded_shell_outputs().is_empty(),
+            "no shell output polling without the flag"
+        );
+        // The declaration stayed plain: no terminal_info, no terminal part.
+        let notifications = collected.lock().expect("collected lock");
+        let decl = notifications
+            .iter()
+            .find_map(|n| match &n.update {
+                acp::SessionUpdate::ToolCall(c) if c.tool_call_id.0.as_ref() == "call_s2" => {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .expect("the shell call was declared");
+        assert!(
+            decl.meta
+                .as_ref()
+                .and_then(|m| m.get("terminal_info"))
+                .is_none()
+        );
+        assert!(decl.content.is_empty());
     }
 
     /// Release 0.8.5: slash-command routing — official `detectSlashCommand`
@@ -10349,14 +10485,33 @@ mod tests {
                     },
                     delta: "remote reply".into(),
                 }));
+                // Release 0.8.6: usage.updated is CUMULATIVE — `used`
+                // comes from the LAST STEP's own tokens (this step: 7+3).
+                backend.remote_push(dto::SessionEvent::StepEnded(dto::StepEnded {
+                    session: dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    },
+                    assistantMessageID: "msg_remote_1".into(),
+                    finish: Some("stop".into()),
+                    rawFinish: None,
+                    cost: None,
+                    tokens: Some(dto::Usage {
+                        input: Some(7),
+                        output: Some(3),
+                        reasoning: None,
+                        cache: None,
+                    }),
+                    snapshot: None,
+                    files: None,
+                }));
                 backend.remote_push(dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
                     session: dto::SessionRef {
                         sessionID: "ses_mock_1".into(),
                     },
                     cost: None,
                     tokens: Some(dto::Usage {
-                        input: Some(7),
-                        output: Some(3),
+                        input: Some(77),
+                        output: Some(33),
                         reasoning: None,
                         cache: None,
                     }),

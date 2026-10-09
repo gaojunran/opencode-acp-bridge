@@ -83,6 +83,15 @@ pub struct MappingState {
     /// turn's exit paths, even streams created after the guard was made
     /// (map snapshots cannot see late registrations).
     pub terminal_registry: Arc<std::sync::Mutex<Vec<Arc<TerminalStream>>>>,
+    /// Release 0.8.6 (`--shell-terminal`): mount the display-only terminal
+    /// card for bash/shell calls (declaration attachments + the output
+    /// poller). Off by default — the card takes vertical space.
+    shell_terminal: bool,
+    /// Release 0.8.6: the LAST STEP's total tokens (official
+    /// `state.usage.last` — recorded on `step.ended` / `step.failed`).
+    /// `usage.updated` carries CUMULATIVE sessions totals, useless for the
+    /// context gauge; `None` until the first step boundary.
+    pub last_step_used: Option<u64>,
 }
 
 /// Release 0.8.5: one shell tool call's terminal streaming state, shared
@@ -215,6 +224,14 @@ impl MappingState {
         self
     }
 
+    /// Builder: `--shell-terminal` (Release 0.8.6) — mount the
+    /// display-only terminal card for bash/shell calls (see
+    /// [`MappingState::shell_terminal`]).
+    pub fn with_shell_terminal(mut self, shell_terminal: bool) -> Self {
+        self.shell_terminal = shell_terminal;
+        self
+    }
+
     /// The parsed input of a tool call, if seen this turn (`tool.input.ended`
     /// / `tool.called`). Used to build the permission prompt's `state.input`.
     pub fn tool_input(&self, tool_call_id: &str) -> Option<&serde_json::Value> {
@@ -324,6 +341,16 @@ impl MappingState {
 /// Map one decoded opencode event to zero or more ACP session updates, in
 /// wire order. Events with no ACP counterpart (step lifecycle, inbox, …) map
 /// to the empty vec.
+/// Total tokens of one usage record — the official `TokenUsage.total`
+/// (input + output + reasoning + cache read + cache write).
+fn usage_total(u: &dto::Usage) -> u64 {
+    u.input.unwrap_or(0)
+        + u.output.unwrap_or(0)
+        + u.reasoning.unwrap_or(0)
+        + u.cache.as_ref().map_or(0, |c| c.read.unwrap_or(0))
+        + u.cache.as_ref().map_or(0, |c| c.write.unwrap_or(0))
+}
+
 pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<SessionUpdate> {
     match event {
         // ---------- text ----------
@@ -433,11 +460,27 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
         }
 
         // ---------- steps ----------
-        dto::SessionEvent::StepFailed(_) => {
+        dto::SessionEvent::StepEnded(s) => {
+            // Release 0.8.6: `usage.updated` carries CUMULATIVE session
+            // tokens — the official `used` is the LAST STEP's total
+            // (turn.ts `recordStep` on step.ended / step.failed). Record
+            // the step's own tokens here; the next usage.updated maps it.
+            // No ACP update of its own (v1 has no per-step surface).
+            if let Some(t) = &s.tokens {
+                state.last_step_used = Some(usage_total(t));
+            }
+            vec![]
+        }
+        dto::SessionEvent::StepFailed(s) => {
             // No ACP update: v1 has no per-step failure surface and the
             // official adapter does not consume this event — the error
             // taxonomy arrives via `session.execution.failed`. The agent
             // layer logs the step-level outcome (`step_failed_outcome`).
+            // Release 0.8.6: a step's tokens still advance `used` even
+            // when the step failed (official `recordStep` on step.failed).
+            if let Some(t) = &s.tokens {
+                state.last_step_used = Some(usage_total(t));
+            }
             vec![]
         }
 
@@ -453,15 +496,14 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
             // Release 0.8.4: mirror the official adapter's usage gate — the
             // update is dropped when nothing was used or the current model's
             // context size is unknown (the agent layer stashes it on the
-            // state from the model catalog). `used` sums EVERY token lane,
-            // cache reads/writes included (the pre-0.8.4 mapping missed them).
-            let used = u.tokens.as_ref().map(|t| {
-                t.input.unwrap_or(0)
-                    + t.output.unwrap_or(0)
-                    + t.reasoning.unwrap_or(0)
-                    + t.cache.as_ref().map_or(0, |c| c.read.unwrap_or(0))
-                    + t.cache.as_ref().map_or(0, |c| c.write.unwrap_or(0))
-            });
+            // state from the model catalog).
+            // Release 0.8.6: `used` is the LAST STEP's total token count
+            // (recorded on step.ended/step.failed) — the wire's own tokens
+            // are CUMULATIVE session totals (usage#2 = usage#1 + step#1;
+            // verified on the fixture) and would inflate the context gauge.
+            // `None` until the first step boundary → no update (official
+            // `used == 0 → return` parity).
+            let used = state.last_step_used;
             let size = state.context_limit;
             if used.is_none() || used == Some(0) || size.is_none() || size == Some(0) {
                 return vec![];
@@ -1691,8 +1733,10 @@ pub fn is_shell(name: &str) -> bool {
 
 /// Release 0.8.5: the terminal-mount attachment for a shell call — the
 /// stable terminal id derives from the call id; `None` for non-shells.
+/// Release 0.8.6: also `None` unless `--shell-terminal` opts the card in
+/// (the flag gates every mount site through this one helper).
 pub fn shell_terminal(state: &MappingState, id: &str, name: &str) -> Option<TerminalAttach> {
-    if is_shell(name) {
+    if state.shell_terminal && is_shell(name) {
         Some(TerminalAttach {
             terminal_id: format!("term_{id}"),
             cwd: state.cwd.clone(),
@@ -1904,10 +1948,12 @@ mod tests {
             .flat_map(|e| to_updates(e, &mut state))
             .collect();
 
-        // 1. First update is the initial usage bump.
+        // 1. First update is the session rename — the fixture's initial
+        //    usage bump (712 cumulative) is GATED OUT: no step has ended
+        //    yet, so there is no per-step `used` (Release 0.8.6).
         match &updates[0] {
-            SessionUpdate::UsageUpdate(_) => {}
-            other => panic!("first update should be usage, got {other:?}"),
+            SessionUpdate::SessionInfoUpdate(_) => {}
+            other => panic!("first update should be the rename, got {other:?}"),
         }
 
         // 2. Renamed → SessionInfoUpdate.
@@ -2029,20 +2075,26 @@ mod tests {
             .collect();
         assert_eq!(texts, vec!["done"]);
 
-        // 7. Usage updates exist (usage.updated fires three times in the
-        //    fixture: session start, after the tool input, after the run) —
-        //    `used` sums every token lane INCLUDING cache reads, `size` is
-        //    the model's context limit (Release 0.8.4).
+        // 7. Usage updates: usage.updated fires THREE times in the
+        //    fixture (session start, after each step) but its payload is
+        //    CUMULATIVE (usage#2 = usage#1 + step#1 = 712 + 31365; verified
+        //    line by line) — the mapped `used` is the LAST STEP's total
+        //    (Release 0.8.6): the pre-step bump is gated out, the two
+        //    post-step updates carry 31365 and 31395. `size` is the
+        //    model's context limit.
         let usage_count = updates
             .iter()
             .filter(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
             .count();
-        assert_eq!(usage_count, 3);
-        let SessionUpdate::UsageUpdate(first) = &updates[0] else {
-            panic!("first update is the usage bump")
-        };
-        assert_eq!(first.used, 712, "20+180+0+512(cache read)+0(cache write)");
-        assert_eq!(first.size, 168_000, "the model's context limit");
+        assert_eq!(usage_count, 2);
+        let usage_values: Vec<(u64, u64)> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::UsageUpdate(u) => Some((u.used, u.size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_values, vec![(31_365, 168_000), (31_395, 168_000)]);
     }
 
     /// Direct ToolMetadata construction (no fixture): `files[]` with ONE
@@ -2401,7 +2453,9 @@ mod tests {
     /// resolution fails). Non-shell declarations carry neither.
     #[test]
     fn shell_declaration_mounts_the_display_terminal() {
-        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let mut state = MappingState::new()
+            .with_shell_terminal(true)
+            .with_cwd("/home/u/proj");
         let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
             base: tool_ref("ses_x", "msg_x", "call_shell"),
             name: "bash".into(),
@@ -2425,7 +2479,9 @@ mod tests {
         assert_eq!(t.terminal_id.0.as_ref(), "term_call_shell");
 
         // Non-shell declarations stay plain.
-        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let mut state = MappingState::new()
+            .with_shell_terminal(true)
+            .with_cwd("/home/u/proj");
         let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
             base: tool_ref("ses_x", "msg_x", "call_read"),
             name: "read".into(),
@@ -2438,7 +2494,9 @@ mod tests {
         assert!(c.content.is_empty());
         // Degenerate introduction paths (no input.started) also mount it
         // when the name is on hand.
-        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let mut state = MappingState::new()
+            .with_shell_terminal(true)
+            .with_cwd("/home/u/proj");
         let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
             base: tool_ref("ses_x", "msg_x", "call_late"),
             name: "bash".into(),
@@ -2453,7 +2511,9 @@ mod tests {
         // A DEGENERATE introduction (no input.started at all — the call id
         // is unknown) cannot know the tool family: no terminal mounts
         // (degraded but harmless — the terminal header just won't stream).
-        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let mut state = MappingState::new()
+            .with_shell_terminal(true)
+            .with_cwd("/home/u/proj");
         let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
             base: tool_ref("ses_x", "msg_x", "call_unknown"),
             input: serde_json::json!({}),
@@ -2472,9 +2532,32 @@ mod tests {
     /// Release 0.8.5: the shell command becomes the title on the running
     /// (called) and failed updates — official `toolTitle` (`input.command ??
     /// input.cmd`), required for the terminal header.
+    /// Release 0.8.6: WITHOUT `--shell-terminal` the shell declaration
+    /// stays PLAIN — no `_meta.terminal_info`, no `{type:"terminal"}`
+    /// content part (the card is opt-in; off by default).
+    #[test]
+    fn shell_declaration_stays_plain_without_the_flag() {
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_shell"),
+            name: "bash".into(),
+        });
+        let updates = to_updates(&started, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert!(c.meta.is_none(), "no terminal_info without the flag");
+        assert!(
+            c.content.is_empty(),
+            "no Terminal content part without the flag"
+        );
+    }
+
     #[test]
     fn shell_running_and_failed_updates_carry_the_command_title() {
-        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let mut state = MappingState::new()
+            .with_shell_terminal(true)
+            .with_cwd("/home/u/proj");
         let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
             base: tool_ref("ses_x", "msg_x", "call_s"),
             name: "bash".into(),
@@ -2533,7 +2616,9 @@ mod tests {
     #[test]
     fn shell_success_emits_terminal_exit_and_fallback_output() {
         let success_with = |meta: Option<dto::ToolMetadata>| {
-            let mut state = MappingState::new().with_cwd("/home/u/proj");
+            let mut state = MappingState::new()
+                .with_shell_terminal(true)
+                .with_cwd("/home/u/proj");
             let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
                 base: tool_ref("ses_x", "msg_x", "call_s"),
                 name: "bash".into(),
@@ -2984,21 +3069,50 @@ mod tests {
         assert_eq!(u.fields.locations, Some(vec![]));
     }
 
-    /// Release 0.8.4: usage mapping mirrors the official adapter — `used`
-    /// sums every lane including cache, `size` is the model's context
-    /// limit; unknown size or zero used ⇒ no update at all.
+    /// Release 0.8.6: usage mapping mirrors the official adapter — `used`
+    /// is the LAST STEP's total (recorded on step.ended / step.failed),
+    /// `size` is the model's context limit; unknown size, zero used, or no
+    /// step boundary yet ⇒ no update at all.
     #[test]
-    fn usage_update_gates_on_size_and_used() {
-        fn map(limit: Option<u64>, tokens: Option<dto::Usage>) -> Vec<SessionUpdate> {
-            let mut state = MappingState::new().with_context_limit(limit);
-            let ev = dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
+    fn usage_update_gates_on_step_tokens_and_size() {
+        fn step(tokens: Option<dto::Usage>) -> dto::SessionEvent {
+            dto::SessionEvent::StepEnded(dto::StepEnded {
+                session: dto::SessionRef {
+                    sessionID: "ses_x".into(),
+                },
+                assistantMessageID: "msg_x".into(),
+                finish: None,
+                rawFinish: None,
+                cost: None,
+                tokens,
+                snapshot: None,
+                files: None,
+            })
+        }
+        fn usage(cumulative: Option<dto::Usage>) -> dto::SessionEvent {
+            dto::SessionEvent::UsageUpdated(dto::UsageUpdated {
                 session: dto::SessionRef {
                     sessionID: "ses_x".into(),
                 },
                 cost: Some(0.5),
-                tokens,
-            });
-            to_updates(&ev, &mut state)
+                tokens: cumulative,
+            })
+        }
+        fn map(limit: Option<u64>, tokens: Option<dto::Usage>) -> Vec<SessionUpdate> {
+            let mut state = MappingState::new().with_context_limit(limit);
+            let mut out = to_updates(&step(tokens.clone()), &mut state);
+            // The usage.updated payload is a deliberately DIFFERENT
+            // (cumulative-looking) number — it must be ignored entirely.
+            out.extend(to_updates(
+                &usage(Some(dto::Usage {
+                    input: Some(999),
+                    output: Some(999),
+                    reasoning: None,
+                    cache: None,
+                })),
+                &mut state,
+            ));
+            out
         }
         let tokens = Some(dto::Usage {
             input: Some(10),
@@ -3009,20 +3123,61 @@ mod tests {
                 write: Some(8),
             }),
         });
-        // 1. used includes the cache lanes; size comes from the catalog.
+        // 1. used = the STEP's total (142 = 10+20+4+100+8); size comes
+        //    from the catalog; the wire's cumulative payload stays ignored.
         let out = map(Some(200_000), tokens.clone());
         assert_eq!(out.len(), 1);
         let SessionUpdate::UsageUpdate(u) = &out[0] else {
             panic!("usage update expected")
         };
-        assert_eq!(u.used, 142, "10+20+4+100(cache read)+8(cache write)");
+        assert_eq!(u.used, 142);
         assert_eq!(u.size, 200_000);
         assert_eq!(u.cost.as_ref().map(|c| c.amount), Some(0.5));
         assert_eq!(u.cost.as_ref().map(|c| c.currency.as_str()), Some("USD"));
-        // 2. Unknown size → no update.
+        // 2. No step boundary yet → no update (official `used == 0` gate).
+        let mut state = MappingState::new().with_context_limit(Some(200_000));
+        assert!(to_updates(&usage(tokens.clone()), &mut state).is_empty());
+        // 3. Unknown size → no update.
         assert!(map(None, tokens.clone()).is_empty());
-        // 3. Zero used → no update.
+        // 4. A step whose tokens total zero → no update.
         assert!(map(Some(200_000), Some(dto::Usage::default())).is_empty());
+        // 5. step.failed records the usage too (official `recordStep`).
+        let mut state = MappingState::new().with_context_limit(Some(200_000));
+        let failed = dto::SessionEvent::StepFailed(dto::StepFailed {
+            session: dto::SessionRef {
+                sessionID: "ses_x".into(),
+            },
+            assistantMessageID: "msg_x".into(),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("boom".into()),
+            },
+            finish: None,
+            tokens: Some(dto::Usage {
+                input: Some(7),
+                output: Some(3),
+                reasoning: None,
+                cache: None,
+            }),
+        });
+        assert!(
+            to_updates(&failed, &mut state).is_empty(),
+            "step.failed maps nothing"
+        );
+        let out = to_updates(
+            &usage(Some(dto::Usage {
+                input: Some(999),
+                output: None,
+                reasoning: None,
+                cache: None,
+            })),
+            &mut state,
+        );
+        assert_eq!(out.len(), 1);
+        let SessionUpdate::UsageUpdate(u) = &out[0] else {
+            panic!("usage update expected")
+        };
+        assert_eq!(u.used, 10, "7+3 from the FAILED step");
     }
 
     // ======================= Wave 5: aft hoist dialect =======================
@@ -3966,6 +4121,7 @@ mod tests {
                 message: Some("auth expired".into()),
             },
             finish: None,
+            tokens: None,
         });
         // No ACP update for step failures (v1 has no per-step surface)…
         let mut state = MappingState::new();

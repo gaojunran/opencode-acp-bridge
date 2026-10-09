@@ -941,3 +941,16 @@ user records via the shared `user_message_chunks` helper), flag off → skip
   user chunk and compaction/move still render nothing, and the following
   real user prompt stages normally.
 - `--show-synthetic` composes with `--zed-git-add` (args parse test).
+
+## Shell terminal cards (--shell-terminal, Release 0.8.5)
+
+bash/shell tool calls CAN mount a display-only terminal card: the first
+declaration carries `_meta.terminal_info` (snake_case, `{terminal_id, cwd}`)
+AND a `{type:"terminal", terminalId}` content part on the same message, the
+running/failed title is the command (`input.command ?? input.cmd`), and a
+~1s output poller (`GET /api/shell/{id}/output`, cursor-incremental) streams
+`_meta.terminal_output` ToolCallUpdates until the call ends — the completed
+update then carries `_meta.terminal_exit` from `metadata.exit`. Behind
+`--shell-terminal` (Release 0.8.6): OFF by default — the card takes vertical
+space, so no terminal_info/terminal content is emitted and no poller starts
+without the flag.

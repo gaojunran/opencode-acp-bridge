@@ -1013,6 +1013,11 @@ pub struct StepFailed {
     pub error: StructuredError,
     #[serde(default)]
     pub finish: Option<String>,
+    /// Release 0.8.6: per-step token usage (the official per-step record —
+    /// `usage.updated` carries CUMULATIVE totals). Optional on the wire;
+    /// serde-default tolerates its absence on 2.0.21.
+    #[serde(default)]
+    pub tokens: Option<Usage>,
 }
 
 /// Payload of a `session.retry.scheduled` event. Field set taken from the

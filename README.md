@@ -96,6 +96,7 @@ To pin a specific server instead, pass the URL and password explicitly:
 | `--no-aft` | *(composes with any connection mode)* | disables the aft tool-call hoist adaptations: File/image content passthrough in tool results; diff extraction stays enabled |
 | `--zed-git-add` | *(composes with any connection mode)* | turn-scoped staging: at each user prompt, `git add --` exactly the paths of the previous turn's native snapshot diff (`step.ended.files` — write/edit/apply_patch AND bash, see Features); accepted premise: no concurrent edits in the same directory during the turn |
 | `--show-synthetic` | *(composes with any connection mode)* | renders server-injected 'synthetic' inbox messages (background bash completions, subagent-completion notifications) as user chunks, live and on replay — off by default; synthetic/compaction/move items never trigger staging under any flag |
+| `--shell-terminal` | *(composes with any connection mode)* | streams bash/shell tool output into an embedded terminal card in the client (display-only terminal + ~1s output polling until the call ends) — off by default; the card takes vertical space |
 
 The server is probed at startup (`GET /api/config`) and failures are
 classified — unreachable, credentials rejected, HTTP status — with the
@@ -166,6 +167,11 @@ usage error.
   ANY flag — `--show-synthetic` additionally renders them as user chunks,
   live (background listener) and on replay (same flag, same semantics).
   Control-plane items are always skipped entirely
+- **Shell terminal cards** (Release 0.8.5, `--shell-terminal`) — bash/shell
+  calls mount a display-only terminal card (terminal_info meta + terminal
+  content part on the first declaration) and a ~1s output poller streams
+  the shell's output into it until the call ends (terminal_exit on
+  completion). Opt-in — off by default, the card takes vertical space
 - **aft plugin compatible** — image reads map to ACP image content blocks;
   `--no-aft` opts out of the hoist adaptations
 - **Native subagent cards label with the dispatch description** (Release

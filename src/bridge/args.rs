@@ -32,6 +32,10 @@ OPTIONS:
                      replay. Off by default: they are never rendered (the
                      wire still carries them; staging never reacts to them
                      either way).
+    --shell-terminal Stream bash/shell tool output into an embedded terminal
+                     card in the client (display-only terminal + ~1s output
+                     polling until the call ends). Off by default — the
+                     card takes vertical space.
     --version        Print the version and exit.
     --help           Print this help and exit.
 
@@ -92,6 +96,9 @@ pub struct RunOptions {
     /// `USAGE`). Off by default. Whatever the flag, synthetic/compaction/
     /// move items NEVER trigger turn-scoped staging.
     pub show_synthetic: bool,
+    /// `--shell-terminal`: mount the display-only terminal card for
+    /// bash/shell calls (Release 0.8.6; see `USAGE`). Off by default.
+    pub shell_terminal: bool,
 }
 
 /// Parse the argument list (argv[0] included, like `std::env::args()`).
@@ -100,8 +107,8 @@ pub struct RunOptions {
 /// - `--help` / `--version` win immediately (first one seen).
 /// - `--attach <url>`: the next token, when it does not start with `-`, is the
 ///   URL; otherwise (next flag or end of args) `--attach` is treated as bare.
-/// - `--no-aft` / `--zed-git-add` / `--show-synthetic`: boolean flags, may
-///   appear anywhere; rejected when repeated.
+/// - `--no-aft` / `--zed-git-add` / `--show-synthetic` / `--shell-terminal`:
+///   boolean flags, may appear anywhere; rejected when repeated.
 /// - any other token is a usage error; a repeated `--attach` is a usage error.
 pub fn parse_args<I>(args: I) -> ParseOutcome
 where
@@ -118,6 +125,7 @@ where
     let mut no_aft = false;
     let mut zed_git_add = false;
     let mut show_synthetic = false;
+    let mut shell_terminal = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -147,6 +155,14 @@ where
                     );
                 }
                 show_synthetic = true;
+            }
+            "--shell-terminal" => {
+                if shell_terminal {
+                    return ParseOutcome::Error(
+                        "duplicate --shell-terminal (run with --help for usage)".to_string(),
+                    );
+                }
+                shell_terminal = true;
             }
             "--attach" => {
                 if attach.is_some() {
@@ -183,7 +199,13 @@ where
         }
         None => ConnectMode::Default,
     };
-    ParseOutcome::Run(RunOptions { mode, no_aft, zed_git_add, show_synthetic })
+    ParseOutcome::Run(RunOptions {
+        mode,
+        no_aft,
+        zed_git_add,
+        show_synthetic,
+        shell_terminal,
+    })
 }
 
 #[cfg(test)]
@@ -207,7 +229,13 @@ mod tests {
     fn attach_with_url_is_explicit_mode() {
         assert_eq!(
             parse(&["prog", "--attach", "http://127.0.0.1:44041"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()), no_aft: false, zed_git_add: false, show_synthetic: false })
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::ExplicitUrl("http://127.0.0.1:44041".into()),
+                no_aft: false,
+                zed_git_add: false,
+                show_synthetic: false,
+                shell_terminal: false,
+            })
         );
     }
 
@@ -229,7 +257,13 @@ mod tests {
     fn no_attach_means_default_mode() {
         assert_eq!(
             parse(&["prog"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: false, show_synthetic: false })
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: false,
+                zed_git_add: false,
+                show_synthetic: false,
+                shell_terminal: false,
+            })
         );
     }
 
@@ -238,7 +272,13 @@ mod tests {
         // Bare --no-aft.
         assert_eq!(
             parse(&["prog", "--no-aft"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: true, zed_git_add: false, show_synthetic: false })
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: true,
+                zed_git_add: false,
+                show_synthetic: false,
+                shell_terminal: false,
+            })
         );
         // With an explicit URL, in either order.
         assert_eq!(
@@ -248,6 +288,7 @@ mod tests {
                 no_aft: true,
                 zed_git_add: false,
                 show_synthetic: false,
+                shell_terminal: false,
             })
         );
         // Bare --attach followed by --no-aft: the deferred usage error
@@ -272,7 +313,13 @@ mod tests {
     fn zed_git_add_flag_composes_with_any_attach_form() {
         assert_eq!(
             parse(&["prog", "--zed-git-add"]),
-            ParseOutcome::Run(RunOptions { mode: ConnectMode::Default, no_aft: false, zed_git_add: true, show_synthetic: false })
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: false,
+                zed_git_add: true,
+                show_synthetic: false,
+                shell_terminal: false,
+            })
         );
         assert_eq!(
             parse(&["prog", "--no-aft", "--zed-git-add", "--attach", "http://127.0.0.1:44041"]),
@@ -281,6 +328,7 @@ mod tests {
                 no_aft: true,
                 zed_git_add: true,
                 show_synthetic: false,
+                shell_terminal: false,
             })
         );
         // Release 0.8.1: --show-synthetic composes with --zed-git-add.
@@ -291,6 +339,7 @@ mod tests {
                 no_aft: false,
                 zed_git_add: true,
                 show_synthetic: true,
+                shell_terminal: false,
             })
         );
     }
@@ -298,6 +347,37 @@ mod tests {
     #[test]
     fn duplicate_zed_git_add_is_rejected() {
         match parse(&["prog", "--zed-git-add", "--zed-git-add"]) {
+            ParseOutcome::Error(msg) => assert!(msg.contains("duplicate"), "got {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_terminal_parses_and_rejects_duplicates() {
+        // Release 0.8.6: bare --shell-terminal opts the terminal card in.
+        assert_eq!(
+            parse(&["prog", "--shell-terminal"]),
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: false,
+                zed_git_add: false,
+                show_synthetic: false,
+                shell_terminal: true,
+            })
+        );
+        // Composes with the other boolean flags.
+        assert_eq!(
+            parse(&["prog", "--shell-terminal", "--no-aft"]),
+            ParseOutcome::Run(RunOptions {
+                mode: ConnectMode::Default,
+                no_aft: true,
+                zed_git_add: false,
+                show_synthetic: false,
+                shell_terminal: true,
+            })
+        );
+        // Repeated → usage error, like the other flags.
+        match parse(&["prog", "--shell-terminal", "--shell-terminal"]) {
             ParseOutcome::Error(msg) => assert!(msg.contains("duplicate"), "got {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }

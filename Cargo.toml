@@ -1,6 +1,6 @@
 [package]
 name = "opencode-acp-bridge"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2024"
 description = "ACP (Agent Client Protocol) server bridging to a shared opencode server over its HTTP API"
 license = "MIT"
