@@ -358,6 +358,7 @@ mod tests {
             title: Some("hello-acp-test.txt".into()),
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1, "one diff block expected");
@@ -378,6 +379,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1);
@@ -615,6 +617,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 2, "one block per Index: section");
@@ -660,6 +663,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         assert!(diff_blocks(&meta).is_empty());
     }
@@ -672,6 +676,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         }
     }
 
@@ -714,6 +719,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1);
@@ -745,6 +751,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1, "files[] only — the diff string is not parsed");
@@ -775,6 +782,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert!(blocks.is_empty(), "malformed entry skipped, no fallback to the string");
@@ -797,6 +805,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         };
         let blocks = diff_blocks(&meta);
         assert_eq!(blocks.len(), 1, "only the malformed entry is skipped");

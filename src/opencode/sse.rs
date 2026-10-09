@@ -216,6 +216,9 @@ mod tests {
             AgentSelected(_) => "session.agent.selected",
             ModelSelected(_) => "session.model.selected",
             InboxEnqueued(_) => "session.inbox.enqueued",
+            FormCreated(_) => "form.created",
+            FormReplied(_) => "form.replied",
+            FormCancelled(_) => "form.cancelled",
         }
     }
 
@@ -269,6 +272,19 @@ mod tests {
 
         // sanity: a full turn produced a healthy event count
         assert!(kinds.len() > 20, "expected a real turn, got {}", kinds.len());
+    }
+
+    /// Release 0.8.5: the synthetic form capture round-trips through the
+    /// live decode path (envelope → frame → typed event) with its kinds.
+    #[test]
+    fn parses_form_fixture_kinds() {
+        let raw = include_str!("../../tests/fixtures/form-created.sse.jsonl");
+        let events = decode_fixture(raw);
+        let kinds: Vec<&str> = events.iter().map(event_kind).collect();
+        assert_eq!(
+            kinds,
+            vec!["form.created", "form.replied", "form.cancelled"]
+        );
     }
 
     #[test]

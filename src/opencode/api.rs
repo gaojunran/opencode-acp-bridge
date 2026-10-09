@@ -31,9 +31,9 @@
 #![allow(dead_code)]
 
 use crate::dto::{
-    AgentInfo, Cursor, Envelope, InboxUserMessage, MessageRecord, MessagesEnvelope, ModelInfo,
-    ModelRef, PermissionReplyRequest, PromptRequest, ProviderInfo, SessionCreateRequest,
-    SessionInfo,
+    AgentInfo, Cursor, Envelope, FormReplyRequest, InboxUserMessage, MessageRecord,
+    MessagesEnvelope, ModelInfo, ModelRef, PermissionReplyRequest, PromptRequest, ProviderInfo,
+    SessionCreateRequest, SessionInfo,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
@@ -327,6 +327,38 @@ impl OpencodeClient {
             .map(|env| env.data)
     }
 
+    // Shells (Release 0.8.5)
+    // ------------------------------------------------------------
+
+    /// `GET /api/shell/{id}/output` — page through a shell's captured
+    /// combined output by absolute byte cursor (openapi `shell.output`,
+    /// TUI-parity paging). `cwd` goes in the deepObject `location.directory`
+    /// query; `cursor`/`limit` are optional (cursor strings on the wire).
+    pub async fn shell_output(
+        &self,
+        shell_id: &str,
+        cwd: &str,
+        cursor: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<ShellOutput, ApiError> {
+        let url = self.endpoint_url(&format!("/shell/{}", encode_segment(shell_id)));
+        let mut url = url.join("output").expect("static join");
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("location[directory]", cwd);
+            if let Some(cursor) = cursor {
+                q.append_pair("cursor", &cursor.to_string());
+            }
+            if let Some(limit) = limit {
+                q.append_pair("limit", &limit.to_string());
+            }
+        }
+        Ok(self
+            .send_json::<ShellOutput>(Method::GET, url, None)
+            .await?
+            .data)
+    }
+
     /// `POST /api/session/{id}/interrupt` — cancel an in-flight turn.
     ///
     /// Unlike the rest, this answers a **bare** `{"interrupted": bool}`.
@@ -428,6 +460,52 @@ impl OpencodeClient {
         ));
         let body = self.encode(&Method::POST, &url, req)?;
         self.send_unit(Method::POST, url, Some(body)).await
+    }
+
+    // Forms (Release 0.8.5)
+    // ------------------------------------------------------------
+
+    /// `POST /api/session/{id}/form/{formID}/reply` — answer a pending
+    /// form (204). Already-settled/not-found/invalid-answer are non-2xx
+    /// `ApiError::Http` (the caller tolerates 404/409 — see
+    /// `form_already_settled_or_gone`).
+    pub async fn form_reply(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        req: &FormReplyRequest,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint_url(&format!(
+            "/session/{}/form/{}/reply",
+            encode_segment(session_id),
+            encode_segment(form_id)
+        ));
+        let body = self.encode(&Method::POST, &url, req)?;
+        self.send_unit(Method::POST, url, Some(body)).await
+    }
+
+    /// `DELETE /api/session/{id}/form/{formID}` — cancel a pending form,
+    /// optionally telling the asker why nobody answered (204).
+    pub async fn form_cancel(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        message: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint_url(&format!(
+            "/session/{}/form/{}",
+            encode_segment(session_id),
+            encode_segment(form_id)
+        ));
+        let url = match message {
+            Some(message) => {
+                let mut url = url;
+                url.query_pairs_mut().append_pair("message", message);
+                url
+            }
+            None => url,
+        };
+        self.send_unit(Method::DELETE, url, None).await
     }
 
     // ------------------------------------------------------------
@@ -564,6 +642,18 @@ pub struct ForkRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct InterruptResponse {
     pub interrupted: bool,
+}
+
+/// `GET /api/shell/{id}/output` response (openapi `Shell.Output`, Release
+/// 0.8.5): `output` is the NEW bytes from the absolute byte `cursor`
+/// (inclusive); `cursor` advances to the end of the page and equals `size`
+/// once fully caught up; `truncated` says the page hit `limit`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShellOutput {
+    pub output: String,
+    pub cursor: u64,
+    pub size: u64,
+    pub truncated: bool,
 }
 
 /// `POST /api/session/{id}/agent` body — `{"agent": "<id>"}`. 204, no

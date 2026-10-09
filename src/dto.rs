@@ -253,6 +253,227 @@ pub struct InboxEventItem {
 }
 
 // ============================================================
+// Forms (Release 0.8.5)
+// ============================================================
+
+/// One selectable answer of a form field — opencode `Form.Option`
+/// (`packages/schema/src/form.ts`): answer `value`, human `label`, optional
+/// `description`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormOption {
+    pub value: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// One visibility condition (`Form.When`): the field is active only when a
+/// previously defined field's answer equals/not-equals `value`. Any present
+/// `when` makes the field unrepresentable for elicitation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormWhen {
+    pub key: String,
+    pub op: String,
+    pub value: serde_json::Value,
+}
+
+/// A form field — opencode `Form.Field` on the wire is a `type`-discriminated
+/// union; decoded as such so representability/schema translation (Release
+/// 0.8.5, `acp/form.rs`) can rely on the per-type optional fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FormField {
+    String(FormStringField),
+    Number(FormNumberField),
+    Integer(FormIntegerField),
+    Boolean(FormBooleanField),
+    Multiselect(FormMultiselectField),
+    External(FormExternalField),
+}
+
+/// Shared base of every non-external form field.
+///
+/// `required`/`hidden`/`custom` are booleans on the wire, defaults `false`
+/// when absent (the live `question` tool emits only key/title/description/
+/// type/options/custom).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormStringField {
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub when: Option<Vec<FormWhen>>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub min_length: Option<u64>,
+    #[serde(default)]
+    pub max_length: Option<u64>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub options: Option<Vec<FormOption>>,
+    #[serde(default)]
+    pub custom: Option<bool>,
+}
+
+/// `Form.NumberField` — minimum/maximum/default are wire numbers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormNumberField {
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub when: Option<Vec<FormWhen>>,
+    #[serde(default)]
+    pub minimum: Option<f64>,
+    #[serde(default)]
+    pub maximum: Option<f64>,
+    #[serde(default)]
+    pub default: Option<f64>,
+}
+
+/// `Form.IntegerField` — bounds/decimal-surface like the number field (wire
+/// numbers; the SDK integer schema serializes them as integers).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormIntegerField {
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub when: Option<Vec<FormWhen>>,
+    #[serde(default)]
+    pub minimum: Option<i64>,
+    #[serde(default)]
+    pub maximum: Option<i64>,
+    #[serde(default)]
+    pub default: Option<i64>,
+}
+
+/// `Form.BooleanField`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormBooleanField {
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub when: Option<Vec<FormWhen>>,
+    #[serde(default)]
+    pub default: Option<bool>,
+}
+
+/// `Form.MultiselectField` — options are REQUIRED on the wire.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormMultiselectField {
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub when: Option<Vec<FormWhen>>,
+    pub options: Vec<FormOption>,
+    #[serde(default)]
+    pub min_items: Option<u64>,
+    #[serde(default)]
+    pub max_items: Option<u64>,
+    #[serde(default)]
+    pub custom: Option<bool>,
+    #[serde(default)]
+    pub default: Option<Vec<String>>,
+}
+
+/// `Form.ExternalField` — a link instead of an input; makes the whole form
+/// unrepresentable (never elicited).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormExternalField {
+    pub key: String,
+    pub url: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A `form.created` event's payload (`{form: Form.Info}`). `metadata` is an
+/// open record — the elicitation gates read `kind` and `tool.id` out of it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormCreated {
+    pub form: FormInfo,
+}
+
+/// `Form.Info` — the full form as the event stream carries it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormInfo {
+    pub id: String,
+    pub sessionID: String,
+    pub title: String,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub fields: Vec<FormField>,
+}
+
+/// `form.replied` — the form was answered (by this bridge's own reply or
+/// elsewhere). Decoded and ignored: the asker resumes on its own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormReplied {
+    pub id: String,
+    pub sessionID: String,
+}
+
+/// `form.cancelled` — decoded and ignored (the asker learned nobody
+/// answered).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormCancelled {
+    pub id: String,
+    pub sessionID: String,
+}
+
+/// POST /api/session/{id}/form/{formID}/reply body (Release 0.8.5) — the
+/// answer object keyed by field key (string/number/bool/string[]).
+#[derive(Debug, Clone, Serialize)]
+pub struct FormReplyRequest {
+    pub answer: serde_json::Map<String, serde_json::Value>,
+}
+
+// ============================================================
 // Permission
 // ============================================================
 
@@ -446,7 +667,7 @@ pub struct StructuredError {
 /// VERIFIED (single-file `write`): `filediff` object + `diff` string + `title`.
 /// UNVERIFIED: multi-file tools (apply_patch) — may carry a different layout;
 /// if a live probe shows one, extend with a `filediffs: Vec<FileDiff>` field.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolMetadata {
     /// Unified patch (SVN-style `Index:` header) as a single string.
     #[serde(default)]
@@ -466,13 +687,25 @@ pub struct ToolMetadata {
     pub truncated: Option<bool>,
     #[serde(default)]
     pub diagnostics: Option<Value>,
+    // Release 0.8.5: shell-tool completion metadata (live-probed shapes from
+    // the opencode bash tool): `status` ("completed" | "running"), `exit`
+    // (process exit code), `signal` (termination signal, optional),
+    // `shellID` (the shell instance behind the call).
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub exit: Option<i64>,
+    #[serde(default)]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub shellID: Option<String>,
 }
 
 /// One entry of `metadata.files[]` (wire shape: `filePath`, `relativePath`,
 /// `type`, `patch`, `additions`, `deletions` — live-verified from a real
 /// apply_patch capture; `movePath` exists in the dev-clone source but was
 /// NOT observed on the wire).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     /// Absolute path of the file — the AUTHORITATIVE path (the diff mapping
@@ -499,7 +732,7 @@ pub struct FileEntry {
     pub move_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileDiff {
     /// Absolute path of the changed file.
     pub file: String,
@@ -744,6 +977,10 @@ pub struct ToolProgressMeta {
     pub sessionID: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Release 0.8.5: the shell instance id (`sh_*`) a bash/shell tool call
+    /// reports while running — the terminal output poller key.
+    #[serde(default)]
+    pub shellID: Option<String>,
 }
 
 /// Payload of a `session.tool.failed` event: a tool call ended in error.
@@ -754,6 +991,14 @@ pub struct ToolRefError {
     #[serde(flatten)]
     pub base: ToolRef,
     pub error: StructuredError,
+    /// Release 0.8.5: the tool's output parts, when the wire carries them
+    /// (official `errorToolUpdate` maps them like success content).
+    #[serde(default)]
+    pub content: Option<Vec<ToolContent>>,
+    /// Release 0.8.5: the tool's completion metadata (diffs, shell
+    /// status/exit) — mirrored into the failed update's rawOutput.
+    #[serde(default)]
+    pub metadata: Option<ToolMetadata>,
 }
 
 /// Payload of a `session.step.failed` event (2.0.21 event processors carry
@@ -1035,6 +1280,15 @@ pub enum SessionEvent {
     /// frontend's user message); the per-turn mapping layer maps it to
     /// nothing (the ACP client authored the local prompt itself).
     InboxEnqueued(InboxEnqueued),
+    // forms (Release 0.8.5)
+    /// `form.created` — a form was raised (the `question` tool's
+    /// forms.ask). Consumed by the agent layer as an `elicitation/create`
+    /// bridge, never mapped to an update.
+    FormCreated(FormCreated),
+    /// `form.replied` — decoded to ignore (the asker resumes on its own).
+    FormReplied(FormReplied),
+    /// `form.cancelled` — decoded to ignore.
+    FormCancelled(FormCancelled),
 }
 
 fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
@@ -1080,6 +1334,9 @@ pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
         "session.agent.selected" => parse(data).map(SessionEvent::AgentSelected),
         "session.model.selected" => parse(data).map(SessionEvent::ModelSelected),
         "session.inbox.enqueued" => parse(data).map(SessionEvent::InboxEnqueued),
+        "form.created" => parse(data).map(SessionEvent::FormCreated),
+        "form.replied" => parse(data).map(SessionEvent::FormReplied),
+        "form.cancelled" => parse(data).map(SessionEvent::FormCancelled),
         _ => None,
     }
 }
@@ -1123,6 +1380,56 @@ mod tests {
         }
         assert!(decoded > 20, "expected a real turn, got {decoded} relevant frames");
         assert!(envelopes > decoded, "fixture should contain skipped kinds too");
+    }
+
+    /// Release 0.8.5: the synthetic form capture decodes end-to-end — the
+    /// `form.created` frame carries the full discriminated field union, the
+    /// reply/cancel frames decode (and are ignored by the mapping layer).
+    #[test]
+    fn decode_form_created_capture() {
+        let raw = include_str!("../tests/fixtures/form-created.sse.jsonl");
+        let mut events = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let env: EventEnvelope =
+                serde_json::from_str(line.strip_prefix("data: ").expect("data: prefix"))
+                    .expect("envelope parses");
+            events.push(decode_event(&env.kind, &env.data).expect("form event decodes"));
+        }
+        assert_eq!(events.len(), 3);
+
+        let SessionEvent::FormCreated(created) = &events[0] else {
+            panic!("first frame is form.created")
+        };
+        assert_eq!(created.form.id, "frm_ask_1");
+        assert_eq!(created.form.sessionID, "ses_fixture_1");
+        assert_eq!(created.form.title, "Questions");
+        let meta = created.form.metadata.as_ref().expect("metadata");
+        assert_eq!(meta.get("kind").and_then(Value::as_str), Some("question"));
+        let tool = meta.get("tool").expect("tool source");
+        assert_eq!(
+            tool.get("id").and_then(Value::as_str),
+            Some("call_question_1")
+        );
+        // The discriminated union decodes per-type.
+        assert_eq!(created.form.fields.len(), 2);
+        let FormField::String(s0) = &created.form.fields[0] else {
+            panic!("q0 is a string field")
+        };
+        assert_eq!(s0.key, "q0");
+        assert_eq!(s0.custom, Some(true));
+        assert_eq!(s0.options.as_ref().map(|o| o.len()), Some(2));
+        let FormField::Multiselect(s1) = &created.form.fields[1] else {
+            panic!("q1 is a multiselect field")
+        };
+        assert_eq!(s1.key, "q1");
+        assert_eq!(s1.custom, Some(true));
+
+        assert!(matches!(&events[1], SessionEvent::FormReplied(_)));
+        assert!(matches!(&events[2], SessionEvent::FormCancelled(_)));
     }
 
     /// Wave 3: the captured permission-ask turn must decode end-to-end, and

@@ -8,5 +8,6 @@
 
 pub mod agent;
 pub mod diff;
+pub mod form;
 pub mod replay;
 pub mod updates;

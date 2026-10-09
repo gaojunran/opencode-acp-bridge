@@ -69,6 +69,23 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
     /// Interrupt a running turn (`session/cancel`).
     fn interrupt(&self, session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 
+    /// Release 0.8.5: run a catalog agent command (`POST .../command`,
+    /// official `session.command` delivery `steer`) — the slash-command
+    /// route for `/foo` when `foo` is in the command catalog. Same
+    /// shape/return as [`Self::prompt`] (the enqueued inbox id).
+    fn command(
+        &self,
+        session_id: &str,
+        name: &str,
+        text: &str,
+        files: &[dto::PromptFile],
+    ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>>;
+
+    /// Release 0.8.5: request session compaction (`POST .../compact`, the
+    /// `/compact` slash route). Returns the enqueued inbox id like the
+    /// prompt; the turn plays out on the same event stream.
+    fn compact(&self, session_id: &str) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>>;
+
     /// Persisted messages of a session, newest-first (as the wire hands them).
     fn messages(
         &self,
@@ -98,6 +115,38 @@ pub trait OpenCodeBackend: Send + Sync + 'static {
         request_id: &str,
         decision: dto::PermissionReply,
     ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+
+    /// Release 0.8.5: answer an opencode form (`POST .../form/{id}/reply`,
+    /// body `{answer}`). Called once the ACP client accepted an
+    /// `elicitation/create`; an Err that is a settled/not-found response is
+    /// tolerated by the caller (the form is already gone).
+    fn form_reply(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        req: &dto::FormReplyRequest,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+
+    /// Release 0.8.5: cancel an opencode form (`DELETE .../form/{id}`, with
+    /// an optional reason message). The anti-hang fallback: declining,
+    /// cancelling, or failing to represent a form always ends here.
+    fn form_cancel(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        message: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+
+    /// Release 0.8.5: page a shell's captured output by absolute byte
+    /// cursor (`GET /api/shell/{id}/output`) — the display-only terminal
+    /// poller's data source.
+    fn shell_output(
+        &self,
+        shell_id: &str,
+        cwd: &str,
+        cursor: Option<u64>,
+        limit: Option<u64>,
+    ) -> BoxFuture<'_, Result<crate::opencode::api::ShellOutput, anyhow::Error>>;
 
     /// Wave 4 catalog fetch: the model list backing `config_option_update`
     /// pushes on catalog reload. Default: unavailable — the live bridge
@@ -221,6 +270,12 @@ pub struct AgentService {
     /// service is per-connection (one stdio ACP session), so a single flag
     /// is the per-connection store.
     config_options_supported: AtomicBool,
+    /// Release 0.8.5: whether the client declared the elicitation form
+    /// capability (`clientCapabilities.elicitation.form` non-null) in its
+    /// initialize request. Gates whether `form.created` events elicit via
+    /// `elicitation/create`; without it every form is cancelled (the asker
+    /// would otherwise hang forever — opencode forms have no TTL).
+    form_elicitation_supported: AtomicBool,
 }
 
 struct SessionEntry {
@@ -315,6 +370,7 @@ impl AgentService {
             zed_git_add: false,
             show_synthetic: false,
             config_options_supported: AtomicBool::new(false),
+            form_elicitation_supported: AtomicBool::new(false),
         }
     }
 
@@ -648,6 +704,21 @@ impl AgentService {
         self.config_options_supported
             .store(config_options_supported, Ordering::SeqCst);
         tracing::debug!(config_options_supported, "initialize: client capabilities");
+        // Release 0.8.5: the elicitation capability gate — the client must
+        // declare `clientCapabilities.elicitation.form` for form
+        // elicitation; else every form is cancelled (never hangs).
+        let form_elicitation_supported = req
+            .client_capabilities
+            .elicitation
+            .as_ref()
+            .and_then(|e| e.form.as_ref())
+            .is_some();
+        self.form_elicitation_supported
+            .store(form_elicitation_supported, Ordering::SeqCst);
+        tracing::debug!(
+            form_elicitation_supported,
+            "initialize: elicitation capability"
+        );
         let info = acp::Implementation::new(
             "opencode-acp-bridge",
             concat!("opencode ", env!("CARGO_PKG_VERSION")),
@@ -1532,7 +1603,35 @@ impl AgentService {
                 ));
             }
         };
-        let inbox_id = match backend.prompt(&req.session_id.0, &text, &files).await {
+        // Release 0.8.5: slash-command routing — official
+        // `detectSlashCommand` + catalog: `/compact` is a builtin;
+        // other names run as commands ONLY when the catalog lists them
+        // (catalog fetch failure degrades to a normal prompt); anything
+        // else prompts normally. Commands share the normal turn wait —
+        // the command's agent turn emits the same execution events.
+        let slash = detect_slash_command(&text);
+        let command_name = match &slash {
+            Some((name, _)) if name != "compact" => match self.backend.list_commands().await {
+                Some(commands)
+                    if commands.iter().any(|c| {
+                        c.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+                    }) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let inbox_id = if slash.as_ref().is_some_and(|(n, _)| n == "compact") {
+            backend.compact(&req.session_id.0).await
+        } else if let Some(name) = &command_name {
+            let (_, args) = slash.as_ref().expect("command implies slash");
+            backend.command(&req.session_id.0, name, args, &files).await
+        } else {
+            backend.prompt(&req.session_id.0, &text, &files).await
+        };
+        let inbox_id = match inbox_id {
             Ok(id) => id,
             Err(e) => {
                 tracing::error!(error = %e, "backend prompt failed");
@@ -1547,9 +1646,18 @@ impl AgentService {
             *entry.local_inbox_id.lock().expect("inbox lock") = Some(id);
         }
 
+        // Release 0.8.5: terminal pollers must never outlive the turn —
+        // the drop guard stops them on EVERY exit path (drain, cancel,
+        // stream loss); the pollers die after their final drain. The guard
+        // holds the SHARED registry (not a snapshot): streams registered
+        // after this point (the first `progress` event spawns the poller)
+        // are still stopped when the turn ends.
+        let terminal_registry = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _terminal_guard = TerminalStopGuard(Arc::clone(&terminal_registry));
         let mut state = updates::MappingState::new()
             .with_no_aft(self.no_aft)
-            .with_cwd(entry.cwd.clone());
+            .with_cwd(entry.cwd.clone())
+            .with_terminal_registry(Arc::clone(&terminal_registry));
         // Release 0.6.0: per-CHILD mapping states (fresh per turn — a
         // child's call ids are unique per child session, so each turn's
         // declarations are its own). The pairing tracker + the persistent
@@ -1806,6 +1914,79 @@ impl AgentService {
                 continue;
             }
 
+            // ---------- form → elicitation bridging (Release 0.8.5) ----------
+            // `form.created` (the `question` tool's forms.ask) is a
+            // turn-level signal, not an update: ask the ACP client via
+            // `elicitation/create` (form mode) and settle the form
+            // server-side before the turn resumes — the server holds the
+            // asker until a reply or cancel, with NO TTL, so an unhandled
+            // form hangs the tool forever. Auto-cancel when the client
+            // lacks the capability, the form is not representable, the
+            // turn is draining, or the form belongs to a CHILD session
+            // (native child ids are plain — the official child-namespaced
+            // toolCallId would match nothing the client has seen; see
+            // `forward_form` docs).
+            if let dto::SessionEvent::FormCreated(created) = &event {
+                let schema = crate::acp::form::requested_schema(
+                    &created.form,
+                    self.form_elicitation_supported.load(Ordering::SeqCst),
+                );
+                match schema {
+                    // A representable form on a live PARENT turn elicits;
+                    // everything else (no capability, unrepresentable,
+                    // draining, child session) cancels so the asker never
+                    // hangs.
+                    Some(schema) if !draining && !is_child_event => {
+                        self.forward_form(created, &req.session_id, schema, &mut state, &cx)
+                            .await;
+                    }
+                    _ => {
+                        if let Err(e) = self
+                            .backend
+                            .form_cancel(&created.form.sessionID, &created.form.id, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                session = %created.form.sessionID,
+                                form = %created.form.id,
+                                "form cancel failed"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // ---------- Release 0.8.5: shell terminal poller start ----------
+            // `session.tool.progress` with metadata.shellID reveals the
+            // shell behind a bash/shell call: spawn the display-only
+            // terminal output poller (1s cadence, TUI parity). Child-session
+            // shells stay out of scope — their events ride the child
+            // routing below (no poller, reported as a follow-up).
+            if let dto::SessionEvent::ToolProgress(p) = &event
+                && !is_child_event
+                && let (Some(shell_id), Some(name)) = (
+                    p.metadata.as_ref().and_then(|m| m.shellID.as_ref()),
+                    state.tool_name(&p.base.id),
+                )
+            {
+                // One poller per call — later progress events for the same
+                // shell must not double-spawn.
+                if updates::is_shell(name) && !state.terminal_streams.contains_key(&p.base.id) {
+                    let cwd = state.cwd.clone();
+                    self.spawn_shell_poller(
+                        &req.session_id,
+                        &p.base.id,
+                        shell_id,
+                        &cwd,
+                        &mut state,
+                        &cx,
+                    );
+                }
+                // Also feeds the tracker (spawner linkage) below.
+            }
+
             // ---------- Release 0.6.0: subagent pairing bookkeeping ----------
             // Parent events feed the tracker: spawner calls (`task` /
             // `subagent`) join the pairing queue; a direct linkage (input
@@ -1933,6 +2114,31 @@ impl AgentService {
                         state.context_limit =
                             *entry.context_limit.lock().expect("context_limit lock");
                     }
+                    // Release 0.8.5: a shell call's terminal event — stop
+                    // the output poller and wait (bounded) for its final
+                    // drain so the last output chunk is sent BEFORE the
+                    // completed update the mapping emits below.
+                    let terminal_call_id = match &event {
+                        dto::SessionEvent::ToolSuccess(t) => Some(t.base.id.clone()),
+                        dto::SessionEvent::ToolFailed(t) => Some(t.base.id.clone()),
+                        _ => None,
+                    };
+                    if let Some(id) = terminal_call_id
+                        && state.stop_terminal(&id)
+                        && let Some(drained) = state
+                            .terminal_streams
+                            .get(&id)
+                            .and_then(|s| s.take_drained())
+                        && tokio::time::timeout(std::time::Duration::from_secs(2), drained)
+                            .await
+                            .is_err()
+                    {
+                        tracing::warn!(
+                            session = %req.session_id,
+                            call = %id,
+                            "terminal drain wait timed out"
+                        );
+                    }
                     let updates = if completion_meta.is_some() {
                         updates::to_updates_annotated(&event, &mut state, completion_meta.as_ref().map(|(_, m)| m))
                     } else {
@@ -1999,6 +2205,7 @@ impl AgentService {
                 title,
                 acp::ToolKind::Other,
                 acp::ToolCallStatus::Pending,
+                None,
                 None,
             ) {
                 cx.send_notification(acp::SessionNotification::new(
@@ -2148,14 +2355,66 @@ impl AgentService {
         if let Some(serde_json::Value::Object(cached_obj)) = state.tool_input(&tool_call_id) {
             input.extend(cached_obj.clone());
         }
-        let update = acp::ToolCallUpdate::new(
-            tool_call_id,
-            acp::ToolCallUpdateFields::new()
-                .title(title)
-                .status(acp::ToolCallStatus::Pending)
-                .raw_input(serde_json::Value::Object(input))
-                .locations(vec![acp::ToolCallLocation::new(cwd)]),
-        );
+        // Release 0.8.5: diff previews from the ask's `metadata.files`
+        // (FileDiff[], same shape as tool-success metadata — the server
+        // reports edit single-match/replaceAll and write/patch there). The
+        // existing diff chain runs on a constructed ToolMetadata; NO disk
+        // reads (oldText comes from the wire patches). edit multi-match
+        // asks carry no metadata.files — no preview there, no invented
+        // transform (reported as an open item).
+        let previews: Vec<acp::ToolCallContent> = asked
+            .metadata
+            .as_ref()
+            .and_then(|meta| {
+                serde_json::from_value::<dto::ToolMetadata>(serde_json::Value::Object(meta.clone()))
+                    .ok()
+            })
+            .map(|meta| crate::acp::diff::diff_blocks(&meta))
+            .unwrap_or_default();
+        // kind + locations (official `permissionLocations`): preview paths
+        // deduped → `tool_locations` → resources minus "*".
+        let name = state.tool_name(&tool_call_id).unwrap_or(&asked.action);
+        let input_value = serde_json::Value::Object(input.clone());
+        let locations: Vec<acp::ToolCallLocation> = {
+            let preview_paths: Vec<String> = previews
+                .iter()
+                .filter_map(|p| match p {
+                    acp::ToolCallContent::Diff(d) => Some(d.path.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            if !preview_paths.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                preview_paths
+                    .into_iter()
+                    .filter(|p| seen.insert(p.clone()))
+                    .map(acp::ToolCallLocation::new)
+                    .collect()
+            } else {
+                let derived = updates::tool_locations(name, &input_value, cwd);
+                if !derived.is_empty() {
+                    derived
+                } else {
+                    asked
+                        .resources
+                        .iter()
+                        .filter(|r| r.as_str() != "*")
+                        .cloned()
+                        .map(acp::ToolCallLocation::new)
+                        .collect()
+                }
+            }
+        };
+        let mut fields = acp::ToolCallUpdateFields::new()
+            .title(title)
+            .status(acp::ToolCallStatus::Pending)
+            .kind(updates::tool_kind(name))
+            .raw_input(serde_json::Value::Object(input.clone()))
+            .locations(locations);
+        if !previews.is_empty() {
+            fields = fields.content(Some(previews));
+        }
+        let update = acp::ToolCallUpdate::new(tool_call_id, fields);
         let request = acp::RequestPermissionRequest::new(
             // A child ask targets the CHILD session (the client loaded it
             // via the subagent card); parent asks target the parent.
@@ -2232,6 +2491,208 @@ impl AgentService {
         }
     }
 
+    /// Release 0.8.5: forward a `form.created` to the ACP client as
+    /// `elicitation/create` (form mode) and settle the form server-side from
+    /// the client's answer — mirrors the official `ACPElicitation.reply` +
+    /// `ask` pair.
+    ///
+    /// `toolCallId` mirrors the official `toolCallSent` gate: it rides only
+    /// when the asking tool call has already been projected to the client as
+    /// a `session/update` tool call (tracked in the mapping state) — a call
+    /// id the client has never seen is worse than none. Child-session forms
+    /// never reach here (the turn loop cancels them): native child ids are
+    /// plain, so the official child-namespaced toolCallId would match
+    /// nothing on the wire, and the child-title message prefix is card
+    /// display cargo — an honest cancel is the anti-hang behavior.
+    async fn forward_form(
+        self: &Arc<Self>,
+        created: &dto::FormCreated,
+        session_id: &acp::SessionId,
+        schema: acp::ElicitationSchema,
+        state: &mut updates::MappingState,
+        cx: &ConnectionTo<Client>,
+    ) {
+        let tool_call_id = created
+            .form
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("tool"))
+            .and_then(|t| t.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| state.knows_tool(id));
+        let mut scope = acp::ElicitationSessionScope::new(session_id.clone());
+        if let Some(id) = tool_call_id {
+            scope = scope.tool_call_id(Some(acp::ToolCallId::new(id.to_string())));
+        }
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationMode::Form(acp::ElicitationFormMode::new(
+                acp::ElicitationScope::Session(scope),
+                schema,
+            )),
+            created.form.title.clone(),
+        );
+
+        // Block on the client's answer. Only `accept` with decodable content
+        // replies; decline/cancel/invalid content/transport failure all
+        // cancel (official `answer(...) ?? "cancel"`).
+        let answer = match cx.send_request(request).block_task().await {
+            Ok(resp) => match resp.action {
+                acp::ElicitationAction::Accept(accept) => accept
+                    .content
+                    .as_ref()
+                    .and_then(|c| crate::acp::form::answer(&created.form, c)),
+                _ => None,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    form = %created.form.id,
+                    "elicitation request to ACP client failed — cancelling form"
+                );
+                None
+            }
+        };
+        match answer {
+            Some(answer) => {
+                let req = dto::FormReplyRequest { answer };
+                tracing::info!(
+                    session = %created.form.sessionID,
+                    form = %created.form.id,
+                    "form answered via ACP elicitation"
+                );
+                if let Err(e) = self
+                    .backend
+                    .form_reply(&created.form.sessionID, &created.form.id, &req)
+                    .await
+                {
+                    // Official: a failed reply falls back to cancelling —
+                    // except when the form is already settled/gone (then
+                    // nothing more is needed; official `settle()` void).
+                    if !form_already_settled_or_gone(&e) {
+                        tracing::warn!(
+                            error = %e,
+                            session = %created.form.sessionID,
+                            form = %created.form.id,
+                            "form reply failed — cancelling"
+                        );
+                        self.cancel_form(&created.form.sessionID, &created.form.id)
+                            .await;
+                    }
+                }
+            }
+            None => {
+                self.cancel_form(&created.form.sessionID, &created.form.id)
+                    .await
+            }
+        }
+    }
+
+    /// Release 0.8.5: cancel a form; when the server rejects that too (or
+    /// transport fails), interrupt the session so the asker never hangs
+    /// (official `cancel()`'s interrupt fallback). AlreadySettled/NotFound
+    /// count as success and skip the interrupt — the form is already gone
+    /// (official `settle()` voids them).
+    async fn cancel_form(&self, session_id: &str, form_id: &str) {
+        if let Err(e) = self.backend.form_cancel(session_id, form_id, None).await {
+            if form_already_settled_or_gone(&e) {
+                return;
+            }
+            tracing::warn!(
+                error = %e,
+                session = %session_id,
+                form = %form_id,
+                "form cancel failed — interrupting session"
+            );
+            if let Err(e2) = self.backend.interrupt(session_id).await {
+                tracing::warn!(
+                    error = %e2,
+                    session = %session_id,
+                    "session interrupt after failed form cancel failed"
+                );
+            }
+        }
+    }
+
+    /// Release 0.8.5: spawn the display-only terminal output poller for a
+    /// shell call (1s cadence — TUI parity). The poller reads shell output
+    /// pages by absolute cursor, streams each non-empty page as a
+    /// `_meta.terminal_output` ToolCallUpdate, stops on the stream's stop
+    /// flag (tool terminal state / turn end, set by the mapping or the
+    /// guard), does one final drain, then signals its drained channel. Any
+    /// API error stops the poller with a log — it never panics.
+    fn spawn_shell_poller(
+        self: &Arc<Self>,
+        session_id: &acp::SessionId,
+        call_id: &str,
+        shell_id: &str,
+        cwd: &str,
+        state: &mut updates::MappingState,
+        cx: &ConnectionTo<Client>,
+    ) {
+        let terminal_id = format!("term_{call_id}");
+        let stream = state.terminal_stream(call_id, terminal_id.clone());
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        stream.set_drained(drained_rx);
+        let backend = Arc::clone(&self.backend);
+        let session_id = session_id.clone();
+        let call_id = call_id.to_string();
+        let shell_id = shell_id.to_string();
+        let cwd = cwd.to_string();
+        let task_cx = cx.clone();
+        if let Err(e) = cx.clone().spawn(async move {
+            let mut cursor: Option<u64> = None;
+            let mut api_failed = false;
+            let send = |data: String| {
+                stream.streamed.store(true, Ordering::SeqCst);
+                let update = updates::terminal_output_update(&call_id, &terminal_id, data);
+                task_cx
+                    .send_notification(acp::SessionNotification::new(session_id.clone(), update))
+                    .is_err()
+            };
+            loop {
+                if stream.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match backend.shell_output(&shell_id, &cwd, cursor, None).await {
+                    Ok(page) => {
+                        if !page.output.is_empty() {
+                            let stopped = send(page.output);
+                            if stopped {
+                                break;
+                            }
+                        }
+                        cursor = Some(page.cursor);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            session = %session_id,
+                            shell = %shell_id,
+                            "shell output poll failed — stopping"
+                        );
+                        api_failed = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            // Final drain: one last poll catches bytes that landed between
+            // the last poll and the stop signal.
+            if !api_failed
+                && let Ok(page) = backend.shell_output(&shell_id, &cwd, cursor, None).await
+                && !page.output.is_empty()
+            {
+                let _ = send(page.output);
+            }
+            let _ = drained_tx.send(());
+            Ok(())
+        }) {
+            tracing::warn!(error = %e, "shell poller spawn failed");
+        }
+    }
+    /// cancel-drain behavior. No-op when nothing is open. Must run before
+    /// the prompt response so the client sees the terminal updates first.
     /// Abandon still-open tool calls as failed ("Cancelled") — official
     /// cancel-drain behavior. No-op when nothing is open. Must run before
     /// the prompt response so the client sees the terminal updates first.
@@ -3054,6 +3515,7 @@ impl AgentService {
                 acp::ToolKind::Other,
                 acp::ToolCallStatus::Pending,
                 None,
+                None,
             ) {
                 if cx
                     .send_notification(acp::SessionNotification::new(parent_sid.clone(), decl))
@@ -3207,9 +3669,63 @@ enum BgTrackOutcome {
     Continue,
 }
 
+/// Release 0.8.5: stop every shell terminal poller on drop — the turn
+/// loop's exit paths (drain, cancel, stream loss) never outlive their
+/// pollers. Holds the SHARED registry arc (poller registrations happen
+/// after construction, on the first `progress` event), so the guard
+/// observes every stream that was ever registered; the lock is only taken
+/// at drop and tolerant of poisoning (a panicked thread must not double-
+/// panic in Drop).
+struct TerminalStopGuard(Arc<std::sync::Mutex<Vec<Arc<updates::TerminalStream>>>>);
+
+impl Drop for TerminalStopGuard {
+    fn drop(&mut self) {
+        let streams = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for stream in streams.iter() {
+            stream.stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Release 0.8.5: official `detectSlashCommand` (2.0.21 service.ts) — the
+/// trimmed prompt starts with "/", the first whitespace token (slash
+/// stripped) is the command name, the remainder (rejoined with single
+/// spaces, trimmed) the args. A bare "/" yields nothing.
+fn detect_slash_command(text: &str) -> Option<(String, String)> {
+    let value = text.trim();
+    if !value.starts_with('/') {
+        return None;
+    }
+    let mut tokens = value[1..].split_whitespace();
+    let name = tokens.next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let args = tokens.collect::<Vec<_>>().join(" ").trim().to_string();
+    Some((name.to_string(), args))
+}
+
 // ============================================================
 // Wave 6a mapping helpers (session/list)
 // ============================================================
+
+/// Release 0.8.5: is the error the server saying the form is ALREADY
+/// settled or not found — the tolerant case (official
+/// `isFormAlreadySettledError` / `isFormNotFoundError`): nothing more is
+/// needed, no cancel/interrupt fallback. Everything else (a 400 answer
+/// rejection, transport failure) is a real failure that must fall back.
+fn form_already_settled_or_gone(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<crate::opencode::api::ApiError>(),
+        Some(crate::opencode::api::ApiError::Http {
+            status: 404 | 409,
+            ..
+        })
+    )
+}
 
 /// Map one opencode wire session into ACP `SessionInfo`.
 ///
@@ -3490,6 +4006,16 @@ mod tests {
 
     // ---------------- mock backend ----------------
 
+    /// One recorded form reply (Release 0.8.5) — (session, form, answer).
+    type FormReplyRecord = (String, String, serde_json::Map<String, serde_json::Value>);
+
+    /// One recorded slash-command run (Release 0.8.5) — (session, name, args, files).
+    type CommandCallRecord = (String, String, String, Vec<dto::PromptFile>);
+
+    /// Canned shell-output pages (Release 0.8.5) — shell id → (data, end
+    /// cursor, size) pages.
+    type ShellPages = HashMap<String, Vec<(String, u64, u64)>>;
+
     struct MockBackend {
         /// Wave 6b: event bus for the turn loop. A broadcast sender carries
     /// mid-turn pushes to the LIVE stream; pushes made while no stream is
@@ -3515,6 +4041,13 @@ mod tests {
         /// Recorded (session_id, request_id, decision) of permission replies.
         permission_replies: Mutex<Vec<(String, String, dto::PermissionReply)>>,
         permission_seen: Mutex<Option<oneshot::Sender<()>>>,
+        /// Release 0.8.5: recorded (session_id, form_id, answer) of form
+        /// replies, plus a one-shot gate for turn-loop sync.
+        form_replies: Mutex<Vec<FormReplyRecord>>,
+        form_reply_seen: Mutex<Option<oneshot::Sender<()>>>,
+        /// Release 0.8.5: recorded (session_id, form_id, message) of form
+        /// cancels.
+        form_cancels: Mutex<Vec<(String, String, Option<String>)>>,
         /// Wave 4: canned model catalog for `config_option_update` pushes.
         models: Mutex<Option<Vec<dto::ModelInfo>>>,
         /// Wave 6a: canned session list for `session/list`.
@@ -3541,6 +4074,17 @@ mod tests {
         get_session_calls: Mutex<Vec<String>>,
         /// Release 0.3.1: every (session_id, text, files) passed to `prompt`.
         prompt_bodies: Mutex<Vec<(String, String, Vec<dto::PromptFile>)>>,
+        /// Release 0.8.5: every (session_id, name, text, files) passed to
+        /// `command` (the slash-command route).
+        command_calls: Mutex<Vec<CommandCallRecord>>,
+        /// Release 0.8.5: session ids passed to `compact` (the /compact
+        /// route).
+        compact_calls: Mutex<Vec<String>>,
+        /// Release 0.8.5: canned shell-output pages for `shell_output`, keyed
+        /// by shell id; each entry is (output, cursor, size). The poller
+        /// reads them in order and sees the cursor advance.
+        shell_pages: Mutex<ShellPages>,
+        shell_output_calls: Mutex<Vec<String>>,
         /// Release 0.3.0: every (session_id, model) passed to `set_model`.
         set_model_calls: Mutex<Vec<(String, dto::ModelRef)>>,
         /// Release 0.3.0: force `set_model` to fail (proves the error+push
@@ -3576,6 +4120,9 @@ mod tests {
                 interrupt_seen: Mutex::new(None),
                 permission_replies: Mutex::new(Vec::new()),
                 permission_seen: Mutex::new(None),
+                form_replies: Mutex::new(Vec::new()),
+                form_reply_seen: Mutex::new(None),
+                form_cancels: Mutex::new(Vec::new()),
                 models: Mutex::new(None),
                 sessions_out: Mutex::new(None),
                 list_calls: Mutex::new(Vec::new()),
@@ -3586,6 +4133,10 @@ mod tests {
                 agents_fail: AtomicBool::new(false),
                 set_agent_calls: Mutex::new(Vec::new()),
                 prompt_bodies: Mutex::new(Vec::new()),
+                command_calls: Mutex::new(Vec::new()),
+                compact_calls: Mutex::new(Vec::new()),
+                shell_pages: Mutex::new(HashMap::new()),
+                shell_output_calls: Mutex::new(Vec::new()),
                 session_out: Mutex::new(None),
                 get_session_calls: Mutex::new(Vec::new()),
                 set_model_calls: Mutex::new(Vec::new()),
@@ -3677,6 +4228,31 @@ mod tests {
             self.prompt_bodies.lock().expect("prompt lock").clone()
         }
 
+        /// Release 0.8.5: recorded (session_id, name, text, files) of
+        /// slash-command runs.
+        fn recorded_command_calls(&self) -> Vec<CommandCallRecord> {
+            self.command_calls.lock().expect("command lock").clone()
+        }
+
+        /// Release 0.8.5: recorded session ids of /compact runs.
+        fn recorded_compact_calls(&self) -> Vec<String> {
+            self.compact_calls.lock().expect("compact lock").clone()
+        }
+
+        /// Release 0.8.5: canned shell-output pages for the terminal poller
+        /// (shell id → pages, consumed in order by cursor).
+        fn set_shell_output(&self, shell_id: &str, pages: Vec<(String, u64, u64)>) {
+            self.shell_pages
+                .lock()
+                .expect("shell lock")
+                .insert(shell_id.to_string(), pages);
+        }
+
+        /// Release 0.8.5: shell ids the poller asked for.
+        fn recorded_shell_outputs(&self) -> Vec<String> {
+            self.shell_output_calls.lock().expect("shell lock").clone()
+        }
+
         /// Block the next `list_commands` call until the returned sender
         /// fires — used to prove the lifecycle response is sent before the
         /// catalog fetch runs.
@@ -3699,7 +4275,30 @@ mod tests {
         }
 
         fn recorded_replies(&self) -> Vec<(String, String, dto::PermissionReply)> {
-            self.permission_replies.lock().expect("permission lock").clone()
+            self.permission_replies
+                .lock()
+                .expect("permission lock")
+                .clone()
+        }
+
+        /// Release 0.8.5: gate — the form reply reaching the backend frees
+        /// the receiver (turn-loop sync in the elicitation tests).
+        fn install_form_reply_seen(&self) -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.form_reply_seen.lock().expect("form lock") = Some(tx);
+            rx
+        }
+
+        /// Release 0.8.5: recorded (session_id, form_id, answer) of form
+        /// replies.
+        fn recorded_form_replies(&self) -> Vec<FormReplyRecord> {
+            self.form_replies.lock().expect("form lock").clone()
+        }
+
+        /// Release 0.8.5: recorded (session_id, form_id, message) of form
+        /// cancels.
+        fn recorded_form_cancels(&self) -> Vec<(String, String, Option<String>)> {
+            self.form_cancels.lock().expect("form lock").clone()
         }
 
         fn set_models(&self, models: Vec<dto::ModelInfo>) {
@@ -3711,7 +4310,10 @@ mod tests {
         }
 
         fn recorded_get_session_calls(&self) -> Vec<String> {
-            self.get_session_calls.lock().expect("get_session lock").clone()
+            self.get_session_calls
+                .lock()
+                .expect("get_session lock")
+                .clone()
         }
 
         fn recorded_set_model_calls(&self) -> Vec<(String, dto::ModelRef)> {
@@ -3757,6 +4359,79 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
 
+        fn command(
+            &self,
+            session_id: &str,
+            name: &str,
+            text: &str,
+            files: &[dto::PromptFile],
+        ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
+            self.command_calls.lock().expect("command lock").push((
+                session_id.to_string(),
+                name.to_string(),
+                text.to_string(),
+                files.to_vec(),
+            ));
+            Box::pin(async { Ok(None) })
+        }
+
+        fn compact(
+            &self,
+            session_id: &str,
+        ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
+            self.compact_calls
+                .lock()
+                .expect("compact lock")
+                .push(session_id.to_string());
+            Box::pin(async { Ok(None) })
+        }
+
+        fn shell_output(
+            &self,
+            shell_id: &str,
+            _cwd: &str,
+            cursor: Option<u64>,
+            _limit: Option<u64>,
+        ) -> BoxFuture<'_, Result<crate::opencode::api::ShellOutput, anyhow::Error>> {
+            let shell_id = shell_id.to_string();
+            let pages = self.shell_pages.lock().expect("shell lock").clone();
+            self.shell_output_calls
+                .lock()
+                .expect("shell lock")
+                .push(shell_id.clone());
+            Box::pin(async move {
+                let pages = pages
+                    .get(&shell_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown shell {shell_id}"))?;
+                // The cursor picks the first page whose range starts at or
+                // after the requested cursor: the mock pages are (data,
+                // end_cursor, size) with absolute cursors.
+                let idx = match cursor {
+                    Some(c) => pages
+                        .iter()
+                        .position(|(_, end, _)| *end > c)
+                        .unwrap_or(pages.len().saturating_sub(1)),
+                    None => 0,
+                };
+                // Caught up (cursor >= every page end): an empty page — the
+                // real API returns no bytes past `size`.
+                if pages.iter().all(|(_, end, _)| Some(*end) <= cursor) {
+                    return Ok(crate::opencode::api::ShellOutput {
+                        output: String::new(),
+                        cursor: cursor.unwrap_or(0),
+                        size: pages.last().map(|(_, _, s)| *s).unwrap_or(0),
+                        truncated: false,
+                    });
+                }
+                let (data, end, size) = pages[idx].clone();
+                Ok(crate::opencode::api::ShellOutput {
+                    output: data,
+                    cursor: end,
+                    size,
+                    truncated: false,
+                })
+            })
+        }
         fn interrupt(&self, _session_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
             let seen = self.interrupt_seen.lock().expect("interrupt lock").take();
             self.interrupted.store(true, Ordering::SeqCst);
@@ -3847,6 +4522,40 @@ mod tests {
                 }
                 Ok(())
             })
+        }
+
+        fn form_reply(
+            &self,
+            session_id: &str,
+            form_id: &str,
+            req: &dto::FormReplyRequest,
+        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.form_replies.lock().expect("form lock").push((
+                session_id.to_string(),
+                form_id.to_string(),
+                req.answer.clone(),
+            ));
+            let seen = self.form_reply_seen.lock().expect("form lock").take();
+            Box::pin(async move {
+                if let Some(tx) = seen {
+                    let _ = tx.send(());
+                }
+                Ok(())
+            })
+        }
+
+        fn form_cancel(
+            &self,
+            session_id: &str,
+            form_id: &str,
+            message: Option<&str>,
+        ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+            self.form_cancels.lock().expect("form lock").push((
+                session_id.to_string(),
+                form_id.to_string(),
+                message.map(str::to_string),
+            ));
+            Box::pin(async move { Ok(()) })
         }
 
         fn list_models(&self) -> BoxFuture<'_, Option<Vec<dto::ModelInfo>>> {
@@ -6372,6 +7081,122 @@ mod tests {
         assert!(completed, "call_a completed during the drain");
     }
 
+    /// Release 0.8.5 (registry fix): a shell poller spawned mid-turn must
+    /// not outlive a CANCELLED turn. The turn keeps one call open (started
+    /// + called + progress with a shellID → poller spawned), the client
+    /// cancels, and the interrupted event ends the drain as Cancelled.
+    /// Without the shared-registry drop guard, the poller keeps polling the
+    /// shell endpoint every second until the connection drops — the poll
+    /// counter keeps growing. With the guard, at most the poller's final
+    /// drain (one last call) lands after cancellation. The mock returns
+    /// Ok pages forever so a zombie poller does NOT self-stop on api
+    /// errors (that would mask the bug).
+    #[tokio::test]
+    async fn cancel_drain_stops_shell_terminal_pollers() {
+        let backend = MockBackend::new();
+        // One known shell: every poll (cursor 12 caught up) returns an
+        // empty Ok page — never an error.
+        backend.set_shell_output("sh_z", vec![("z\n".to_string(), 12, 12)]);
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+
+        let outcome: Result<(), AcpError> = Client
+            .builder()
+            .name("acp-test-client")
+            .on_receive_notification(
+                |_notif: SessionNotification, _cx| async move { Ok(()) },
+                on_receive_notification!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    let prompt = cx.send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("run a shell"))],
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_z".into(),
+                            id: "call_z".into(),
+                        },
+                        name: "bash".into(),
+                    }));
+                    backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_z".into(),
+                            id: "call_z".into(),
+                        },
+                        input: serde_json::json!({ "command": "sleep 30" }),
+                        executed: Some(true),
+                    }));
+                    // The progress event spawns the output poller.
+                    backend.push(dto::SessionEvent::ToolProgress(dto::ToolProgress {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_z".into(),
+                            id: "call_z".into(),
+                        },
+                        metadata: Some(dto::ToolProgressMeta {
+                            sessionID: Some("ses_mock_1".into()),
+                            status: Some("running".into()),
+                            shellID: Some("sh_z".into()),
+                        }),
+                    }));
+
+                    // The call stays open; the client cancels and the
+                    // interrupted event ends the drain.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    cx.send_notification(CancelNotification::new(sid.clone()))?;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    backend.push(dto::SessionEvent::ExecutionInterrupted(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let resp = prompt.block_task().await?;
+                    assert_eq!(resp.stop_reason, acp::StopReason::Cancelled);
+
+                    // Sample the poll counter while BOTH sides are alive
+                    // (an aborted connection would kill a zombie poller
+                    // and mask the bug): a zombie polls every second (≥2
+                    // calls in the window); the fixed guard allows at most
+                    // the poller's final drain (+1).
+                    let before = backend.recorded_shell_outputs().len();
+                    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+                    let after = backend.recorded_shell_outputs().len();
+                    assert!(
+                        after <= before + 1,
+                        "shell poller outlived the cancelled turn: {before} → {after} polls"
+                    );
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+    }
+
     #[tokio::test]
     async fn catalog_reload_pushes_full_config_option_state() {
         let backend = MockBackend::new();
@@ -8499,6 +9324,937 @@ mod tests {
                 dto::PromptFile::new("data:text/plain;base64,dGV4dA==", "file", "text/plain"),
                 dto::PromptFile::new("file:///tmp/blob.bin", "blob.bin", "application/octet-stream"),
             ]
+        );
+    }
+
+    // ============ Release 0.8.5: form → elicitation bridging ============
+
+    /// One `question`-tool `form.created` event (wire shape from the
+    /// synthetic fixture): a string+options+custom field and a multiselect,
+    /// with the tool-call source in metadata.
+    fn question_form() -> dto::SessionEvent {
+        dto::SessionEvent::FormCreated(dto::FormCreated {
+            form: dto::FormInfo {
+                id: "frm_ask_1".into(),
+                sessionID: "ses_mock_1".into(),
+                title: "Questions".into(),
+                metadata: Some(
+                    serde_json::json!({
+                        "kind": "question",
+                        "tool": { "messageID": "msg_mock_1", "id": "call_question_1" },
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+                fields: serde_json::from_value(serde_json::json!([
+                    {
+                        "key": "q0",
+                        "title": "Preferred path",
+                        "description": "Which approach do you want?",
+                        "type": "string",
+                        "options": [
+                            { "value": "fast", "label": "Fast" },
+                            { "value": "safe", "label": "Safe" },
+                        ],
+                        "custom": true,
+                    },
+                    {
+                        "key": "q1",
+                        "title": "Pick many",
+                        "type": "multiselect",
+                        "options": [
+                            { "value": "x", "label": "X" },
+                            { "value": "y", "label": "Y" },
+                        ],
+                        "custom": true,
+                    },
+                ]))
+                .expect("question fields parse"),
+            },
+        })
+    }
+
+    /// `initialize` declaring `clientCapabilities.elicitation.form` — what
+    /// a form-capable client sends.
+    fn init_with_form_elicitation() -> InitializeRequest {
+        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().elicitation(
+                acp::ElicitationCapabilities::new().form(acp::ElicitationFormCapabilities::new()),
+            ),
+        )
+    }
+
+    /// What the client should answer to each incoming `CreateElicitation`.
+    #[derive(Clone)]
+    enum ElicitReply {
+        /// Respond `accept` with this content map.
+        Accept(std::collections::BTreeMap<String, acp::ElicitationContentValue>),
+        /// Respond `decline` (also covers cancel/unknown actions).
+        Decline,
+        /// Handler failure — simulates a dead/dismissed client request.
+        HandlerError,
+    }
+
+    /// The full form → elicitation → reply flow: the event arrives mid-turn,
+    /// the client gets an `elicitation/create` with the translated schema
+    /// and session/toolCall ids, and the accepted answer reaches the form
+    /// reply endpoint.
+    #[tokio::test]
+    async fn form_created_elicits_and_replies() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            ElicitReply::Accept(std::collections::BTreeMap::from([
+                (
+                    "q0".to_string(),
+                    acp::ElicitationContentValue::String("safe".into()),
+                ),
+                (
+                    "q1".to_string(),
+                    acp::ElicitationContentValue::StringArray(vec!["x".into()]),
+                ),
+                (
+                    "q1_custom".to_string(),
+                    acp::ElicitationContentValue::String("z".into()),
+                ),
+            ])),
+        ])));
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let reply_seen = backend.install_form_reply_seen();
+
+        let outcome: Result<(), AcpError> = Client
+            .builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    let responses = Arc::clone(&responses);
+                    async move |req: acp::CreateElicitationRequest,
+                                responder: Responder<acp::CreateElicitationResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        match responses.lock().expect("responses lock").pop_front() {
+                            Some(ElicitReply::Accept(content)) => {
+                                responder.respond(acp::CreateElicitationResponse::new(
+                                    acp::ElicitationAction::Accept(
+                                        acp::ElicitationAcceptAction::new().content(Some(content)),
+                                    ),
+                                ))
+                            }
+                            Some(ElicitReply::Decline) => {
+                                responder.respond(acp::CreateElicitationResponse::new(
+                                    acp::ElicitationAction::Decline,
+                                ))
+                            }
+                            Some(ElicitReply::HandlerError) => Err(AcpError::internal_error()),
+                            None => panic!("elicitation request with no queued client reply"),
+                        }
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(init_with_form_elicitation())
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    // The question tool's call streams, then the form it
+                    // raised, then the turn ends.
+                    backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_mock_1".into(),
+                            id: "call_question_1".into(),
+                        },
+                        name: "question".into(),
+                    }));
+                    backend.push(question_form());
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("ask me"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        // The requested shape: form mode, session-scoped, toolCallId rides
+        // BECAUSE the call was already projected, message = form title.
+        // (Captured BEFORE the reply wait — the guard must not cross an
+        // await; the reply assertions below re-take the lock.)
+        let seen: Vec<acp::CreateElicitationRequest> =
+            seen_requests.lock().expect("requests lock").clone();
+        assert_eq!(seen.len(), 1, "one elicitation/create per form");
+        let req = &seen[0];
+        let acp::ElicitationMode::Form(form_mode) = &req.mode else {
+            panic!("form mode expected")
+        };
+        let acp::ElicitationScope::Session(scope) = &form_mode.scope else {
+            panic!("session scope expected")
+        };
+        assert_eq!(scope.session_id.0.as_ref(), "ses_mock_1");
+        assert_eq!(
+            scope.tool_call_id.as_ref().map(|t| t.0.as_ref()),
+            Some("call_question_1"),
+            "toolCallId rides the projected tool call"
+        );
+        assert_eq!(req.message, "Questions");
+        let props = &form_mode.requested_schema.properties;
+        assert_eq!(
+            props.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["q0", "q0_custom", "q1", "q1_custom"]
+        );
+        let q0 = serde_json::to_value(&props["q0"]).expect("q0 serializes");
+        assert_eq!(q0["oneOf"].as_array().expect("oneOf").len(), 2);
+
+        // The accepted answer reached the form reply endpoint, with the
+        // free-text custom appended to the multiselect.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reply_seen)
+            .await
+            .expect("form reply must reach the backend");
+        let replies = backend.recorded_form_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, "ses_mock_1");
+        assert_eq!(replies[0].1, "frm_ask_1");
+        assert_eq!(replies[0].2.get("q0"), Some(&serde_json::json!("safe")));
+        assert_eq!(replies[0].2.get("q1"), Some(&serde_json::json!(["x", "z"])));
+        assert!(backend.recorded_form_cancels().is_empty());
+    }
+
+    /// Decline, cancel, invalid content and client failure all cancel the
+    /// form (official `answer(...) ?? "cancel"` + the race-cancel rule).
+    #[tokio::test]
+    async fn form_decline_and_failure_cancel() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            ElicitReply::Decline,
+            ElicitReply::HandlerError,
+        ])));
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let outcome: Result<(), AcpError> = Client
+            .builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    let responses = Arc::clone(&responses);
+                    async move |req: acp::CreateElicitationRequest,
+                                responder: Responder<acp::CreateElicitationResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        match responses.lock().expect("responses lock").pop_front() {
+                            Some(ElicitReply::Decline) => {
+                                responder.respond(acp::CreateElicitationResponse::new(
+                                    acp::ElicitationAction::Decline,
+                                ))
+                            }
+                            Some(ElicitReply::HandlerError) => Err(AcpError::internal_error()),
+                            _ => panic!("unexpected reply queue"),
+                        }
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(init_with_form_elicitation())
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    backend.push(question_form());
+                    backend.push(question_form());
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("ask twice"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        assert_eq!(seen_requests.lock().expect("requests lock").len(), 2);
+        assert!(
+            backend.recorded_form_replies().is_empty(),
+            "no replies on decline/failure"
+        );
+        assert_eq!(backend.recorded_form_cancels().len(), 2);
+        assert_eq!(backend.recorded_form_cancels()[0].0, "ses_mock_1");
+        assert_eq!(backend.recorded_form_cancels()[0].1, "frm_ask_1");
+        assert_eq!(
+            backend.recorded_form_cancels()[0].2,
+            None,
+            "no cancel message"
+        );
+    }
+
+    /// Without the `elicitation.form` capability (or with an unrepresentable
+    /// form), the form is cancelled outright — the asker never hangs.
+    #[tokio::test]
+    async fn form_without_capability_is_cancelled() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+        let outcome: Result<(), AcpError> = Client
+            .builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    async move |req: acp::CreateElicitationRequest,
+                                _responder: Responder<acp::CreateElicitationResponse>,
+                                _cx: ConnectionTo<Agent>|
+                                -> Result<(), AcpError> {
+                        // No capability → the bridge must never ask; answering
+                        // with an error makes the bridge cancel the form.
+                        Err(AcpError::internal_error().data(serde_json::json!({
+                            "message": format!(
+                                "elicitation/create without the capability: {}",
+                                req.message
+                            )
+                        })))
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    // NO form elicitation capability in initialize.
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    backend.push(question_form());
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new(
+                                "ask but no capability",
+                            ))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        assert!(backend.recorded_form_replies().is_empty());
+        let cancels = backend.recorded_form_cancels();
+        assert_eq!(cancels.len(), 1, "capability-less form is cancelled");
+        assert_eq!(cancels[0].1, "frm_ask_1");
+    }
+
+    /// Release 0.8.5: the permission request's tool call carries diff
+    /// previews built from the ask's `metadata.files` (via the existing
+    /// diff chain — no disk reads), the official kind, and
+    /// `permissionLocations` parity: preview paths (deduped) win, then
+    /// tool_locations, then resources minus "*".
+    #[tokio::test]
+    async fn permission_asked_carries_diff_previews_kind_and_locations() {
+        let backend = MockBackend::new();
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let outcome: Result<(), AcpError> = Client.builder()
+            .name("acp-test-client")
+            .on_receive_request(
+                {
+                    let seen_requests = Arc::clone(&seen_requests);
+                    async move |req: acp::RequestPermissionRequest,
+                                responder: Responder<acp::RequestPermissionResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        seen_requests.lock().expect("requests lock").push(req);
+                        responder.respond(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Selected(
+                                acp::SelectedPermissionOutcome::new("once"),
+                            ),
+                        ))
+                    }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(client_side, {
+                let backend = Arc::clone(&backend);
+                async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                        base: dto::ToolRef {
+                            sessionID: "ses_mock_1".into(),
+                            assistantMessageID: "msg_w".into(),
+                            id: "call_w".into(),
+                        },
+                        name: "write".into(),
+                    }));
+                    // Ask 1: write with metadata.files → diff preview + edit
+                    // kind + preview-path locations.
+                    backend.push(dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+                        id: "per_p".into(),
+                        sessionID: "ses_mock_1".into(),
+                        action: "write".into(),
+                        resources: vec!["/etc/hosts".into()],
+                        save: None,
+                        metadata: Some(
+                            serde_json::json!({
+                                "files": [{
+                                    "filePath": "/tmp/opencode/a.txt",
+                                    "relativePath": "a.txt",
+                                    "type": "add",
+                                    "patch": "Index: /tmp/opencode/a.txt\n===.\n@@ -0,0 +1 @@\n+hello\n",
+                                    "additions": 1,
+                                    "deletions": 0,
+                                }],
+                            })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        ),
+                        source: Some(dto::PermissionSource {
+                            kind: Some("tool".into()),
+                            messageID: Some("msg_w".into()),
+                            id: "call_w".into(),
+                        }),
+                    }));
+                    // Ask 2: an unknown action with a "*"-led resource list —
+                    // no previews, no tool_locations → resources minus "*".
+                    backend.push(dto::SessionEvent::PermissionAsked(dto::PermissionAsked {
+                        id: "per_x".into(),
+                        sessionID: "ses_mock_1".into(),
+                        action: "custom-tool".into(),
+                        resources: vec!["*".into(), "echo hi".into()],
+                        save: None,
+                        metadata: None,
+                        source: None,
+                    }));
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+                    let prompt_req = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![ContentBlock::Text(TextContent::new("do it"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                    Ok(())
+                }
+            })
+            .await;
+        agent_task.abort();
+        outcome.expect("client run ok");
+
+        let requests = seen_requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        // Ask 1: kind = Edit (official), content = the diff preview, and
+        // locations = the deduped preview path (permissionLocations first
+        // tier — the cwd no longer overrides it).
+        let tc = &requests[0].tool_call;
+        assert_eq!(tc.fields.kind, Some(acp::ToolKind::Edit));
+        let blocks = tc.fields.content.as_ref().expect("preview content");
+        let acp::ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("diff preview block expected")
+        };
+        assert_eq!(
+            d.path.to_string_lossy(),
+            "/tmp/opencode/a.txt",
+            "preview path from metadata.files"
+        );
+        assert!(
+            d.new_text.contains("hello"),
+            "preview newText from the patch"
+        );
+        let locs = tc.fields.locations.as_ref().expect("locations");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path.to_string_lossy(), "/tmp/opencode/a.txt");
+        // Ask 2: no previews, unknown tool → resources minus "*".
+        let tc = &requests[1].tool_call;
+        assert!(tc.fields.content.is_none());
+        let locs = tc.fields.locations.as_ref().expect("locations");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path.to_string_lossy(), "echo hi");
+    }
+
+    // ============ Release 0.8.5: shell terminal + slash commands ============
+
+    /// The full shell terminal flow: the bash declaration mounts the
+    /// display-only terminal (terminal_info meta + terminal content), the
+    /// running title is the command, the progress-revealed shell streams
+    /// terminal_output chunks (poller, 1s cadence) BEFORE the completed
+    /// update, and the completed update carries terminal_exit from
+    /// metadata.exit.
+    #[tokio::test]
+    async fn shell_terminal_streams_output_then_exits() {
+        let backend = MockBackend::new();
+        backend.set_shell_output("sh_9", vec![("hello world\n".to_string(), 12, 12)]);
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (outcome, collected) = run_client(
+            svc,
+            Arc::clone(&backend),
+            move |backend, _collected, cx| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+
+                backend.push(dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_1".into(),
+                        id: "call_s1".into(),
+                    },
+                    name: "bash".into(),
+                }));
+                backend.push(dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_1".into(),
+                        id: "call_s1".into(),
+                    },
+                    input: serde_json::json!({ "command": "echo hi" }),
+                    executed: Some(true),
+                }));
+                backend.push(dto::SessionEvent::ToolProgress(dto::ToolProgress {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_1".into(),
+                        id: "call_s1".into(),
+                    },
+                    metadata: Some(dto::ToolProgressMeta {
+                        sessionID: Some("ses_mock_1".into()),
+                        status: Some("running".into()),
+                        shellID: Some("sh_9".into()),
+                    }),
+                }));
+                backend.push(dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                    base: dto::ToolRef {
+                        sessionID: "ses_mock_1".into(),
+                        assistantMessageID: "msg_1".into(),
+                        id: "call_s1".into(),
+                    },
+                    content: Some(vec![dto::ToolContent::Text {
+                        text: "echo hi".into(),
+                    }]),
+                    metadata: Some(dto::ToolMetadata {
+                        status: Some("completed".into()),
+                        exit: Some(0),
+                        signal: None,
+                        shellID: Some("sh_9".into()),
+                        ..Default::default()
+                    }),
+                    executed: Some(true),
+                }));
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+
+                let prompt_req = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("run it"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(prompt_req.stop_reason, acp::StopReason::EndTurn);
+                Ok(())
+            },
+        )
+        .await;
+        outcome.expect("client run ok");
+
+        let notifications = collected.lock().expect("collected lock");
+        // 1. The declaration mounts the terminal (info meta + content).
+        let decl = notifications
+            .iter()
+            .find_map(|n| match &n.update {
+                acp::SessionUpdate::ToolCall(t)
+                    if t.tool_call_id.0.as_ref() == "call_s1"
+                        && t.status == acp::ToolCallStatus::Pending =>
+                {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .expect("shell declaration");
+        let info = decl
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal_info"))
+            .expect("terminal_info meta");
+        assert_eq!(
+            info.get("terminal_id"),
+            Some(&serde_json::json!("term_call_s1"))
+        );
+        assert_eq!(info.get("cwd"), Some(&serde_json::json!("/tmp")));
+        let acp::ToolCallContent::Terminal(term) = &decl.content[0] else {
+            panic!("terminal content on the declaration")
+        };
+        assert_eq!(term.terminal_id.0.as_ref(), "term_call_s1");
+
+        // 2. The running update's title is the command (terminal header).
+        assert!(notifications.iter().any(|n| matches!(
+            &n.update,
+            acp::SessionUpdate::ToolCallUpdate(u)
+                if u.tool_call_id.0.as_ref() == "call_s1"
+                    && u.fields.title.as_deref() == Some("echo hi")
+        )));
+
+        // 3. Output chunks streamed from the poller (the mock's shell page),
+        //    and they PRECEDE the completed update.
+        let positions: Vec<usize> = notifications
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| match &n.update {
+                acp::SessionUpdate::ToolCallUpdate(u)
+                    if u.tool_call_id.0.as_ref() == "call_s1"
+                        && u.meta
+                            .as_ref()
+                            .and_then(|m| m.get("terminal_output"))
+                            .is_some() =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!positions.is_empty(), "terminal_output chunks streamed");
+        let completed_idx = notifications
+            .iter()
+            .position(|n| {
+                matches!(
+                    &n.update,
+                    acp::SessionUpdate::ToolCallUpdate(u)
+                        if u.tool_call_id.0.as_ref() == "call_s1"
+                            && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                )
+            })
+            .expect("completed update");
+        assert!(
+            positions.iter().all(|&i| i < completed_idx),
+            "all output chunks precede the completed update"
+        );
+        // The chunk carries the SAME terminal id.
+        let first = &notifications[positions[0]];
+        let acp::SessionUpdate::ToolCallUpdate(u) = &first.update else {
+            unreachable!()
+        };
+        let out = u.meta.as_ref().unwrap().get("terminal_output").unwrap();
+        assert_eq!(
+            out.get("terminal_id"),
+            Some(&serde_json::json!("term_call_s1"))
+        );
+        assert_eq!(out.get("data"), Some(&serde_json::json!("hello world\n")));
+
+        // 4. The completed update carries the exit meta.
+        let completed = notifications
+            .iter()
+            .find(|n| {
+                matches!(
+                    &n.update,
+                    acp::SessionUpdate::ToolCallUpdate(u)
+                        if u.tool_call_id.0.as_ref() == "call_s1"
+                            && u.fields.status == Some(acp::ToolCallStatus::Completed)
+                )
+            })
+            .expect("completed");
+        let acp::SessionUpdate::ToolCallUpdate(completed) = &completed.update else {
+            unreachable!()
+        };
+        let exit = completed
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal_exit"))
+            .expect("terminal_exit");
+        assert_eq!(
+            exit.get("terminal_id"),
+            Some(&serde_json::json!("term_call_s1"))
+        );
+        assert_eq!(exit.get("exit_code"), Some(&serde_json::json!(0)));
+        // The poller actually called the shell endpoint.
+        assert_eq!(backend.recorded_shell_outputs(), vec!["sh_9".to_string()]);
+    }
+
+    /// Release 0.8.5: slash-command routing — official `detectSlashCommand`
+    /// + catalog: /compact → session.compact; catalog name → session.command
+    /// (args detached); anything else prompts normally. Commands share the
+    /// normal turn wait (execution events gate the response).
+    #[tokio::test]
+    async fn slash_commands_route_compact_command_and_prompt() {
+        // The mock's canned command catalog: one registered command.
+        let backend = MockBackend::new();
+        backend.set_commands(vec![serde_json::json!({
+            "name": "mycmd",
+            "description": "MYCMD-DESC",
+        })]);
+        let svc = Arc::new(AgentService::new(
+            Arc::clone(&backend) as Arc<dyn OpenCodeBackend>
+        ));
+        let (outcome, _collected) = run_client(
+            svc,
+            Arc::clone(&backend),
+            move |backend, _c, cx| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id.clone();
+
+                // 1. /compact: no execution turn on the wire — compaction events
+                //    plus the closing execution.succeeded gate the response like
+                //    any turn.
+                backend.push(dto::SessionEvent::CompactionStarted(
+                    dto::CompactionStarted {
+                        sessionID: "ses_mock_1".into(),
+                        inputID: Some("msg_compact".into()),
+                        reason: Some("requested".into()),
+                        recent: None,
+                    },
+                ));
+                backend.push(dto::SessionEvent::CompactionEnded(dto::CompactionEnded {
+                    sessionID: "ses_mock_1".into(),
+                    inputID: Some("msg_compact".into()),
+                    reason: Some("requested".into()),
+                }));
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+                let compact_req = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("/compact"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(compact_req.stop_reason, acp::StopReason::EndTurn);
+
+                // 2. Catalog hit: /mycmd with args. The command ALSO runs a
+                //    real turn (execution events stream like a prompt).
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+                let cmd_req = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("/mycmd   arg1  arg2"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(cmd_req.stop_reason, acp::StopReason::EndTurn);
+
+                // 3. Catalog miss: a normal prompt, text untouched.
+                backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                    sessionID: "ses_mock_1".into(),
+                }));
+                let plain_req = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("/nope just text"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(plain_req.stop_reason, acp::StopReason::EndTurn);
+                Ok(())
+            },
+        )
+        .await;
+        outcome.expect("client run ok");
+
+        // Routing recorded on the backend.
+        assert_eq!(
+            backend.recorded_compact_calls(),
+            vec!["ses_mock_1".to_string()]
+        );
+        let commands = backend.recorded_command_calls();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            (
+                &commands[0].0,
+                commands[0].1.as_str(),
+                commands[0].2.as_str()
+            ),
+            (&"ses_mock_1".to_string(), "mycmd", "arg1 arg2")
+        );
+        assert!(commands[0].3.is_empty(), "no files in the command args");
+        // The miss fell through to the normal prompt with the text verbatim.
+        let prompts = backend.recorded_prompt_bodies();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, "/nope just text");
+    }
+
+    /// The official `detectSlashCommand` port: trim, leading "/", first
+    /// whitespace token as the name, rest rejoined+trimmed as args.
+    #[test]
+    fn detect_slash_command_cases() {
+        assert_eq!(
+            detect_slash_command("  /compact  "),
+            Some(("compact".to_string(), String::new()))
+        );
+        assert_eq!(
+            detect_slash_command("/cmd   a  b"),
+            Some(("cmd".to_string(), "a b".to_string()))
+        );
+        assert_eq!(detect_slash_command("/"), None);
+        assert_eq!(detect_slash_command("plain text"), None);
+        assert_eq!(detect_slash_command("  "), None);
+        assert_eq!(
+            detect_slash_command("/nospace/"),
+            Some(("nospace/".to_string(), String::new()))
+        );
+    }
+
+    /// Release 0.8.5 (registry fix): the shared terminal registry holds
+    /// ONE entry per call id — the map entry decides, re-registration just
+    /// returns the same Arc (the drop guard must not double-stop).
+    #[test]
+    fn terminal_registry_keeps_one_stream_per_call_id() {
+        let registry = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = updates::MappingState::new().with_terminal_registry(Arc::clone(&registry));
+        let a = state.terminal_stream("call_1", "term_call_1".into());
+        let b = state.terminal_stream("call_1", "term_call_1".into());
+        assert!(Arc::ptr_eq(&a, &b), "same call id → the same stream Arc");
+        assert_eq!(
+            registry.lock().expect("registry lock").len(),
+            1,
+            "re-registration must not duplicate the registry entry"
+        );
+        let c = state.terminal_stream("call_2", "term_call_2".into());
+        assert_eq!(registry.lock().expect("registry lock").len(), 2);
+        assert!(
+            !Arc::ptr_eq(&a, &c),
+            "a different call id → a different stream"
+        );
+    }
+
+    /// Release 0.8.5 (registry fix): dropping the guard stops EVERY stream
+    /// the registry saw — including streams registered after the guard was
+    /// constructed, which the old map snapshot could never reach.
+    #[test]
+    fn terminal_guard_stops_every_registered_stream_on_drop() {
+        let registry = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = updates::MappingState::new().with_terminal_registry(Arc::clone(&registry));
+        // Register BEFORE and AFTER the guard construction (the poller
+        // registers on the first progress event, well after turn start).
+        let early = state.terminal_stream("call_1", "term_call_1".into());
+        let guard = TerminalStopGuard(Arc::clone(&registry));
+        let late = state.terminal_stream("call_2", "term_call_2".into());
+        assert!(!early.stop.load(Ordering::SeqCst));
+        assert!(!late.stop.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(
+            early.stop.load(Ordering::SeqCst),
+            "pre-guard stream stopped"
+        );
+        assert!(
+            late.stop.load(Ordering::SeqCst),
+            "post-guard stream stopped too"
         );
     }
 

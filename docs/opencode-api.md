@@ -183,9 +183,11 @@ reject); "always" sends `{"decision":"always"}` — server derives the rule from
 
 - `session.tool.failed` — tool failure live event (persisted `ToolState.Error`
   exists; official ACP code consumes `session.tool.failed {…, error:{type,message}}`).
-- `session.execution.interrupted`, `session.retry.scheduled`, `form.created`,
+- `session.execution.interrupted`, `session.retry.scheduled`,
   `session.forked/moved/deleted` — present in the official ACP consumer loop
   (see below) but not yet on our captures.
+
+  (`form.created` is decoded and consumed since v0.8.5 — see elicitation below.)
 
 ### Official 2.0.21 ACP adapter — event→ACP mapping (extracted from the binary)
 
@@ -286,8 +288,9 @@ The notes above describe the 2.0.21 binary we run; tag v2.0.22
 **Bridge backlog (Wave 4+, priority-ordered)**: 1. prompt `id` + inbox
 admission gate; 2. step.failed/execution.failed terminal + auth-error
 mapping (Wave 3); 3. child sessions + child permission asks; 4. usage
-size/cost from catalog + PromptResponse usage; 5. form elicitation
-(capability-gated); 6. compaction/retry markers; 7. config-option pushes;
+size/cost from catalog + PromptResponse usage (done in v0.8.4);
+5. form elicitation (capability-gated, done in v0.8.5);
+6. compaction/retry markers; 7. config-option pushes;
 8. cancel drain + abandonTools; 9. error-taxonomy parity; 10. output-ordering
 buffer after session/load response; 11. prompt enrichment (audience
 annotations, images, files, slash-commands).

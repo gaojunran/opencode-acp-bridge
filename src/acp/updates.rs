@@ -6,18 +6,22 @@
 //!
 //! Word of caution on the wire: opencode's `session.*` events do NOT carry
 //! ACP-style part IDs, only `{assistantMessageID, ordinal}`. ACP chunks need a
-//! `messageId` — we reuse the assistant message ID for both text and reasoning
-//! chunks of the same assistant message (each chunk type gets its own
-//! `message_id` from the same ID; the client groups by that ID).
+//! `messageId` — the official adapter emits `${assistantMessageID}:reasoning:`
+//! `<ordinal>` for thought chunks (text keeps the bare assistant message id);
+//! the bridge mirrors that exactly (Release 0.8.5).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Cost, ImageContent, SessionInfoUpdate, SessionUpdate, TextContent,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ContentBlock, ContentChunk, Cost, ImageContent, MessageId, SessionInfoUpdate, SessionUpdate,
+    Terminal, TerminalId, TextContent, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
+use tokio::sync::oneshot;
 
 use crate::dto::{self, ToolContent, ToolMetadata};
 
@@ -69,9 +73,123 @@ pub struct MappingState {
     /// `usage.updated` events. `None` skips the usage update (the official
     /// adapter's unknown-size gate).
     pub context_limit: Option<u64>,
+    /// Release 0.8.5: shell tool calls with a display-only terminal — call
+    /// id → streaming state (stop flag, streamed flag, drained channel).
+    /// Registered when the output poller starts; consumed by the completed
+    /// update (terminal_exit) and the turn-end cleanup.
+    pub terminal_streams: HashMap<String, Arc<TerminalStream>>,
+    /// Release 0.8.5: EVERY stream ever registered this turn, shared with
+    /// the agent layer's drop guard — the guard stops all of them on the
+    /// turn's exit paths, even streams created after the guard was made
+    /// (map snapshots cannot see late registrations).
+    pub terminal_registry: Arc<std::sync::Mutex<Vec<Arc<TerminalStream>>>>,
+}
+
+/// Release 0.8.5: one shell tool call's terminal streaming state, shared
+/// between the mapping layer (registry, stop/exit signals) and the agent
+/// layer's output poller (spawned per call, runs on the client connection).
+/// The poller checks `stop` each iteration and signals `drained` after its
+/// final drain, so the turn loop can bound its wait for the last bytes.
+#[derive(Debug, Default)]
+pub struct TerminalStream {
+    /// The display-only terminal entity id (`term_<call id>`) — Zed mounts
+    /// it from the FIRST ToolCall declaration's `_meta.terminal_info`.
+    pub terminal_id: String,
+    /// Set by the mapping on tool close and by the turn loop before the
+    /// completed update; the poller stops on it and does one final drain.
+    pub stop: AtomicBool,
+    /// Whether ANY terminal_output chunk reached the client (the empty-
+    /// terminal fallback reads it: append the success text when false).
+    pub streamed: AtomicBool,
+    drained_rx: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl TerminalStream {
+    /// The poller's final-drain completion signal — consumed once, by the
+    /// turn loop's bounded wait before the completed update.
+    pub fn take_drained(&self) -> Option<oneshot::Receiver<()>> {
+        self.drained_rx.lock().expect("drained lock").take()
+    }
+
+    /// Wire in the drained-completion receiver (once, before the poller
+    /// spawns; the sender rides into the poller task).
+    pub fn set_drained(&self, rx: oneshot::Receiver<()>) {
+        *self.drained_rx.lock().expect("drained lock") = Some(rx);
+    }
 }
 
 impl MappingState {
+    /// Release 0.8.5: has a tool call with this id been PROJECTED to the
+    /// client already (its `input.started` arrived)? The elicitation
+    /// `toolCallId` gate — an id the client has never seen is worse than
+    /// none (official `toolCallSent`).
+    pub fn knows_tool(&self, id: &str) -> bool {
+        self.tool_titles.contains_key(id)
+    }
+
+    /// Release 0.8.5: the tool name indexed for a call id (from
+    /// `input.started`), when one arrived.
+    pub fn tool_name(&self, id: &str) -> Option<&str> {
+        self.tool_titles.get(id).map(String::as_str)
+    }
+
+    /// Builder: the shared terminal registry (Release 0.8.5) — the agent
+    /// layer's drop guard holds the same `Arc` and stops every stream that
+    /// was registered, no matter when.
+    pub fn with_terminal_registry(
+        mut self,
+        registry: Arc<std::sync::Mutex<Vec<Arc<TerminalStream>>>>,
+    ) -> Self {
+        self.terminal_registry = registry;
+        self
+    }
+
+    /// Release 0.8.5: register (or fetch) the terminal stream of a shell
+    /// call. `terminal_id` is the display entity id chosen on declaration;
+    /// the agent layer wires the drained channel in right before spawning
+    /// the poller ([`TerminalStream::set_drained`]). The FIRST registration
+    /// also pushes the stream into [`MappingState::terminal_registry`] —
+    /// same call id never re-registers (the map entry decides).
+    pub fn terminal_stream(&mut self, call_id: &str, terminal_id: String) -> Arc<TerminalStream> {
+        let registry = Arc::clone(&self.terminal_registry);
+        self.terminal_streams
+            .entry(call_id.to_string())
+            .or_insert_with(|| {
+                let stream = Arc::new(TerminalStream {
+                    terminal_id,
+                    stop: AtomicBool::new(false),
+                    streamed: AtomicBool::new(false),
+                    drained_rx: Mutex::new(None),
+                });
+                registry
+                    .lock()
+                    .expect("terminal registry lock")
+                    .push(Arc::clone(&stream));
+                stream
+            })
+            .clone()
+    }
+
+    /// Release 0.8.5: stop a call's terminal poller (tool terminal state or
+    /// turn end). Returns whether a stream was registered — the caller then
+    /// waits for its final drain (bounded) so the last bytes precede the
+    /// completed update.
+    pub fn stop_terminal(&self, call_id: &str) -> bool {
+        match self.terminal_streams.get(call_id) {
+            Some(stream) => {
+                stream.stop.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Release 0.8.5: drop a call's terminal state after its completed
+    /// update carried the exit (a reused call id never re-mounts).
+    pub fn remove_terminal(&mut self, call_id: &str) {
+        self.terminal_streams.remove(call_id);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -124,6 +242,10 @@ impl MappingState {
     /// Mark a tool call closed (completed or failed).
     pub(crate) fn close_tool(&mut self, id: &str) {
         self.open_tools.remove(id);
+        // Release 0.8.5: a closed shell call stops its terminal poller (the
+        // agent layer already drained it before the completed update fell
+        // out of this mapping — degenerate paths expire the pollers here).
+        self.stop_terminal(id);
     }
 
     /// The still-open tool calls at end-of-turn, abandoned as failed with
@@ -148,6 +270,12 @@ impl MappingState {
     /// which Zed renders as a "Tool call not found" placeholder). Returns
     /// the initial `ToolCall` update, or `None` when the id was already
     /// introduced.
+    ///
+    /// Release 0.8.5: `terminal` — when the call is a shell tool, the first
+    /// declaration ALSO mounts the display-only terminal: `_meta.terminal_info`
+    /// (snake_case, Zed reads it ONLY from the initial ToolCall) plus a
+    /// `content: [{type: "terminal", terminalId}]` part (camelCase — without
+    /// it the terminal never mounts and the whole update is dropped).
     pub(crate) fn introduce_tool(
         &mut self,
         id: &str,
@@ -155,6 +283,7 @@ impl MappingState {
         kind: ToolKind,
         status: ToolCallStatus,
         raw_input: Option<serde_json::Value>,
+        terminal: Option<TerminalAttach>,
     ) -> Option<SessionUpdate> {
         if !self.introduced_tools.insert(id.to_string()) {
             return None;
@@ -162,6 +291,21 @@ impl MappingState {
         let mut call = ToolCall::new(id.to_string(), title).kind(kind).status(status);
         if let Some(input) = raw_input {
             call = call.raw_input(input);
+        }
+        if let Some(term) = terminal {
+            let mut info = serde_json::Map::new();
+            info.insert(
+                "terminal_id".into(),
+                serde_json::Value::String(term.terminal_id.clone()),
+            );
+            info.insert("cwd".into(), serde_json::Value::String(term.cwd));
+            let mut meta = serde_json::Map::new();
+            meta.insert("terminal_info".into(), serde_json::Value::Object(info));
+            call = call
+                .meta(meta)
+                .content(vec![ToolCallContent::Terminal(Terminal::new(
+                    TerminalId::new(term.terminal_id),
+                ))]);
         }
         Some(SessionUpdate::ToolCall(call))
     }
@@ -191,7 +335,15 @@ pub fn to_updates(event: &dto::SessionEvent, state: &mut MappingState) -> Vec<Se
         // ---------- reasoning ----------
         dto::SessionEvent::ReasoningDelta(d) => vec![SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(d.delta.clone())))
-                .message_id(d.base.assistantMessageID.as_str()),
+                // Release 0.8.5: official messageId format
+                // `${assistantMessageID}:reasoning:${ordinal}` (the wire's
+                // per-reasoning-part ordinal, verified in both adapter
+                // generations) — text chunks keep the bare assistant id.
+                .message_id(MessageId::new(format!(
+                    "{}:reasoning:{}",
+                    d.base.assistantMessageID,
+                    d.base.ordinal.unwrap_or(0)
+                ))),
         )],
 
         // ---------- tools (parent namespace) ----------
@@ -857,9 +1009,15 @@ pub fn to_child_updates(
         dto::SessionEvent::ReasoningDelta(d) => {
             track.record_message(&d.base.assistantMessageID);
             (
+                // Release 0.8.5: official `${assistantMessageID}:reasoning:`
+                // `${ordinal}` messageId (live + child paths share it).
                 vec![SessionUpdate::AgentThoughtChunk(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(d.delta.clone())))
-                        .message_id(d.base.assistantMessageID.as_str()),
+                        .message_id(MessageId::new(format!(
+                            "{}:reasoning:{}",
+                            d.base.assistantMessageID,
+                            d.base.ordinal.unwrap_or(0)
+                        ))),
                 )],
                 None,
             )
@@ -1014,6 +1172,10 @@ fn to_tool_updates(
                 tool_kind(&t.name),
                 ToolCallStatus::Pending,
                 None,
+                // Release 0.8.5: shell calls mount their display-only
+                // terminal on the FIRST declaration (terminal_info meta +
+                // terminal content — both ride this message).
+                shell_terminal(state, &id, &t.name),
             ) {
                 out.push(decl);
             }
@@ -1051,6 +1213,7 @@ fn to_tool_updates(
                         tool_kind(name),
                         ToolCallStatus::Pending,
                         raw_input,
+                        None,
                     ) {
                         out.push(decl);
                     }
@@ -1060,12 +1223,14 @@ fn to_tool_updates(
                         .tool_titles
                         .get(&id)
                         .map_or(ToolKind::Other, |n| tool_kind(n));
+                    let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
                     if let Some(decl) = state.introduce_tool(
                         &id,
                         id.clone(),
                         kind,
                         ToolCallStatus::Pending,
                         raw_input,
+                        shell_terminal(state, &id, name),
                     ) {
                         out.push(decl);
                     }
@@ -1096,6 +1261,7 @@ fn to_tool_updates(
                         tool_kind(name),
                         ToolCallStatus::InProgress,
                         Some(t.input.clone()),
+                        None,
                     ) {
                         out.push(decl);
                     }
@@ -1105,12 +1271,14 @@ fn to_tool_updates(
                         .tool_titles
                         .get(&id)
                         .map_or(ToolKind::Other, |n| tool_kind(n));
+                    let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
                     if let Some(decl) = state.introduce_tool(
                         &id,
                         id.clone(),
                         kind,
                         ToolCallStatus::InProgress,
                         Some(t.input.clone()),
+                        shell_terminal(state, &id, name),
                     ) {
                         out.push(decl);
                     }
@@ -1119,15 +1287,18 @@ fn to_tool_updates(
             // Release 0.8.4: the running update carries kind + derived
             // locations (official `runningToolUpdate`) — the empty-locations
             // array is unconditional, exactly like the official adapter.
+            // Release 0.8.5: the shell command becomes the running title
+            // (official `toolTitle`) — the terminal header shows it.
             let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
-            out.push(tool_update(
-                &id,
-                ToolCallUpdateFields::new()
-                    .status(ToolCallStatus::InProgress)
-                    .kind(tool_kind(name))
-                    .locations(tool_locations(name, &t.input, &state.cwd))
-                    .raw_input(t.input.clone()),
-            ));
+            let mut fields = ToolCallUpdateFields::new()
+                .status(ToolCallStatus::InProgress)
+                .kind(tool_kind(name))
+                .locations(tool_locations(name, &t.input, &state.cwd))
+                .raw_input(t.input.clone());
+            if let Some(title) = shell_command_title(name, &t.input) {
+                fields = fields.title(title);
+            }
+            out.push(tool_update(&id, fields));
             out
         }
         dto::SessionEvent::ToolSuccess(t) => {
@@ -1143,6 +1314,7 @@ fn to_tool_updates(
                 .or_else(|| state.tool_titles.get(&id).cloned())
                 .unwrap_or_else(|| id.clone());
             let mut out = Vec::with_capacity(2);
+            let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
             if let Some(decl) = state.introduce_tool(
                 &id,
                 title,
@@ -1152,6 +1324,7 @@ fn to_tool_updates(
                     .map_or(ToolKind::Other, |n| tool_kind(n)),
                 ToolCallStatus::Completed,
                 None,
+                shell_terminal(state, &id, name),
             ) {
                 out.push(decl);
             }
@@ -1189,7 +1362,52 @@ fn to_tool_updates(
                     fields = fields.content(Some(blocks));
                 }
             }
-            out.push(tool_update_meta(&id, fields, completion_meta));
+            // Release 0.8.5: terminal close-out for shell calls — the
+            // agent layer stopped the poller and waited for its final drain
+            // BEFORE this mapping ran, so the completed update (with
+            // `_meta.terminal_exit`, when metadata.exit says the process
+            // ended) always follows the last output. Skipped when the shell
+            // stays running (no exit) and consumed thereafter (a reused id
+            // never re-mounts). Nothing streamed at all → the success text
+            // rides a terminal_output chunk so the terminal is never empty
+            // (the fallback chunk is pushed BEFORE the completed update).
+            let mut terminal_chunks: Vec<SessionUpdate> = Vec::new();
+            let mut terminal_exit: Option<serde_json::Map<String, serde_json::Value>> = None;
+            if let Some(stream) = state.terminal_streams.get(&id) {
+                let terminal_id = stream.terminal_id.clone();
+                if let Some(exit) = t.metadata.as_ref().and_then(|m| m.exit) {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("terminal_id".into(), terminal_id.clone().into());
+                    obj.insert("exit_code".into(), exit.into());
+                    if let Some(signal) = t.metadata.as_ref().and_then(|m| m.signal.clone()) {
+                        obj.insert("signal".into(), signal.into());
+                    }
+                    terminal_exit = Some(obj);
+                }
+                if !stream.streamed.load(Ordering::SeqCst) {
+                    let fallback: String = t
+                        .content
+                        .iter()
+                        .flat_map(|c| c.iter())
+                        .filter_map(ToolContent::text)
+                        .map(str::to_string)
+                        .collect();
+                    if !fallback.is_empty() {
+                        terminal_chunks.push(terminal_output_update(&id, &terminal_id, fallback));
+                    }
+                }
+                state.remove_terminal(&id);
+            }
+            out.extend(terminal_chunks);
+            let update = tool_update_meta(&id, fields, completion_meta);
+            out.push(match terminal_exit {
+                Some(exit) => {
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("terminal_exit".into(), serde_json::Value::Object(exit));
+                    tool_update_merge_meta(update, meta)
+                }
+                None => update,
+            });
             out
         }
         dto::SessionEvent::ToolFailed(t) => {
@@ -1201,6 +1419,7 @@ fn to_tool_updates(
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| id.clone());
+            let name = state.tool_titles.get(&id).cloned().unwrap_or_default();
             if let Some(decl) = state.introduce_tool(
                 &id,
                 title,
@@ -1210,31 +1429,52 @@ fn to_tool_updates(
                     .map_or(ToolKind::Other, |n| tool_kind(n)),
                 ToolCallStatus::Failed,
                 None,
+                shell_terminal(state, &id, &name),
             ) {
                 out.push(decl);
             }
-            // v1 has no error field on tool updates: the failure surfaces as
-            // `Failed` with the error message in the raw output. Release
-            // 0.8.4: kind + locations mirror the official `errorToolUpdate`
-            // (input from the cached parsed input — absent → no locations).
+            // Release 0.8.5: official `errorToolUpdate` — the payload parts
+            // map like success content (diffs included), then the error
+            // message is ALWAYS appended as a text block; rawOutput is the
+            // completion metadata plus the error message (nulls dropped).
             let message = t
                 .error
                 .message
                 .clone()
                 .unwrap_or_else(|| "Tool execution failed".to_string());
-            let name = state.tool_titles.get(&id).map(String::as_str).unwrap_or("");
             let input = state
                 .tool_input(&id)
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::Null);
-            let update = ToolCallUpdate::new(
-                id.clone(),
-                ToolCallUpdateFields::new()
-                    .status(ToolCallStatus::Failed)
-                    .kind(tool_kind(name))
-                    .locations(tool_locations(name, &input, &state.cwd))
-                    .raw_output(serde_json::Value::String(message)),
-            );
+            let mut blocks = t
+                .content
+                .as_ref()
+                .map(|c| tool_result_blocks(c, &t.metadata, state.no_aft))
+                .unwrap_or_default();
+            blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                message.clone(),
+            ))));
+            let mut raw_output = serde_json::Map::new();
+            if let Ok(serde_json::Value::Object(meta_obj)) = serde_json::to_value(&t.metadata) {
+                for (key, value) in meta_obj {
+                    if !value.is_null() {
+                        raw_output.insert(key, value);
+                    }
+                }
+            }
+            raw_output.insert("error".into(), message.clone().into());
+            let mut fields = ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Failed)
+                .kind(tool_kind(&name))
+                .locations(tool_locations(&name, &input, &state.cwd))
+                .content(Some(blocks))
+                .raw_output(serde_json::Value::Object(raw_output));
+            // Release 0.8.5: the shell command becomes the failed title too
+            // (official `toolTitle` parity).
+            if let Some(title) = shell_command_title(&name, &input) {
+                fields = fields.title(title);
+            }
+            let update = ToolCallUpdate::new(id.clone(), fields);
             let update = match completion_meta {
                 Some(meta) => update.meta(meta.clone()),
                 None => update,
@@ -1367,6 +1607,10 @@ pub fn event_session_id(event: &dto::SessionEvent) -> Option<&str> {
         // Release 0.5.0: inbox events ride their session id (the payload's
         // `sessionID` is optional on the wire; absent → unroutable).
         dto::SessionEvent::InboxEnqueued(e) => e.sessionID.as_deref(),
+        // Release 0.8.5: form events ride their session id.
+        dto::SessionEvent::FormCreated(f) => Some(&f.form.sessionID),
+        dto::SessionEvent::FormReplied(f) => Some(&f.sessionID),
+        dto::SessionEvent::FormCancelled(f) => Some(&f.sessionID),
     }
 }
 
@@ -1391,10 +1635,97 @@ fn tool_update_meta(
     }
 }
 
+/// Merge an extra `_meta` key into a tool update's existing meta (Release
+/// 0.8.5 — terminal_exit joins the completion meta, not replacing it).
+fn tool_update_merge_meta(
+    update: SessionUpdate,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> SessionUpdate {
+    match update {
+        SessionUpdate::ToolCallUpdate(mut u) => {
+            let mut merged = u.meta.take().unwrap_or_default();
+            for (key, value) in extra {
+                merged.insert(key, value);
+            }
+            u.meta = Some(merged);
+            SessionUpdate::ToolCallUpdate(u)
+        }
+        other => other,
+    }
+}
+
+/// A `ToolCallUpdate` carrying `_meta.terminal_output` (Release 0.8.5) —
+/// pure append semantics on the client side. The agent layer's shell
+/// output poller builds these.
+pub(crate) fn terminal_output_update(
+    call_id: &str,
+    terminal_id: &str,
+    data: String,
+) -> SessionUpdate {
+    let mut output = serde_json::Map::new();
+    output.insert("terminal_id".into(), terminal_id.into());
+    output.insert("data".into(), data.into());
+    let mut meta = serde_json::Map::new();
+    meta.insert("terminal_output".into(), serde_json::Value::Object(output));
+    SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(call_id.to_string(), ToolCallUpdateFields::new()).meta(meta),
+    )
+}
+
+/// Release 0.8.5: the terminal-mount data for a shell call's FIRST
+/// declaration ([`MappingState::introduce_tool`]).
+#[derive(Debug, Clone)]
+pub struct TerminalAttach {
+    /// The display-only terminal entity id (`term_<call id>`, stable per
+    /// call — Zed does no uniqueness check).
+    pub terminal_id: String,
+    /// The session cwd (the terminal's working directory label).
+    pub cwd: String,
+}
+
+/// Release 0.8.5: is the tool a shell-family tool (`bash`/`shell`, official
+/// `isShell`)? The terminal path and the command titles key off this.
+pub fn is_shell(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "bash" | "shell")
+}
+
+/// Release 0.8.5: the terminal-mount attachment for a shell call — the
+/// stable terminal id derives from the call id; `None` for non-shells.
+pub fn shell_terminal(state: &MappingState, id: &str, name: &str) -> Option<TerminalAttach> {
+    if is_shell(name) {
+        Some(TerminalAttach {
+            terminal_id: format!("term_{id}"),
+            cwd: state.cwd.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Release 0.8.5: the official `toolTitle` command lane — `input.command
+/// ?? input.cmd` for shell tools (the terminal header shows the command).
+/// `None` when the tool is not a shell or no command is on hand (the
+/// update then keeps the title the client already has).
+fn shell_command_title(name: &str, input: &serde_json::Value) -> Option<String> {
+    if !is_shell(name) {
+        return None;
+    }
+    input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 /// Release 0.8.4: the full official ACP `ToolKind` mapping (mirrors the
 /// 2.0.21 adapter's `toToolKind`) — case-insensitive, `Other` fallback.
 /// Note the pre-0.8.4 families moved: grep/glob are Search, not Read.
-fn tool_kind(name: &str) -> ToolKind {
+pub(crate) fn tool_kind(name: &str) -> ToolKind {
     match name.to_ascii_lowercase().as_str() {
         "bash" | "shell" => ToolKind::Execute,
         "webfetch" => ToolKind::Fetch,
@@ -1585,7 +1916,9 @@ mod tests {
             .iter()
             .any(|u| matches!(u, SessionUpdate::SessionInfoUpdate(s) if s.title.value().map(|t| t.as_str()) == Some(expected_title.as_str()))));
 
-        // 3. Reasoning chunks stream before the tool call.
+        // 3. Reasoning chunks stream before the tool call — with the
+        //    official `${assistantMessageID}:reasoning:${ordinal}` messageId
+        //    (Release 0.8.5).
         let thought: Vec<&str> = updates
             .iter()
             .filter_map(|u| match u {
@@ -1595,6 +1928,19 @@ mod tests {
             .collect();
         assert!(!thought.is_empty());
         assert_eq!(thought[0], "The");
+        let thought_ids: Vec<String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentThoughtChunk(c) => {
+                    c.message_id.as_ref().map(|m| m.0.as_ref().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            thought_ids.iter().all(|id| id.contains(":reasoning:")),
+            "live thought chunks carry the official suffixed id: {thought_ids:?}"
+        );
 
         // 4. Tool call state machine: pending → (raw-input) → in_progress → completed.
         let tool: Vec<&ToolCallUpdate> = updates
@@ -1745,6 +2091,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         });
         let locs = single
             .fields
@@ -1764,6 +2111,7 @@ mod tests {
             title: None,
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         });
         assert!(multi.fields.locations.is_none(), "two diffs ⇒ no locations");
 
@@ -1774,6 +2122,7 @@ mod tests {
             title: Some("bash".into()),
             truncated: None,
             diagnostics: None,
+            ..Default::default()
         });
         assert!(none.fields.locations.is_none(), "no diffs ⇒ no locations");
     }
@@ -1999,6 +2348,8 @@ mod tests {
                 kind: Some("tool.execution".into()),
                 message: Some("boom".into()),
             },
+            content: None,
+            metadata: None,
         });
         let updates = to_updates(&failed, &mut state);
         assert_eq!(updates.len(), 1);
@@ -2019,10 +2370,329 @@ mod tests {
             Some(vec![]),
             "no input/cwd → empty locations"
         );
-        // v1 has no error field on tool updates — the message rides raw_output.
-        assert_eq!(u.fields.raw_output, Some(serde_json::Value::String("boom".into())));
+        // Release 0.8.5: official `errorToolUpdate` — the error message
+        // ALSO rides a text content block (Zed renders it on the failed
+        // card), and rawOutput is `{metadata?, error}` (the v1 error field
+        // substitute).
+        let blocks = u
+            .fields
+            .content
+            .as_ref()
+            .expect("failed update carries error text");
+        let Some(ToolCallContent::Content(c)) = blocks.first() else {
+            panic!("error text block expected")
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("text block expected")
+        };
+        assert_eq!(t.text, "boom");
+        assert_eq!(
+            u.fields.raw_output,
+            Some(serde_json::json!({ "error": "boom" }))
+        );
         // The call is closed: the cancel drain must not re-abandon it.
         assert!(state.abandon_open_tools().is_empty());
+    }
+
+    /// Release 0.8.5: the FIRST declaration of a shell-family call mounts
+    /// the display-only terminal — `_meta.terminal_info` (snake_case, with
+    /// cwd) AND a `content` terminal part (camelCase `terminalId`, same id)
+    /// must ride the SAME message (Zed drops the update when content
+    /// resolution fails). Non-shell declarations carry neither.
+    #[test]
+    fn shell_declaration_mounts_the_display_terminal() {
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_shell"),
+            name: "bash".into(),
+        });
+        let updates = to_updates(&started, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        let meta = c.meta.as_ref().expect("terminal_info meta");
+        let info = meta.get("terminal_info").expect("terminal_info key");
+        assert_eq!(
+            info.get("terminal_id"),
+            Some(&serde_json::json!("term_call_shell"))
+        );
+        assert_eq!(info.get("cwd"), Some(&serde_json::json!("/home/u/proj")));
+        // The SAME call's content mounts the terminal (camelCase field).
+        assert_eq!(c.content.len(), 1);
+        let ToolCallContent::Terminal(t) = &c.content[0] else {
+            panic!("terminal content block expected")
+        };
+        assert_eq!(t.terminal_id.0.as_ref(), "term_call_shell");
+
+        // Non-shell declarations stay plain.
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_read"),
+            name: "read".into(),
+        });
+        let updates = to_updates(&started, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("declaration expected")
+        };
+        assert!(c.meta.is_none(), "no terminal meta on non-shell calls");
+        assert!(c.content.is_empty());
+        // Degenerate introduction paths (no input.started) also mount it
+        // when the name is on hand.
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_late"),
+            name: "bash".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_x", "msg_x", "call_late"),
+            input: serde_json::json!({}),
+            executed: None,
+        });
+        let _ = to_updates(&called, &mut state);
+        // A DEGENERATE introduction (no input.started at all — the call id
+        // is unknown) cannot know the tool family: no terminal mounts
+        // (degraded but harmless — the terminal header just won't stream).
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_x", "msg_x", "call_unknown"),
+            input: serde_json::json!({}),
+            executed: None,
+        });
+        let updates = to_updates(&called, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("degenerate declaration expected")
+        };
+        assert!(
+            c.meta.is_none(),
+            "a nameless degenerate introduction cannot mount a terminal"
+        );
+    }
+
+    /// Release 0.8.5: the shell command becomes the title on the running
+    /// (called) and failed updates — official `toolTitle` (`input.command ??
+    /// input.cmd`), required for the terminal header.
+    #[test]
+    fn shell_running_and_failed_updates_carry_the_command_title() {
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_s"),
+            name: "bash".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let input = serde_json::json!({"command": "ls -la", "cwd": "/tmp"});
+        let called = dto::SessionEvent::ToolCalled(dto::ToolCalled {
+            base: tool_ref("ses_x", "msg_x", "call_s"),
+            input: input.clone(),
+            executed: None,
+        });
+        let updates = to_updates(&called, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("called update expected — call_s was already declared")
+        };
+        assert_eq!(u.fields.title.as_deref(), Some("ls -la"), "command title");
+
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_x", "msg_x", "call_s"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("boom".into()),
+            },
+            content: None,
+            metadata: None,
+        });
+        let updates = to_updates(&failed, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("failed update expected")
+        };
+        assert_eq!(
+            u.fields.title.as_deref(),
+            Some("ls -la"),
+            "failed keeps the command title"
+        );
+        let blocks = u.fields.content.as_ref().expect("error text block");
+        let Some(ToolCallContent::Content(c)) = blocks.first() else {
+            panic!("text block expected")
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("text")
+        };
+        assert_eq!(t.text, "boom");
+        assert_eq!(
+            u.fields.raw_output,
+            Some(serde_json::json!({"error": "boom"}))
+        );
+    }
+
+    /// Release 0.8.5: shell success closes the terminal — when the call has
+    /// a registered stream, the completed update carries `_meta.terminal_exit`
+    /// (metadata.exit + optional signal; skipped when the shell stays
+    /// running), and a NOTHING-STREAMED call appends the success text as a
+    /// terminal_output chunk BEFORE the completed update (never an empty
+    /// terminal).
+    #[test]
+    fn shell_success_emits_terminal_exit_and_fallback_output() {
+        let success_with = |meta: Option<dto::ToolMetadata>| {
+            let mut state = MappingState::new().with_cwd("/home/u/proj");
+            let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                base: tool_ref("ses_x", "msg_x", "call_s"),
+                name: "bash".into(),
+            });
+            let _ = to_updates(&started, &mut state);
+            // The agent layer registered the stream when the poller started.
+            state.terminal_stream("call_s", "term_call_s".into());
+            let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+                base: tool_ref("ses_x", "msg_x", "call_s"),
+                content: Some(vec![dto::ToolContent::Text {
+                    text: "total 42\n".into(),
+                }]),
+                metadata: meta,
+                executed: Some(true),
+            });
+            let updates = to_updates(&success, &mut state);
+            (state, updates)
+        };
+
+        // Nothing streamed (streamed=false) + exit present → fallback chunk
+        // then the completed update with terminal_exit.
+        let (_, updates) = success_with(Some(dto::ToolMetadata {
+            status: Some("completed".into()),
+            exit: Some(0),
+            signal: None,
+            shellID: Some("sh_1".into()),
+            ..Default::default()
+        }));
+        assert_eq!(updates.len(), 2, "fallback output chunk + completed");
+        let SessionUpdate::ToolCallUpdate(fb) = &updates[0] else {
+            panic!("fallback chunk first")
+        };
+        let out = fb
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal_output"))
+            .expect("terminal_output on the fallback chunk");
+        assert_eq!(
+            out.get("terminal_id"),
+            Some(&serde_json::json!("term_call_s"))
+        );
+        assert_eq!(out.get("data"), Some(&serde_json::json!("total 42\n")));
+        let SessionUpdate::ToolCallUpdate(completed) = &updates[1] else {
+            panic!("completed update second")
+        };
+        assert_eq!(
+            completed.fields.status,
+            Some(acp::ToolCallStatus::Completed)
+        );
+        let exit = completed
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal_exit"))
+            .expect("terminal_exit on the completed update");
+        assert_eq!(
+            exit.get("terminal_id"),
+            Some(&serde_json::json!("term_call_s"))
+        );
+        assert_eq!(exit.get("exit_code"), Some(&serde_json::json!(0)));
+
+        // The stream is consumed — no re-mount on a later call with the
+        // same id.
+        let (state, _) = success_with(Some(dto::ToolMetadata {
+            exit: Some(1),
+            ..Default::default()
+        }));
+        assert!(!state.terminal_streams.contains_key("call_s"));
+
+        // No exit (shell stays running) → update without terminal_exit;
+        // streamed output (the poller marked it) → NO fallback chunk.
+        let mut state = MappingState::new().with_cwd("/home/u/proj");
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_r"),
+            name: "bash".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let stream = state.terminal_stream("call_r", "term_call_r".into());
+        stream.streamed.store(true, Ordering::SeqCst);
+        let success = dto::SessionEvent::ToolSuccess(dto::ToolSuccess {
+            base: tool_ref("ses_x", "msg_x", "call_r"),
+            content: Some(vec![dto::ToolContent::Text {
+                text: "still running".into(),
+            }]),
+            metadata: Some(dto::ToolMetadata {
+                status: Some("running".into()),
+                ..Default::default()
+            }),
+            executed: Some(true),
+        });
+        let updates = to_updates(&success, &mut state);
+        assert_eq!(updates.len(), 1, "no fallback when output streamed");
+        let SessionUpdate::ToolCallUpdate(completed) = &updates[0] else {
+            panic!("completed update")
+        };
+        assert!(
+            completed
+                .meta
+                .as_ref()
+                .is_none_or(|m| !m.contains_key("terminal_exit")),
+            "no terminal_exit for a still-running shell"
+        );
+    }
+
+    /// Release 0.8.5: the failed update maps the payload parts like success
+    /// content (diffs included) and ALWAYS appends the error text; rawOutput
+    /// carries the completion metadata plus the error message (nulls
+    /// dropped) — official `errorToolUpdate`.
+    #[test]
+    fn failed_update_maps_payload_diffs_and_metadata_raw_output() {
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_e"),
+            name: "edit".into(),
+        });
+        let _ = to_updates(&started, &mut state);
+        let failed = dto::SessionEvent::ToolFailed(dto::ToolRefError {
+            base: tool_ref("ses_x", "msg_x", "call_e"),
+            error: dto::StructuredError {
+                kind: Some("tool.execution".into()),
+                message: Some("no permission".into()),
+            },
+            content: Some(vec![dto::ToolContent::Text {
+                text: "partial".into(),
+            }]),
+            metadata: Some(dto::ToolMetadata {
+                title: Some("f.txt".into()),
+                truncated: Some(false),
+                ..Default::default()
+            }),
+        });
+        let updates = to_updates(&failed, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("failed update")
+        };
+        let blocks = u.fields.content.as_ref().expect("content");
+        assert_eq!(blocks.len(), 2, "payload text + error text");
+        let ToolCallContent::Content(c) = &blocks[0] else {
+            panic!("payload text block")
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("text")
+        };
+        assert_eq!(t.text, "partial");
+        let ToolCallContent::Content(c) = &blocks[1] else {
+            panic!("error text block")
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("text")
+        };
+        assert_eq!(t.text, "no permission");
+        assert_eq!(
+            u.fields.raw_output,
+            Some(serde_json::json!({
+                "title": "f.txt",
+                "truncated": false,
+                "error": "no permission"
+            })),
+            "metadata verbatim (false survives; only nulls are dropped) + error message"
+        );
     }
 
     #[test]
@@ -2049,6 +2719,8 @@ mod tests {
                 kind: Some("tool.execution".into()),
                 message: None,
             },
+            content: None,
+            metadata: None,
         });
         let _ = to_updates(&failed, &mut state);
 
@@ -2169,6 +2841,8 @@ mod tests {
                 kind: Some("tool.execution".into()),
                 message: Some("boom".into()),
             },
+            content: None,
+            metadata: None,
         });
         let updates = to_updates(&failed, &mut state);
         assert_eq!(updates.len(), 2);
@@ -2902,6 +3576,7 @@ mod tests {
             metadata: Some(dto::ToolProgressMeta {
                 sessionID: Some("ses_child".into()),
                 status: Some("running".into()),
+                shellID: None,
             }),
         });
         let out = track_event(&mut tracker, &progress, "ses_parent");
@@ -2923,6 +3598,7 @@ mod tests {
             metadata: Some(dto::ToolProgressMeta {
                 sessionID: Some("ses_child".into()),
                 status: Some("running".into()),
+                shellID: None,
             }),
         });
         assert!(track_event(&mut tracker, &foreign, "ses_parent").announce.is_none());
@@ -2944,6 +3620,8 @@ mod tests {
                 kind: Some("tool.execution".into()),
                 message: Some("child spawn failed".into()),
             },
+            content: None,
+            metadata: None,
         });
         let out = track_event(&mut tracker, &failed, "ses_parent");
         assert!(out.complete.is_none(), "unpaired calls get no completion meta");

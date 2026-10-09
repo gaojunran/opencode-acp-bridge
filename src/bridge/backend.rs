@@ -72,7 +72,11 @@ impl OpenCodeBackend for HttpBackend {
             // against it so the LOCAL user message never projects as a
             // remote user chunk.
             let inbox = self.client.prompt(&session_id, &req).await?;
-            Ok(if inbox.id.is_empty() { None } else { Some(inbox.id) })
+            Ok(if inbox.id.is_empty() {
+                None
+            } else {
+                Some(inbox.id)
+            })
         })
     }
 
@@ -81,6 +85,49 @@ impl OpenCodeBackend for HttpBackend {
         Box::pin(async move {
             self.client.interrupt(&session_id).await?;
             Ok(())
+        })
+    }
+
+    fn command(
+        &self,
+        session_id: &str,
+        name: &str,
+        text: &str,
+        files: &[crate::dto::PromptFile],
+    ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
+        let session_id = session_id.to_string();
+        let req = crate::opencode::api::CommandRequest {
+            name: name.to_string(),
+            text: text.to_string(),
+            files: if files.is_empty() {
+                None
+            } else {
+                Some(
+                    files
+                        .iter()
+                        .map(|f| serde_json::to_value(f).unwrap_or_default())
+                        .collect(),
+                )
+            },
+            agents: None,
+            skills: None,
+            delivery: Some("steer".to_string()),
+        };
+        Box::pin(async move {
+            let inbox = self.client.command(&session_id, &req).await?;
+            Ok(if inbox.id.is_empty() {
+                None
+            } else {
+                Some(inbox.id)
+            })
+        })
+    }
+
+    fn compact(&self, session_id: &str) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>> {
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            let inbox = self.client.compact(&session_id).await?;
+            Ok(if inbox.id.is_empty() { None } else { Some(inbox.id) })
         })
     }
 
@@ -155,6 +202,58 @@ impl OpenCodeBackend for HttpBackend {
         Box::pin(async move {
             self.client.permission_reply(&session_id, &request_id, &req).await?;
             Ok(())
+        })
+    }
+
+    fn form_reply(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        req: &crate::dto::FormReplyRequest,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let session_id = session_id.to_string();
+        let form_id = form_id.to_string();
+        let req = crate::dto::FormReplyRequest {
+            answer: req.answer.clone(),
+        };
+        Box::pin(async move {
+            self.client.form_reply(&session_id, &form_id, &req).await?;
+            Ok(())
+        })
+    }
+
+    fn form_cancel(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        message: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        let session_id = session_id.to_string();
+        let form_id = form_id.to_string();
+        let message = message.map(str::to_string);
+        Box::pin(async move {
+            self.client
+                .form_cancel(&session_id, &form_id, message.as_deref())
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn shell_output(
+        &self,
+        shell_id: &str,
+        cwd: &str,
+        cursor: Option<u64>,
+        limit: Option<u64>,
+    ) -> BoxFuture<'_, Result<crate::opencode::api::ShellOutput, anyhow::Error>> {
+        let shell_id = shell_id.to_string();
+        let cwd = cwd.to_string();
+        Box::pin(async move {
+            let out = self
+                .client
+                .shell_output(&shell_id, &cwd, cursor, limit)
+                .await?;
+            Ok(out)
         })
     }
 

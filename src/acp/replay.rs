@@ -62,8 +62,23 @@ pub fn replay_updates(
                 }
             }
             "assistant" => {
+                // Official replay numbering: reasoning ordinals count ONLY
+                // reasoning parts within one assistant message (Release
+                // 0.8.5 — mirrors the live wire ordinal semantics).
+                let mut reasoning_ordinal = 0u32;
                 for part in record.content.iter().flatten() {
-                    out.extend(assistant_part(part, &record.id, no_aft, children));
+                    if matches!(part, Part::Reasoning { .. }) {
+                        out.extend(assistant_part(
+                            part,
+                            &record.id,
+                            Some(reasoning_ordinal),
+                            no_aft,
+                            children,
+                        ));
+                        reasoning_ordinal += 1;
+                    } else {
+                        out.extend(assistant_part(part, &record.id, None, no_aft, children));
+                    }
                 }
             }
             // Execution bookkeeping records — nothing to show the client.
@@ -123,6 +138,7 @@ pub(crate) fn user_file_link(
 fn assistant_part(
     part: &Part,
     message_id: &str,
+    reasoning_ordinal: Option<u32>,
     no_aft: bool,
     children: &[ReplayChildMeta],
 ) -> Vec<SessionUpdate> {
@@ -132,8 +148,14 @@ fn assistant_part(
                 .message_id(message_id),
         )],
         Part::Reasoning { text, .. } => vec![SessionUpdate::AgentThoughtChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
-                .message_id(message_id),
+            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))).message_id(
+                // Release 0.8.5: official `${messageId}:reasoning:${ordinal}`
+                // — the ordinal counts reasoning parts within the message.
+                agent_client_protocol::schema::v1::MessageId::new(format!(
+                    "{message_id}:reasoning:{}",
+                    reasoning_ordinal.unwrap_or(0)
+                )),
+            ),
         )],
         Part::Tool { id, name, state, .. } => {
             let child = children.iter().find(|c| c.call_id == *id);
@@ -412,22 +434,32 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_and_text_parts_share_the_assistant_message_id() {
+    fn reasoning_gets_the_official_suffixed_message_id() {
         let updates = replay_updates(&fixture_records(), false, &[], false);
-        // The write-tool assistant message carries a reasoning part (and no
-        // text part in this capture) — the thought chunk must keep the
-        // message id so clients can anchor it under the right assistant turn.
-        let msg = "msg_0fac20b1a001EggNXWtAEmLWrL";
-        let chunks_with_id = updates
+        // Release 0.8.5: the official `${messageId}:reasoning:${ordinal}`
+        // format (live wire + replay counter) — TEXT chunks keep the bare
+        // assistant message id.
+        let ids: Vec<String> = updates
             .iter()
-            .filter(|u| match u {
-                SessionUpdate::AgentMessageChunk(c) | SessionUpdate::AgentThoughtChunk(c) => {
-                    c.message_id.as_ref().map(|m| &*m.0) == Some(msg)
+            .filter_map(|u| match u {
+                SessionUpdate::AgentThoughtChunk(c) => {
+                    c.message_id.as_ref().map(|m| m.0.as_ref().to_string())
                 }
-                _ => false,
+                _ => None,
             })
-            .count();
-        assert!(chunks_with_id >= 1, "reasoning part keeps the assistant message id");
+            .collect();
+        assert!(!ids.is_empty(), "the capture has a reasoning part");
+        assert!(
+            ids.iter()
+                .all(|id| id.contains(":reasoning:") && id.starts_with("msg_")),
+            "thought chunks carry the suffixed official id, got {ids:?}"
+        );
+        // The write-tool assistant message's thought rides the expected
+        // exact id (replay ordinals count reasoning parts per message).
+        assert!(
+            ids.iter()
+                .any(|id| id == "msg_0fac20b1a001EggNXWtAEmLWrL:reasoning:0")
+        );
     }
 
     fn record_with_tool(state: ToolState) -> MessageRecord {
