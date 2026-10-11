@@ -4,30 +4,19 @@ A Rust [ACP](https://agentclientprotocol.com) agent that connects Zed (or any
 ACP v1 client) to one **shared** opencode server over its HTTP API — instead
 of letting each editor window spawn its own private `opencode serve`.
 
-## Why
-
-`opencode acp` (2.0.x) starts a private `opencode serve` for every editor
-window: ~255 MB RSS and ~8 s cold start each, and the sessions of those
-private servers are invisible to each other (the pain behind opencode
-PR #52075). This bridge attaches to a single shared server instead:
-
-- **~10–20 MB** per window instead of ~255 MB (tokio + reqwest, single binary)
-- **millisecond** startup instead of ~8 s
-- every window sees the same server and the same sessions
-- correct diff blocks for every file-edit path (fixes opencode #52636)
-- **real-time progress sync** — turns started in other frontends (TUI, any
-  client of the same server) stream live into the open editor thread, and
-  remote model/agent switches update the pickers instantly
-- **session styling tuned for the Zed thread UI** — subagents render as
-  Zed's native subagent cards (status, live activity, embedded transcript)
-  instead of foreign tool-card spam
-- **per-turn diffs for Zed** — with `--zed-git-add` (opt-in), each user
-  prompt stages the previous turn's edits so Zed's unstaged-changes panel
-  shows exactly the current turn's diff
-- **synthetic inbox messages opt-in** — `--show-synthetic` renders the
-  server's system-injected 'synthetic' messages (background bash
-  completions, subagent-completion notifications) as user chunks, live and
-  on replay; off by default, and staging never reacts to them either way
+- **One shared server** — every window attaches to the same `opencode serve`:
+  the same sessions, the same state, and turns started anywhere (TUI included)
+  stream live into every open thread
+- **Small and fast** — a single tokio + reqwest binary (~10–20 MB RSS per
+  window, millisecond startup) instead of a ~255 MB private server with ~8 s
+  cold start per window
+  ([opencode PR #52075](https://github.com/anomalyco/opencode/pull/52075))
+- **Built for Zed's thread UI** — native diff cards with "Go to File",
+  subagent cards with embedded transcripts, permission previews, form cards,
+  tool-kind icons, and a context-usage ring
+- **Wire-faithful** — the opencode 2.0.21/2.0.22 HTTP/SSE contract is
+  captured in [`docs/opencode-api.md`](docs/opencode-api.md) and drives the
+  mapping layer
 
 ## Install
 
@@ -37,10 +26,10 @@ With [mise](https://mise.jdx.dev):
 mise use -g github:gaojunran/opencode-acp-bridge
 ```
 
-Prebuilt binaries for Linux (gnu/musl, x64/arm64), macOS (x64/arm64) and
+Prebuilt binaries for Linux (gnu/musl, x64/arm64), macOS (x64/arm64), and
 Windows are attached to each
-[release](https://github.com/gaojunran/opencode-acp-bridge/releases); mise
-puts the binary on its PATH shim
+[release](https://github.com/gaojunran/opencode-acp-bridge/releases) (plus
+`SHA256SUMS`); mise puts the binary on its PATH shim
 (`~/.local/share/mise/shims/opencode-acp-bridge` by default).
 
 From source (stable Rust):
@@ -51,9 +40,9 @@ cargo build --release
 
 ## Configure Zed
 
-Run your shared server once — `opencode serve` writes its address and
-password to `~/.config/opencode/service.json`, and the bridge picks that up
-by default, so no secrets go into the Zed config:
+Run your shared server once — `opencode serve` writes its address and password
+to `~/.config/opencode/service.json`, and the bridge reads that by default, so
+no secrets go into the Zed config:
 
 ```jsonc
 {
@@ -89,100 +78,110 @@ To pin a specific server instead, pass the URL and password explicitly:
 
 ## Connection
 
-| Invocation | Server URL | Password |
+| Mode | Server URL | Password |
 | --- | --- | --- |
-| *(none — default)* | `~/.config/opencode/service.json` (`{port, password, hostname}`, `0.0.0.0` → `127.0.0.1`); if the file is absent, the `OPENCODE_URL` env var | from the file, or `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
-| `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
-| `--no-aft` | *(composes with any connection mode)* | disables the aft tool-call hoist adaptations: File/image content passthrough in tool results; diff extraction stays enabled |
-| `--zed-git-add` | *(composes with any connection mode)* | turn-scoped staging: at each user prompt, `git add --` exactly the paths of the previous turn's native snapshot diff (`step.ended.files` — write/edit/apply_patch AND bash, see Features); accepted premise: no concurrent edits in the same directory during the turn |
-| `--show-synthetic` | *(composes with any connection mode)* | renders server-injected 'synthetic' inbox messages (background bash completions, subagent-completion notifications) as user chunks, live and on replay — off by default; synthetic/compaction/move items never trigger staging under any flag |
-| `--shell-terminal` | *(composes with any connection mode)* | streams bash/shell tool output into an embedded terminal card in the client (display-only terminal + ~1s output polling until the call ends) — off by default; the card takes vertical space |
+| default (no flags) | `~/.config/opencode/service.json` — `{port, password, hostname}`, with `0.0.0.0` mapped to `127.0.0.1`; if the file is absent, the `OPENCODE_URL` env var | from the file, or the `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env |
+| `--attach <url>` | the given URL | `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD` env (required) |
+| `OPENCODE_URL` env | the given URL (fallback when no service file exists) | same env vars |
 
-The server is probed at startup (`GET /api/config`) and failures are
-classified — unreachable, credentials rejected, HTTP status — with the
-connection source named in the message, so a stale service registration reads
-differently from a dead server. Logs go to stderr (Zed collects them in its
-per-agent debug log). Exit codes: `0` normal, `1` connection failure, `2`
-usage error.
+A present-but-broken service file is surfaced as-is (never masked by the env
+fallback); a stale registration — the server restarted with a new port —
+prints a hint to restart the server or use `--attach`. The server is probed at
+startup (`GET /api/config`) and failures are classified — unreachable,
+credentials rejected, HTTP status — with the connection source named in the
+message.
+
+Logs go to stderr (Zed collects them in its per-agent debug log; level from
+`RUST_LOG`, default `info`). Exit codes: `0` normal, `1` connection failure,
+`2` usage error.
+
+## Options
+
+All of these are off by default:
+
+| Flag | Effect |
+| --- | --- |
+| `--no-aft` | Disable the aft tool-call hoist adaptations (file/image content passthrough in tool results). Diff extraction stays enabled — `filediff`/`diff` are dialect-neutral and work either way. |
+| `--zed-git-add` | Turn-scoped staging: at each user prompt, `git add --` the paths the previous turn changed (see *Turn-scoped staging* under Features). |
+| `--show-synthetic` | Render server-injected `synthetic` inbox messages (background bash completions, subagent-completion notifications) as user chunks, live and on replay. Never affects staging. |
+| `--shell-terminal` | Stream bash/shell output into an embedded display-only terminal card (≈1 s polling until the call ends). The card takes vertical space, so it is opt-in. |
+| `--help` / `--version` | Usage / version. |
 
 ## Features
 
-- **Sessions, shared everywhere** — create, resume with full history replay,
-  list, delete, close (bridge-local cancellation + unregister), fork
-  (native opencode fork with full-transcript copy); every window sees the
-  same sessions on the same server
-- **Streaming turns** — text, reasoning, and tool-call events; cancel maps to
-  interrupt with a bounded drain of in-flight tools
-- **Live sync of other frontends' turns** — a persistent background
-  listener streams turns started in the TUI (or any other frontend) into the
-  connected editor: user messages, text/reasoning, tool calls, usage, and
-  remote agent/model switches — no reload needed
+### Sessions & streaming
+
+- **Full session surface** — create, reopen with full history replay, list,
+  delete, close (bridge-local cancellation + unregister), and fork (native
+  opencode fork with full-transcript copy). Zed's *Import External Agent
+  Threads* lists the server's sessions via `session/list` and imports them as
+  archived threads that replay on open.
+- **Streaming turns** — text, reasoning (one chunk per part, official-parity
+  message ids), and tool calls; cancel maps to `interrupt` with a bounded
+  drain of in-flight tools.
+- **Live sync of other frontends** — a persistent background listener streams
+  turns started elsewhere (the TUI, or any client of the same server) into
+  the connected editor: user messages, text/reasoning, tool calls, usage, and
+  remote agent/model switches — no reload needed.
 - **Editor attachments** — `@`-file references and pasted images travel to
-  the server as opencode attachments; unmapped block types degrade to a
-  warning, never an error
+  the server as opencode attachments; on reload, user-message file chips
+  replay as ACP resource links. Unmapped block types degrade to a warning,
+  never an error.
+
+### Editing & review
+
 - **Diff blocks on every edit path** — `edit`, `write`, `apply_patch`, and
   plugin-hoisted tools alike, derived from server-side result metadata
-  (`filediff` / `files[]`) instead of reconstructed tool inputs
+  (`filediff` / `files[]`) with faithful trailing-newline reconstruction.
+- **"Go to File" on diff cards** — tool calls carry the affected file as an
+  ACP location (at running time and on completion), lighting up Zed's
+  jump-to-file header.
+- **Permission previews** — permission requests carry an inline diff preview
+  (when the server provides `metadata.files`) plus the affected paths, so the
+  approval card shows what will change.
+- **Turn-scoped staging** (`--zed-git-add`) — each finished step's native
+  snapshot diff (`step.ended.files`) is collected per root session (a
+  subagent's steps accumulate under its parent), and the next user-initiated
+  prompt — local or remote — runs `git add --` on exactly those paths before
+  the turn starts. Covers `write`/`edit`/`apply_patch` and `bash` (any on-disk
+  change in the session directory); only user prompts stage. Paths are
+  validated against the local worktree (partial batches are retained, not
+  staged; `git add` failures retry 3× and retain for the next prompt), so
+  Zed's unstaged-changes view shows only the current turn's changes and your
+  own working-tree edits are never touched. Accepted premise: one session at
+  a time in a directory — concurrent manual edits within the turn window are
+  staged too.
+
+### Conversation UI
+
+- **Tool kinds** — official-parity ACP kinds (`bash`/`shell` → execute,
+  `edit`/`write`/`apply_patch` → edit, `read` → read, `grep`/`glob` →
+  search, `webfetch` → fetch, `task`/`subagent` → think), so Zed picks the
+  right icon and layout per tool.
+- **Native subagent cards** — the parent's task call declares
+  `_meta.subagent_session_info` so Zed renders its own subagent card: child
+  events stream into the embedded transcript, tool boundaries aggregate onto
+  the task card, continuations re-slice, background children outliving the
+  parent turn stay visible, and the card is titled with the dispatch
+  description.
 - **Permissions routed to the editor** — asks surface as ACP
   `requestPermission`, including asks originating from subagent child
-  sessions
-- **Modes** — opencode agents (build/plan/…) exposed as ACP modes, switchable
-  live, with remote switches reflected
-- **Model & agent pickers** — session model and agent as ACP config options
-  (what Zed renders as its pickers), switchable live via
-  `session/set_config_option`, with remote switches and catalog reloads
-  reflected as `config_option_update` pushes
-- **Slash commands** pushed to the editor as they become available
-- **Native subagent sessions** (Release 0.6.0) — the parent's task call
-  declares `_meta.subagent_session_info` so Zed renders Zed's own subagent
-  card: child events stream into the embedded transcript (child-session
-  notifications, plain tool ids), tool boundaries aggregate onto the task
-  card, the closing meta slices the completed transcript, continuations
-  re-slice, and background children outliving the parent turn stay visible
-  (the v0.5.0 listener gap)
-- **Turn-scoped staging** (Release 0.8.0, `--zed-git-add`) — the
-  `opencode-git-add` plugin's staging semantics natively, with the server's
-  NATIVE snapshot diff as the data source: each finished step's
-  `step.ended.files` (`git diff --name-only` of the step's snapshot trees)
-  is collected per ROOT session (a subagent's steps accumulate under its
-  parent), and the next USER-initiated prompt — local or remote — runs
-  `git add -- <exact paths>` before the turn starts. Covers write / edit /
-  apply_patch AND bash (any on-disk change in the session dir), and only
-  USER prompts stage (a child-session dispatch never does). Zed's
-  unstaged-changes view then always shows only the current turn's changes,
-  and the user's own working-tree edits are never touched. Accepted
-  premise: the snapshot has no tool attribution — concurrent
-  manual/other-session edits in the same directory within the turn window
-  are staged too (assumed: one session at a time); interrupted steps carry
-  no files and are not chased. Topology guards (paths resolve against the
-  local worktree top, must exist and stay inside the session dir) retain
-  the set instead of staging partial batches; `git add` failures retry 3×
-  and retain for the next prompt. Off by default — with the flag off, no
-  tracking and no git invocations
-- **Synthetic inbox messages** (Release 0.8.1, `--show-synthetic`) — the
-  server discriminates inbox items by `item.type`: `user` / `synthetic`
-  (system-injected: background bash completions, subagent-completion
-  notifications) / `compaction` / `move` (control plane). Synthetic
-  messages are never rendered by default and never trigger staging under
-  ANY flag — `--show-synthetic` additionally renders them as user chunks,
-  live (background listener) and on replay (same flag, same semantics).
-  Control-plane items are always skipped entirely
-- **Shell terminal cards** (Release 0.8.5, `--shell-terminal`) — bash/shell
-  calls mount a display-only terminal card (terminal_info meta + terminal
-  content part on the first declaration) and a ~1s output poller streams
-  the shell's output into it until the call ends (terminal_exit on
-  completion). Opt-in — off by default, the card takes vertical space
-- **aft plugin compatible** — image reads map to ACP image content blocks;
-  `--no-aft` opts out of the hoist adaptations
-- **Native subagent cards label with the dispatch description** (Release
-  0.7.1) — a spawner card's title is the subagent task's `description`
-  (truncated to 80 chars + "…"), matching Zed's own `spawn_agent` cards
-  instead of the bare `subagent`/`task` tool name
-- **@-attachments survive reload** (Release 0.7.2) — user message `files[]`
-  (the `@`-mention chips) are replayed as ACP `ResourceLink` chunks (and a
-  remote frontend's prompt attachments are re-emitted by the background
-  listener), so reloading an agent keeps the file chips instead of showing
-  bare text
+  sessions.
+- **Modes & pickers** — opencode agents (build/plan/…) as ACP modes, session
+  model and agent as ACP config options (Zed's pickers), all switchable live,
+  with remote switches and catalog reloads pushed back.
+- **Slash commands** — available commands are pushed to the editor as they
+  become available; submitting one is routed client-side: `/compact` triggers
+  compaction, catalog commands go through the server's command endpoint,
+  anything else falls back to a plain prompt.
+- **Forms** — opencode's `question` tool surfaces as an ACP elicitation form
+  card (single/multi-select options and custom answers); answers route back
+  to the server, Decline/Cancel cancel the form, and forms the client cannot
+  render are cancelled cleanly instead of hanging the turn.
+- **Context usage & failures** — the activity-bar ring shows the last step's
+  token usage against the model's context window (`used / limit.context`)
+  plus session cost; tool failures render the server's error message in the
+  card.
 
 ## Compared to the official `opencode acp`
 
@@ -194,7 +193,7 @@ behavior verified against a real server:
 | Process model ([#40696](https://github.com/anomalyco/opencode/issues/40696), PR [#52075](https://github.com/anomalyco/opencode/pull/52075)) | private `opencode serve` per window — ~255 MB + ~8 s each, sessions invisible across windows | one shared server — ~10–20 MB bridge process, ms-scale startup, sessions shared |
 | Diff blocks for file edits ([#52636](https://github.com/anomalyco/opencode/issues/52636)) | only from the `edit` tool's inputs; `write` / `apply_patch` / plugin tools produce none | result-metadata driven, covers every edit path incl. plugin tools |
 | Subagent permission asks ([#48232](https://github.com/anomalyco/opencode/issues/48232)) | replies hang — they never reach the child session that asked | routed to the asking session (the client request targets the CHILD session in native subagent mode), round-trip verified |
-| Subagent (child) sessions (Release 0.6.0) | namespaced tool projections into the parent stream (`${child.id}:` cards, official #48232 fallback) | Zed's native subagent cards — `_meta.subagent_session_info` pairing, child-session streaming, embedded transcript slices |
+| Subagent (child) sessions | namespaced tool projections into the parent stream (`${child.id}:` cards, official #48232 fallback) | Zed's native subagent cards — `_meta.subagent_session_info` pairing, child-session streaming, embedded transcript slices |
 | Session & mode surface | `session/list` / `resume` / `delete` / `fork`, `set_mode`, command pushes (present in source) | full parity, plus `current_mode_update` on remote switches and `session/close` (bridge-local; official has no close surface) |
 
 Not mappable on either side: todo/plan outlines
