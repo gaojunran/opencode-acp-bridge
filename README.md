@@ -123,8 +123,10 @@ All of these are off by default:
   turns started elsewhere (the TUI, or any client of the same server) into
   the connected editor: user messages, text/reasoning, tool calls, usage, and
   remote agent/model switches — no reload needed.
-- **Editor attachments** — `@`-file references and pasted images travel to
-  the server as opencode attachments; on reload, user-message file chips
+- **Editor attachments** — pasted images travel to the server as opencode
+  attachments, and each `@`-file reference carries the lines it points at
+  (Zed's `#L10:20` range → a `[path:line]` prefix), so the model sees the
+  selection rather than just the file; on reload, user-message file chips
   replay as ACP resource links. Unmapped block types degrade to a warning,
   never an error.
 

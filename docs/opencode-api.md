@@ -369,8 +369,8 @@ rejected):
 | `Image` with base64 `data` | files entry `url: "data:{mime_type};base64,{data}"`, `filename: basename(uri) or "image"`, `mime: mime_type` |
 | `Image` uri-only (`data:`/`http(s)://`) | files entry `url: uri`, filename = basename(uri) or "image" |
 | `Image` with any other uri scheme | dropped |
-| `ResourceLink` (Zed @-mentions — the 0.3.1 bug) | files entry `url: link.uri` **verbatim** (the opencode server resolves `file://` locally), `filename: link.name or basename(uri) or "file"`, `mime: link.mime_type or "text/plain"` |
-| `Resource` text + `file://` uri (rare from Zed) | appended to `text` as `[<pathname>[:<line>]] <text>` (line from a `#L<digits>` uri fragment) |
+| `ResourceLink` (mention when the client did not get `embeddedContext`) | files entry `url: link.uri` **verbatim** (the opencode server resolves `file://` locally), `filename: link.name or basename(uri) or "file"`, `mime: link.mime_type or "text/plain"` |
+| `Resource` text + `file://` uri (Zed @-mentions since v0.8.7) | appended to `text` as `[<pathname>[:<line>]] <text>`; the line comes from the START of the fragment (`?column=5#L10:20` → `10`, official `/^#L(\d+)/` parity) |
 | `Resource` text + `data:` uri | files entry (`url: uri`, mime `text/plain` default) |
 | `Resource` blob + `file://`/`data:` uri | files entry (mime `application/octet-stream` default) |
 | `Resource` other uri schemes | dropped |
@@ -378,6 +378,12 @@ rejected):
 
 `filename` derives from the uri basename (query/fragment stripped, `file://`
 scheme removed); `data:` uris have no basename → the fallback name.
+
+Since v0.8.7 `initialize` advertises `promptCapabilities {embeddedContext,
+image}` (official-adapter parity). Zed then sends a mention as a `Resource`
+carrying the selected lines (or the whole file) and sends pasted images at all;
+before that every mention degraded to a content-less `ResourceLink`, so the
+line/range Zed encodes in the URI fragment never reached the model.
 
 ## aft dialect (tool-call hoist, v0.58.0, wire-verified)
 

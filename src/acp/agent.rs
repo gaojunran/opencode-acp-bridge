@@ -692,7 +692,20 @@ impl AgentService {
         // is a marker struct — `{}` on the wire (schema 1.5.0 stable; only
         // `fork` is unstable-feature-gated, which the `unstable` umbrella
         // enables — so the bridge advertises and serves `session/fork`).
-        let caps = acp::AgentCapabilities::new().load_session(true).session_capabilities(
+        let caps = acp::AgentCapabilities::new()
+            // Release 0.8.7: mirror the official 2.0.22 adapter's
+            // `promptCapabilities: {embeddedContext: true, image: true}`.
+            // Without `embeddedContext` Zed downgrades every @-mention to a
+            // content-less `resource_link`, so the line/range it encodes in the
+            // URI fragment is lost when opencode reads the file server-side;
+            // without `image` Zed never sends image blocks at all.
+            .prompt_capabilities(
+                acp::PromptCapabilities::new()
+                    .embedded_context(true)
+                    .image(true),
+            )
+            .load_session(true)
+            .session_capabilities(
             acp::SessionCapabilities::new()
                 .list(acp::SessionListCapabilities::new())
                 .delete(acp::SessionDeleteCapabilities::new())
@@ -1470,6 +1483,13 @@ impl AgentService {
                 })),
             );
         };
+        // Release 0.8.7: a `session/cancel` latches on the entry until a turn
+        // observes it (`cancel()` sets it; the loop consumes it while
+        // draining). Clear any LEFTOVER latch from an earlier turn FIRST: a
+        // cancel that predates this prompt request belongs to a turn that
+        // already ended, and leaving it set made every later prompt on the
+        // session answer Cancelled locally without ever reaching the backend.
+        entry.cancel.store(false, Ordering::Release);
         // Release 0.5.0: mark the local turn in flight for the background
         // remote-turn listener — its per-session events are dropped while
         // this is set (the per-turn loop's own subscription delivers them).
@@ -3871,28 +3891,31 @@ fn basename_of(uri: Option<&str>) -> Option<String> {
     path.rsplit('/').next().filter(|b| !b.is_empty()).map(str::to_string)
 }
 
-/// Release 0.3.1: `(pathname, line)` of a `file://` URI for the text
-/// resource folding `[path[:line]] content` — the pathname with the query
-/// stripped, the line from a `#L<digits>` (or `#<digits>`) fragment
-/// (official emits `[${path}${line? ":"+line : ""}]`). Non-`file://` uris
-/// yield `(None, None)`.
+/// Release 0.3.1, extended in 0.8.7: `(pathname, line)` of a `file://` URI
+/// for the text resource folding `[path[:line]] content` — the pathname with
+/// the query stripped, the line taken from the START of the fragment's
+/// `L<digits>` (Zed emits ranges as `#L10:20` and single lines as `#L42:42`;
+/// a bare `#42` stays accepted). Only the start line is kept, matching the
+/// official adapter's `/^#L(\d+)/`. Non-`file://` uris yield `(None, None)`.
 fn path_and_line(uri: &str) -> (Option<String>, Option<String>) {
     if !uri.starts_with("file://") {
         return (None, None);
     }
-    let without_query = uri.split('?').next().unwrap_or(uri);
-    let (path_part, fragment) = match without_query.split_once('#') {
+    // Fragment first: Zed's shape is `file:///abs/path?column=5#L10:20`, so
+    // stripping the query before the fragment would drop the line with it.
+    let (without_fragment, fragment) = match uri.split_once('#') {
         Some((p, f)) => (p, Some(f)),
-        None => (without_query, None),
+        None => (uri, None),
     };
+    let path_part = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let path = path_part.strip_prefix("file://");
     let line = fragment.and_then(|f| {
         let digits = f.strip_prefix('L').unwrap_or(f);
-        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            Some(digits.to_string())
-        } else {
-            None
-        }
+        let digits: String = digits.chars().take_while(char::is_ascii_digit).collect();
+        (!digits.is_empty()).then_some(digits)
     });
     (path.map(str::to_string), line)
 }
@@ -4732,6 +4755,12 @@ mod tests {
                         .block_task()
                         .await?;
                     assert!(init.agent_capabilities.load_session);
+                    // Release 0.8.7: prompt capabilities mirror the official
+                    // adapter — `embeddedContext` is what makes Zed send the
+                    // mention as a resource (the only carrier of its line
+                    // range), `image` what makes it send image blocks.
+                    assert!(init.agent_capabilities.prompt_capabilities.embedded_context);
+                    assert!(init.agent_capabilities.prompt_capabilities.image);
                     assert_eq!(init.agent_info.as_ref().map(|i| i.name.as_str()), Some("opencode-acp-bridge"));
 
                     // 2. newSession
@@ -4951,6 +4980,119 @@ mod tests {
 
         agent_task.abort();
         outcome.expect("client run ok");
+    }
+
+    /// Regression: a `session/cancel` latches on the session entry until a
+    /// turn observes it. Before the fix the latch was never cleared, so once
+    /// a turn was cancelled EVERY later prompt on that session answered
+    /// `Cancelled` locally without ever reaching the backend — the
+    /// "interrupt the turn, then send a new message → no response" report.
+    #[tokio::test]
+    async fn cancel_latch_does_not_poison_the_next_turn() {
+        /// Bounded wait for `n` recorded prompt bodies. Never asserts: a panic
+        /// inside the client closure leaves the connection open and hangs the
+        /// test instead of failing it.
+        async fn wait_for_prompts(backend: &MockBackend, n: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while backend.recorded_prompt_bodies().len() < n && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        let backend = MockBackend::new();
+        let svc = Arc::new(
+            AgentService::new(Arc::clone(&backend) as Arc<dyn OpenCodeBackend>)
+                // Short drain: the cancelled turn ends on the window — no
+                // terminal event needed.
+                .with_drain_window(std::time::Duration::from_millis(50)),
+        );
+        let (client_side, agent_side) = agent_client_protocol::Channel::duplex();
+        let agent_task = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let _ = svc.serve(agent_side).await;
+            }
+        });
+
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops: Arc<std::sync::Mutex<Vec<acp::StopReason>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let interrupt_seen = backend.install_interrupt_seen();
+        let run = {
+            let prompts = Arc::clone(&prompts);
+            let stops = Arc::clone(&stops);
+            Client
+                .builder()
+                .name("acp-test-client")
+                .connect_with(client_side, async move |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new("/tmp"))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id.clone();
+
+                    // Turn one: cancel it mid-flight.
+                    let p1 = cx.send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("turn one"))],
+                    ));
+                    wait_for_prompts(&backend, 1).await;
+                    cx.send_notification(CancelNotification::new(sid.clone()))?;
+                    // Barrier: the cancel handler ran (latch set, interrupt
+                    // called) — only then is the push below certain to be
+                    // seen as a cancel instead of an ordinary event.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), interrupt_seen)
+                        .await;
+                    // Wake the blocked loop so it observes the latch; the
+                    // short drain window then answers Cancelled.
+                    backend.push(step_ended("ses_mock_1", "msg_cancel", None));
+                    let r1 = p1.block_task().await?;
+
+                    // Turn two: only a cleared latch lets this reach the
+                    // backend and end on its own terminal event.
+                    let p2 = cx.send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![ContentBlock::Text(TextContent::new("turn two"))],
+                    ));
+                    wait_for_prompts(&backend, 2).await;
+                    backend.push(dto::SessionEvent::ExecutionSucceeded(dto::SessionRef {
+                        sessionID: "ses_mock_1".into(),
+                    }));
+                    let r2 = p2.block_task().await?;
+
+                    stops
+                        .lock()
+                        .expect("stops lock")
+                        .extend([r1.stop_reason, r2.stop_reason]);
+                    prompts.store(
+                        backend.recorded_prompt_bodies().len(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    Ok(())
+                })
+        };
+
+        // Outer bound: a stuck turn loop must fail the test, not hang it.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+        agent_task.abort();
+        outcome
+            .expect("client run timed out — the turn loop never finished")
+            .expect("client run ok");
+        let recorded = prompts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            recorded, 2,
+            "the prompt after a cancelled turn must reach the backend — a leaked cancel \
+             latch answered it Cancelled locally ({recorded} prompt(s) sent)"
+        );
+        let stops = stops.lock().expect("stops lock").clone();
+        assert_eq!(stops[0], acp::StopReason::Cancelled);
+        assert_eq!(stops[1], acp::StopReason::EndTurn);
     }
 
     #[tokio::test]
@@ -9244,6 +9386,32 @@ mod tests {
         assert!(bodies[0].2.is_empty(), "audio must not produce a files entry");
     }
 
+    #[test]
+    fn file_uri_fragments_carry_zed_mention_lines() {
+        let path = || Some("/tmp/notes.md".to_string());
+        // Zed encodes a mention's line/range ONLY in the fragment.
+        assert_eq!(path_and_line("file:///tmp/notes.md"), (path(), None));
+        assert_eq!(
+            path_and_line("file:///tmp/notes.md#L42:42"),
+            (path(), Some("42".into()))
+        );
+        assert_eq!(
+            path_and_line("file:///tmp/notes.md#L10:20"),
+            (path(), Some("10".into()))
+        );
+        assert_eq!(
+            path_and_line("file:///tmp/notes.md?column=5#L10:20"),
+            (path(), Some("10".into()))
+        );
+        // A bare digit fragment stays accepted; junk carries no line.
+        assert_eq!(
+            path_and_line("file:///tmp/notes.md#42"),
+            (path(), Some("42".into()))
+        );
+        assert_eq!(path_and_line("file:///tmp/notes.md#symbol"), (path(), None));
+        assert_eq!(path_and_line("data:text/plain,x"), (None, None));
+    }
+
     #[tokio::test]
     async fn prompt_text_resource_folds_into_text_others_into_files() {
         let backend = MockBackend::new();
@@ -9286,7 +9454,11 @@ mod tests {
             let sid = ns.session_id.clone();
             let res = acp::EmbeddedResource::new(
                 acp::EmbeddedResourceResource::TextResourceContents(
-                    acp::TextResourceContents::new("line 12", "file:///tmp/notes.md#L12"),
+                    // Zed's real range shape (start:end, optional ?column).
+                    acp::TextResourceContents::new(
+                        "line 10..20",
+                        "file:///tmp/notes.md?column=5#L10:20",
+                    ),
                 ),
             );
             push_turn_end(&backend, &sid.0);
@@ -9300,7 +9472,7 @@ mod tests {
         .await;
         outcome.expect("client run ok");
         let bodies = backend.recorded_prompt_bodies();
-        assert_eq!(bodies[0].1, "[/tmp/notes.md:12] line 12");
+        assert_eq!(bodies[0].1, "[/tmp/notes.md:10] line 10..20");
 
         // data: text resource → files entry; blob file:// resource → files
         // entry (mime defaults).
