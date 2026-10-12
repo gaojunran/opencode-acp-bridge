@@ -101,6 +101,34 @@ fn truncate_body(s: String) -> String {
     s.chars().take(500).collect()
 }
 
+/// Diagnostic identity of a raw message-record object (`id` / `type`).
+fn value_ident<'a>(value: &'a Value, key: &'a str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("?")
+}
+
+/// Decode persisted records ONE BY ONE (Release 0.8.8): a single stored
+/// record the bridge cannot map (dialect drift) is skipped with a warning
+/// instead of aborting the whole message list — otherwise `session/load`
+/// fails outright on that one record.
+fn decode_records(values: Vec<Value>) -> Vec<MessageRecord> {
+    let mut records = Vec::with_capacity(values.len());
+    for value in values {
+        // Copied out before the move — the diagnostic needs them on failure.
+        let id = value_ident(&value, "id").to_owned();
+        let kind = value_ident(&value, "type").to_owned();
+        match serde_json::from_value::<MessageRecord>(value) {
+            Ok(record) => records.push(record),
+            Err(e) => tracing::warn!(
+                record = %id,
+                kind = %kind,
+                error = %e,
+                "malformed persisted message record — skipping it (the rest of the session still loads)"
+            ),
+        }
+    }
+    records
+}
+
 // ============================================================
 // Client
 // ============================================================
@@ -402,6 +430,13 @@ impl OpencodeClient {
     /// `GET /api/session/{id}/message?cursor=` — persisted message records,
     /// newest first. Returns the full envelope; the caller continues paging
     /// with the returned `cursor` (`{previous,next}` object).
+    ///
+    /// Release 0.8.8: records decode ONE BY ONE. A stored record the bridge
+    /// cannot map (dialect drift — e.g. a `metadata.files[]` entry shape from
+    /// a different opencode dialect) used to abort the whole response, so
+    /// `session/load` failed outright with `missing field \`filePath\``.
+    /// The record is now skipped with a warning — the same tolerance the
+    /// replay layer already grants to per-message mapping failures.
     pub async fn messages(&self, session_id: &str, cursor: Option<&Cursor>) -> Result<MessagesEnvelope, ApiError> {
         let mut url = self.endpoint_url(&format!("/session/{}/message", encode_segment(session_id)));
         {
@@ -410,7 +445,12 @@ impl OpencodeClient {
                 q.append_pair("cursor", &token);
             }
         }
-        self.send_json::<Vec<MessageRecord>>(Method::GET, url, None).await
+        let envelope = self.send_json::<Vec<Value>>(Method::GET, url, None).await?;
+        Ok(MessagesEnvelope {
+            data: decode_records(envelope.data),
+            location: envelope.location,
+            cursor: envelope.cursor,
+        })
     }
 
     /// `GET /api/session/{id}/message/{messageID}` — one record.
@@ -806,6 +846,25 @@ mod tests {
         assert!(env.data.is_empty());
     }
 
+    /// Release 0.8.8: the message-list decode is per-record. One stored record
+    /// the bridge cannot map is skipped (with its id/kind logged), the rest of
+    /// the history still loads — before this, one such record aborted the whole
+    /// `session/load` with `missing field \`filePath\``.
+    #[test]
+    fn malformed_records_are_skipped_one_by_one() {
+        let values = vec![
+            serde_json::json!({"type": "user", "id": "msg_ok_1", "text": "hi"}),
+            // missing `id` (required by MessageRecord)
+            serde_json::json!({"type": "assistant"}),
+            // missing `type`
+            serde_json::json!({"id": "msg_bad_2"}),
+            serde_json::json!({"type": "user", "id": "msg_ok_2", "text": "there"}),
+        ];
+        let records = decode_records(values);
+        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_ok_1", "msg_ok_2"]);
+    }
+
     // ------------------------------------------------------------
     // Integration test (opt-in): BRIDGE_IT=1 cargo test -- --ignored
     // ------------------------------------------------------------
@@ -910,15 +969,17 @@ mod tests {
 
         assert!(succeeded, "execution.succeeded within 120s (failed={failed:?})");
         let filediff = tool_successes.first().expect("saw session.tool.success with filediff");
+        let file = filediff
+            .file
+            .as_deref()
+            .expect("filediff carries the file path");
         // The write tool resolves relative paths against the project root, so
         // accept either the session dir or the project root.
         assert!(
-            filediff.file == format!("{dir}/it-test.txt")
-                || filediff.file == "/tmp/opencode/it-test.txt",
-            "written file path {} in expected location",
-            filediff.file
+            file == format!("{dir}/it-test.txt") || file == "/tmp/opencode/it-test.txt",
+            "written file path {file} in expected location"
         );
-        let content = std::fs::read_to_string(&filediff.file).expect("written file readable");
+        let content = std::fs::read_to_string(file).expect("written file readable");
         assert!(content.contains("laneA ok"), "content = {content:?}");
         // Clean up the artifact we created (and any root-level variant), then
         // the session.

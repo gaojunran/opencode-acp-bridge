@@ -1381,7 +1381,13 @@ impl AgentService {
         // view-creation scan loads the children. Best-effort: a failure or
         // an ambiguous match degrades to parent-only replay.
         let child_metas = self.discover_child_metas(&req.session_id.0, &records).await;
-        for update in replay::replay_updates(&records, self.no_aft, &child_metas, self.show_synthetic) {
+        for update in replay::replay_updates(
+            &records,
+            self.no_aft,
+            &child_metas,
+            self.show_synthetic,
+            Some(req.cwd.to_string_lossy().as_ref()),
+        ) {
             cx.send_notification(acp::SessionNotification::new(
                 req.session_id.clone(),
                 update,
@@ -2405,7 +2411,7 @@ impl AgentService {
                 serde_json::from_value::<dto::ToolMetadata>(serde_json::Value::Object(meta.clone()))
                     .ok()
             })
-            .map(|meta| crate::acp::diff::diff_blocks(&meta))
+            .map(|meta| crate::acp::diff::diff_blocks_at(&meta, Some(&state.cwd)))
             .unwrap_or_default();
         // kind + locations (official `permissionLocations`): preview paths
         // deduped → `tool_locations` → resources minus "*".

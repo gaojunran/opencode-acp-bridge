@@ -43,6 +43,7 @@ pub fn replay_updates(
     no_aft: bool,
     children: &[ReplayChildMeta],
     show_synthetic: bool,
+    cwd: Option<&str>,
 ) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
     for record in records.iter().rev() {
@@ -74,10 +75,13 @@ pub fn replay_updates(
                             Some(reasoning_ordinal),
                             no_aft,
                             children,
+                            cwd,
                         ));
                         reasoning_ordinal += 1;
                     } else {
-                        out.extend(assistant_part(part, &record.id, None, no_aft, children));
+                        out.extend(assistant_part(
+                            part, &record.id, None, no_aft, children, cwd,
+                        ));
                     }
                 }
             }
@@ -141,6 +145,7 @@ fn assistant_part(
     reasoning_ordinal: Option<u32>,
     no_aft: bool,
     children: &[ReplayChildMeta],
+    cwd: Option<&str>,
 ) -> Vec<SessionUpdate> {
     match part {
         Part::Text { text, .. } => vec![SessionUpdate::AgentMessageChunk(
@@ -159,7 +164,7 @@ fn assistant_part(
         )],
         Part::Tool { id, name, state, .. } => {
             let child = children.iter().find(|c| c.call_id == *id);
-            tool_part(id, name, state, no_aft, child)
+            tool_part(id, name, state, no_aft, child, cwd)
         }
         Part::Unknown => vec![],
     }
@@ -177,6 +182,7 @@ fn tool_part(
     state: &ToolState,
     no_aft: bool,
     child: Option<&ReplayChildMeta>,
+    cwd: Option<&str>,
 ) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
 
@@ -214,9 +220,9 @@ fn tool_part(
         ToolState::Completed { content, metadata, .. } => {
             let mut blocks: Vec<ToolCallContent> = Vec::new();
             if let Some(content) = content {
-                blocks = tool_result_blocks(content, metadata, no_aft);
+                blocks = tool_result_blocks(content, metadata, no_aft, cwd);
             } else if let Some(meta) = metadata {
-                blocks = tool_result_blocks(&[], &Some(meta.clone()), no_aft);
+                blocks = tool_result_blocks(&[], &Some(meta.clone()), no_aft, cwd);
             }
             let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
             // Release 0.8.2: single-diff results attach the file location
@@ -236,7 +242,7 @@ fn tool_part(
             // output (if any) plus the error text.
             let mut blocks: Vec<ToolCallContent> = Vec::new();
             if let Some(content) = content {
-                blocks = tool_result_blocks(content, metadata, no_aft);
+                blocks = tool_result_blocks(content, metadata, no_aft, cwd);
             }
             if let Some(msg) = &error.message {
                 blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
@@ -329,7 +335,7 @@ mod tests {
 
     #[test]
     fn replay_orders_history_and_maps_transcript() {
-        let updates = replay_updates(&fixture_records(), false, &[], false);
+        let updates = replay_updates(&fixture_records(), false, &[], false, None);
 
         // 1. Chronological order: the OLDEST user message comes first.
         let first = &updates[0];
@@ -393,18 +399,30 @@ mod tests {
     fn streaming_and_running_states_map_without_terminal_update() {
         // Streaming: raw input stays a raw JSON string (matches ToolInputEnded
         // semantics in the live path).
-        let streaming = replay_updates(&[record_with_tool(ToolState::Streaming {
-            input: r#"{"x":1}"#.into(),
-        })], false, &[], false);
+        let streaming = replay_updates(
+            &[record_with_tool(ToolState::Streaming {
+                input: r#"{"x":1}"#.into(),
+            })],
+            false,
+            &[],
+            false,
+            None,
+        );
         assert_eq!(streaming.len(), 1);
         let SessionUpdate::ToolCall(call) = &streaming[0] else { panic!() };
         assert_eq!(call.raw_input, Some(serde_json::Value::String(r#"{"x":1}"#.into())));
 
         // Running: pending call + in-progress update.
-        let running = replay_updates(&[record_with_tool(ToolState::Running {
-            input: serde_json::json!({"x": 1}),
-            metadata: None,
-        })], false, &[], false);
+        let running = replay_updates(
+            &[record_with_tool(ToolState::Running {
+                input: serde_json::json!({"x": 1}),
+                metadata: None,
+            })],
+            false,
+            &[],
+            false,
+            None,
+        );
         assert_eq!(running.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &running[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
@@ -421,7 +439,7 @@ mod tests {
             content: None,
             metadata: None,
         })];
-        let updates = replay_updates(&records, false, &[], false);
+        let updates = replay_updates(&records, false, &[], false, None);
         assert_eq!(updates.len(), 2);
         let SessionUpdate::ToolCallUpdate(u) = &updates[1] else { panic!() };
         assert_eq!(u.fields.status, Some(ToolCallStatus::Failed));
@@ -435,7 +453,7 @@ mod tests {
 
     #[test]
     fn reasoning_gets_the_official_suffixed_message_id() {
-        let updates = replay_updates(&fixture_records(), false, &[], false);
+        let updates = replay_updates(&fixture_records(), false, &[], false, None);
         // Release 0.8.5: the official `${messageId}:reasoning:${ordinal}`
         // format (live wire + replay counter) — TEXT chunks keep the bare
         // assistant message id.
@@ -515,7 +533,7 @@ mod tests {
             session_id: "ses_child_1".into(),
             entries: 5,
         }];
-        let updates = replay_updates(&records, false, &children, false);
+        let updates = replay_updates(&records, false, &children, false, None);
         assert_eq!(updates.len(), 2, "declaration + terminal");
         // Declaration carries the meta (the view-creation scan reads it HERE
         // to discover + load the child).
@@ -593,7 +611,7 @@ mod tests {
         let records = [synthetic, user];
 
         // Flag off (default): only the user record renders.
-        let off = replay_updates(&records, false, &[], false);
+        let off = replay_updates(&records, false, &[], false, None);
         assert_eq!(off.len(), 1, "synthetic skipped with the flag off");
         let SessionUpdate::UserMessageChunk(chunk) = &off[0] else {
             panic!("the single update is the user text chunk");
@@ -602,7 +620,7 @@ mod tests {
 
         // Flag on: BOTH render as user chunks (records replay newest-first:
         // the synthetic record is older, so it comes second).
-        let on = replay_updates(&records, false, &[], true);
+        let on = replay_updates(&records, false, &[], true, None);
         assert_eq!(on.len(), 2, "synthetic renders with the flag on");
         let SessionUpdate::UserMessageChunk(user_chunk) = &on[0] else {
             panic!("first update is the user text chunk");
@@ -642,7 +660,7 @@ mod tests {
             tokens: None,
             time: None,
         };
-        let updates = replay_updates(&[record], false, &[], false);
+        let updates = replay_updates(&[record], false, &[], false, None);
 
         // Text first, then exactly ONE link chunk (the two degenerate files
         // project nothing).
@@ -695,7 +713,7 @@ mod tests {
 
         // The decoded record replays as text + link, like the live user saw
         // before reload.
-        let updates = replay_updates(&[rec], false, &[], false);
+        let updates = replay_updates(&[rec], false, &[], false, None);
         assert_eq!(updates.len(), 2, "text chunk + resource link chunk");
         let SessionUpdate::UserMessageChunk(c) = &updates[1] else { panic!() };
         assert!(matches!(&c.content, ContentBlock::ResourceLink(_)));
@@ -717,13 +735,13 @@ mod tests {
             session_id: "ses_child_1".into(),
             entries: 5,
         }];
-        let updates = replay_updates(&records, false, &wrong, false);
+        let updates = replay_updates(&records, false, &wrong, false, None);
         let SessionUpdate::ToolCall(call) = &updates[0] else {
             panic!("declaration expected")
         };
         assert!(call.meta.is_none(), "unmatched call stays plain");
         // Empty children → plain too.
-        let updates = replay_updates(&records, false, &[], false);
+        let updates = replay_updates(&records, false, &[], false, None);
         let SessionUpdate::ToolCall(call) = &updates[0] else {
             panic!("declaration expected")
         };

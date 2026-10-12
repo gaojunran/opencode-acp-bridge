@@ -258,8 +258,16 @@ mod tests {
             .expect("tool success with filediff");
         let md = success.metadata.as_ref().unwrap();
         let fd = md.filediff.as_ref().unwrap();
-        assert!(fd.file.starts_with('/'), "filediff.file is absolute");
-        assert!(fd.patch.starts_with("Index: "));
+        assert!(
+            fd.file.as_deref().expect("filediff file").starts_with('/'),
+            "filediff.file is absolute"
+        );
+        assert!(
+            fd.patch
+                .as_deref()
+                .expect("filediff patch")
+                .starts_with("Index: ")
+        );
         assert_eq!(fd.additions, Some(1));
         assert!(md.title.is_some());
 

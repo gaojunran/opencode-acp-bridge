@@ -701,27 +701,48 @@ pub struct ToolMetadata {
     pub shellID: Option<String>,
 }
 
-/// One entry of `metadata.files[]` (wire shape: `filePath`, `relativePath`,
-/// `type`, `patch`, `additions`, `deletions` — live-verified from a real
-/// apply_patch capture; `movePath` exists in the dev-clone source but was
-/// NOT observed on the wire).
+/// One entry of `metadata.files[]`. Two dialects exist on the wire:
+///
+/// - **aft hoist**: `filePath` (absolute) + `relativePath` + `type`
+///   (`add`/`update`/`delete`) — live-verified from real captures.
+/// - **core** (`FileDiff.Info`, `packages/schema/src/file-diff.ts`): `file`
+///   (location-relative, absolute only for external paths) + `status`
+///   (`added`/`deleted`/`modified`) — what every core `edit`/`write`/`patch`
+///   publishes as `metadata: { files: [fileDiff(...)] }`.
+///
+/// Both carry `patch` (an `Index:`-style section) + `additions`/`deletions`;
+/// `movePath` exists in the dev-clone source but was NOT observed on the wire.
+///
+/// Release 0.8.8: every field is optional. The previous required `filePath`
+/// (aft only) made a single core-dialect record abort the WHOLE message-list
+/// decode, so `session/load` failed with "missing field `filePath`".
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
-    /// Absolute path of the file — the AUTHORITATIVE path (the diff mapping
-    /// takes it from here, never from the `Index:` header of `patch`).
-    pub file_path: String,
+    /// aft dialect: absolute path — authoritative when present (never
+    /// derived from the `Index:` header of `patch`).
+    #[serde(default)]
+    pub file_path: Option<String>,
+    /// core dialect: the entry's resource path, resolved against the
+    /// session directory by the diff mapping (the official adapter does the
+    /// same: `absolutePath(file.file, cwd)`).
+    #[serde(default)]
+    pub file: Option<String>,
     /// Project-relative path (display use).
+    #[serde(default)]
     pub relative_path: Option<String>,
-    /// Entry kind: `"add"` is wire-verified; `"delete"` is modeled from the
-    /// core source, not wire-verified. No semantics are invented beyond
-    /// these two — anything else falls back to generic reconstruction.
-    #[serde(rename = "type")]
+    /// aft dialect kind: `"add"` is wire-verified; `"delete"` is modeled
+    /// from the core source, not wire-verified.
+    #[serde(default, rename = "type")]
     pub r#type: Option<String>,
+    /// core dialect kind: `"added"` / `"deleted"` / `"modified"`.
+    #[serde(default)]
+    pub status: Option<String>,
     /// This file's own `Index:`-format patch section (same source text as
     /// the combined `metadata.diff`). Note: new files carry a trailing
     /// `-\n` line quirk.
-    pub patch: String,
+    #[serde(default)]
+    pub patch: Option<String>,
     #[serde(default)]
     pub additions: Option<u64>,
     #[serde(default)]
@@ -732,13 +753,32 @@ pub struct FileEntry {
     pub move_path: Option<String>,
 }
 
+impl FileEntry {
+    /// The entry's path in either dialect. `filePath` wins when both appear
+    /// (it is the absolute one; core's `file` is usually session-relative).
+    pub fn path(&self) -> Option<&str> {
+        self.file_path
+            .as_deref()
+            .or(self.file.as_deref())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// The entry's change kind in either dialect (`type`, then core's
+    /// `status`). Callers match on both vocabularies.
+    pub fn kind(&self) -> Option<&str> {
+        self.r#type.as_deref().or(self.status.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileDiff {
     /// Absolute path of the changed file.
-    pub file: String,
+    #[serde(default)]
+    pub file: Option<String>,
     /// Unified patch (SVN-style `Index:` header). Note: new files carry a
     /// trailing `-\n` line quirk.
-    pub patch: String,
+    #[serde(default)]
+    pub patch: Option<String>,
     #[serde(default)]
     pub additions: Option<u64>,
     #[serde(default)]
@@ -1296,8 +1336,18 @@ pub enum SessionEvent {
     FormCancelled(FormCancelled),
 }
 
-fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
-    serde_json::from_value(x.clone()).ok()
+/// Parse a known kind's payload. A failure here means dialect drift in an
+/// event the bridge believes it understands — warn instead of dropping
+/// silently (Release 0.8.8: the silent path hid the core `metadata.files[]`
+/// shape drift that broke tool cards and session/load).
+fn parse<T: serde::de::DeserializeOwned>(kind: &str, x: &Value) -> Option<T> {
+    match serde_json::from_value(x.clone()) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(kind, error = %e, "known event payload failed to decode — dropping the event");
+            None
+        }
+    }
 }
 
 /// Decode an SSE frame's `data` into a typed event. Returns `None` for kinds
@@ -1305,43 +1355,45 @@ fn parse<T: serde::de::DeserializeOwned>(x: &Value) -> Option<T> {
 /// future/unverified types) — callers must skip those silently.
 pub fn decode_event(kind: &str, data: &Value) -> Option<SessionEvent> {
     match kind {
-        "session.execution.started" => parse(data).map(SessionEvent::ExecutionStarted),
-        "session.execution.succeeded" => parse(data).map(SessionEvent::ExecutionSucceeded),
-        "session.execution.failed" => parse(data).map(SessionEvent::ExecutionFailed),
-        "session.execution.interrupted" => parse(data).map(SessionEvent::ExecutionInterrupted),
-        "permission.asked" => parse(data).map(SessionEvent::PermissionAsked),
-        "permission.replied" => parse(data).map(SessionEvent::PermissionReplied),
-        "session.step.started" => parse(data).map(SessionEvent::StepStarted),
-        "session.step.streamed" => parse(data).map(SessionEvent::StepStreamed),
-        "session.step.ended" => parse(data).map(SessionEvent::StepEnded),
-        "session.text.started" => parse(data).map(SessionEvent::TextStarted),
-        "session.text.delta" => parse(data).map(SessionEvent::TextDelta),
-        "session.text.ended" => parse(data).map(SessionEvent::TextEnded),
-        "session.reasoning.started" => parse(data).map(SessionEvent::ReasoningStarted),
-        "session.reasoning.delta" => parse(data).map(SessionEvent::ReasoningDelta),
-        "session.reasoning.ended" => parse(data).map(SessionEvent::ReasoningEnded),
-        "session.tool.input.started" => parse(data).map(SessionEvent::ToolInputStarted),
-        "session.tool.input.ended" => parse(data).map(SessionEvent::ToolInputEnded),
-        "session.tool.called" => parse(data).map(SessionEvent::ToolCalled),
-        "session.tool.progress" => parse(data).map(SessionEvent::ToolProgress),
-        "session.tool.success" => parse(data).map(SessionEvent::ToolSuccess),
-        "session.tool.failed" => parse(data).map(SessionEvent::ToolFailed),
-        "session.step.failed" => parse(data).map(SessionEvent::StepFailed),
-        "session.retry.scheduled" => parse(data).map(SessionEvent::RetryScheduled),
-        "session.compaction.started" => parse(data).map(SessionEvent::CompactionStarted),
-        "session.compaction.ended" => parse(data).map(SessionEvent::CompactionEnded),
-        "session.compaction.failed" => parse(data).map(SessionEvent::CompactionFailed),
-        "model.updated" => parse(data).map(SessionEvent::ModelUpdated),
-        "provider.updated" => parse(data).map(SessionEvent::ProviderUpdated),
-        "session.usage.updated" => parse(data).map(SessionEvent::UsageUpdated),
-        "session.renamed" => parse(data).map(SessionEvent::Renamed),
-        "session.created" => parse(data).map(SessionEvent::SessionCreated),
-        "session.agent.selected" => parse(data).map(SessionEvent::AgentSelected),
-        "session.model.selected" => parse(data).map(SessionEvent::ModelSelected),
-        "session.inbox.enqueued" => parse(data).map(SessionEvent::InboxEnqueued),
-        "form.created" => parse(data).map(SessionEvent::FormCreated),
-        "form.replied" => parse(data).map(SessionEvent::FormReplied),
-        "form.cancelled" => parse(data).map(SessionEvent::FormCancelled),
+        "session.execution.started" => parse(kind, data).map(SessionEvent::ExecutionStarted),
+        "session.execution.succeeded" => parse(kind, data).map(SessionEvent::ExecutionSucceeded),
+        "session.execution.failed" => parse(kind, data).map(SessionEvent::ExecutionFailed),
+        "session.execution.interrupted" => {
+            parse(kind, data).map(SessionEvent::ExecutionInterrupted)
+        }
+        "permission.asked" => parse(kind, data).map(SessionEvent::PermissionAsked),
+        "permission.replied" => parse(kind, data).map(SessionEvent::PermissionReplied),
+        "session.step.started" => parse(kind, data).map(SessionEvent::StepStarted),
+        "session.step.streamed" => parse(kind, data).map(SessionEvent::StepStreamed),
+        "session.step.ended" => parse(kind, data).map(SessionEvent::StepEnded),
+        "session.text.started" => parse(kind, data).map(SessionEvent::TextStarted),
+        "session.text.delta" => parse(kind, data).map(SessionEvent::TextDelta),
+        "session.text.ended" => parse(kind, data).map(SessionEvent::TextEnded),
+        "session.reasoning.started" => parse(kind, data).map(SessionEvent::ReasoningStarted),
+        "session.reasoning.delta" => parse(kind, data).map(SessionEvent::ReasoningDelta),
+        "session.reasoning.ended" => parse(kind, data).map(SessionEvent::ReasoningEnded),
+        "session.tool.input.started" => parse(kind, data).map(SessionEvent::ToolInputStarted),
+        "session.tool.input.ended" => parse(kind, data).map(SessionEvent::ToolInputEnded),
+        "session.tool.called" => parse(kind, data).map(SessionEvent::ToolCalled),
+        "session.tool.progress" => parse(kind, data).map(SessionEvent::ToolProgress),
+        "session.tool.success" => parse(kind, data).map(SessionEvent::ToolSuccess),
+        "session.tool.failed" => parse(kind, data).map(SessionEvent::ToolFailed),
+        "session.step.failed" => parse(kind, data).map(SessionEvent::StepFailed),
+        "session.retry.scheduled" => parse(kind, data).map(SessionEvent::RetryScheduled),
+        "session.compaction.started" => parse(kind, data).map(SessionEvent::CompactionStarted),
+        "session.compaction.ended" => parse(kind, data).map(SessionEvent::CompactionEnded),
+        "session.compaction.failed" => parse(kind, data).map(SessionEvent::CompactionFailed),
+        "model.updated" => parse(kind, data).map(SessionEvent::ModelUpdated),
+        "provider.updated" => parse(kind, data).map(SessionEvent::ProviderUpdated),
+        "session.usage.updated" => parse(kind, data).map(SessionEvent::UsageUpdated),
+        "session.renamed" => parse(kind, data).map(SessionEvent::Renamed),
+        "session.created" => parse(kind, data).map(SessionEvent::SessionCreated),
+        "session.agent.selected" => parse(kind, data).map(SessionEvent::AgentSelected),
+        "session.model.selected" => parse(kind, data).map(SessionEvent::ModelSelected),
+        "session.inbox.enqueued" => parse(kind, data).map(SessionEvent::InboxEnqueued),
+        "form.created" => parse(kind, data).map(SessionEvent::FormCreated),
+        "form.replied" => parse(kind, data).map(SessionEvent::FormReplied),
+        "form.cancelled" => parse(kind, data).map(SessionEvent::FormCancelled),
         _ => None,
     }
 }
@@ -1716,8 +1768,16 @@ mod tests {
                 if let Part::Tool { state: ToolState::Completed { metadata, .. }, .. } = part {
                     let meta = metadata.as_ref().expect("completed tool has metadata");
                     let fd = meta.filediff.as_ref().expect("filediff present");
-                    assert!(fd.patch.starts_with("Index: "));
-                    assert!(fd.file.starts_with('/'), "file is absolute");
+                    assert!(
+                        fd.patch
+                            .as_deref()
+                            .expect("filediff patch")
+                            .starts_with("Index: ")
+                    );
+                    assert!(
+                        fd.file.as_deref().expect("filediff file").starts_with('/'),
+                        "file is absolute"
+                    );
                     assert!(meta.title.is_some());
                     found = true;
                 }
@@ -1802,10 +1862,19 @@ mod tests {
         let files = patch_meta.files.as_ref().expect("apply_patch files[] present");
         assert_eq!(files.len(), 1);
         let entry = &files[0];
-        assert_eq!(entry.file_path, "/tmp/opencode/aft-probe/added.txt");
+        assert_eq!(
+            entry.file_path.as_deref(),
+            Some("/tmp/opencode/aft-probe/added.txt")
+        );
         assert_eq!(entry.relative_path.as_deref(), Some(".aft-probe/added.txt"));
         assert_eq!(entry.r#type.as_deref(), Some("add"));
-        assert!(entry.patch.starts_with("Index: /tmp/opencode/aft-probe/added.txt"));
+        assert!(
+            entry
+                .patch
+                .as_deref()
+                .expect("entry patch")
+                .starts_with("Index: /tmp/opencode/aft-probe/added.txt")
+        );
         assert_eq!(entry.additions, Some(1));
         assert_eq!(entry.deletions, Some(0));
         assert_eq!(entry.move_path, None, "movePath not on the wire");

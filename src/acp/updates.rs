@@ -1388,7 +1388,8 @@ fn to_tool_updates(
                 }
             }
             if let Some(content) = &t.content {
-                let blocks = tool_result_blocks(content, &t.metadata, state.no_aft);
+                let blocks =
+                    tool_result_blocks(content, &t.metadata, state.no_aft, Some(&state.cwd));
                 if let Some(loc) = single_diff_location(&blocks) {
                     fields = fields.locations(vec![loc]);
                 }
@@ -1396,7 +1397,8 @@ fn to_tool_updates(
             } else if let Some(meta) = &t.metadata {
                 // Content-less success (e.g. progress-only tools) may still
                 // carry diffs — never drop the file changes.
-                let blocks = tool_result_blocks(&[], &Some(meta.clone()), state.no_aft);
+                let blocks =
+                    tool_result_blocks(&[], &Some(meta.clone()), state.no_aft, Some(&state.cwd));
                 if !blocks.is_empty() {
                     if let Some(loc) = single_diff_location(&blocks) {
                         fields = fields.locations(vec![loc]);
@@ -1491,7 +1493,7 @@ fn to_tool_updates(
             let mut blocks = t
                 .content
                 .as_ref()
-                .map(|c| tool_result_blocks(c, &t.metadata, state.no_aft))
+                .map(|c| tool_result_blocks(c, &t.metadata, state.no_aft, Some(&state.cwd)))
                 .unwrap_or_default();
             blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
                 message.clone(),
@@ -1869,6 +1871,7 @@ pub fn tool_result_blocks(
     content: &[ToolContent],
     metadata: &Option<ToolMetadata>,
     no_aft: bool,
+    cwd: Option<&str>,
 ) -> Vec<ToolCallContent> {
     let mut blocks: Vec<ToolCallContent> = Vec::new();
     for part in content {
@@ -1884,7 +1887,7 @@ pub fn tool_result_blocks(
         }
     }
     if let Some(meta) = metadata {
-        blocks.extend(diff::diff_blocks(meta));
+        blocks.extend(diff::diff_blocks_at(meta, cwd));
     }
     blocks
 }
@@ -2105,10 +2108,12 @@ mod tests {
     fn locations_follow_the_exactly_one_diff_rule() {
         fn entry(path: &str, body: &str) -> dto::FileEntry {
             dto::FileEntry {
-                file_path: path.into(),
+                file_path: Some(path.into()),
+                file: None,
                 relative_path: None,
                 r#type: Some("add".into()),
-                patch: format!("Index: {path}\n===\n@@ -0,0 +1 @@\n+{body}\n"),
+                status: None,
+                patch: Some(format!("Index: {path}\n===\n@@ -0,0 +1 @@\n+{body}\n")),
                 additions: Some(1),
                 deletions: Some(0),
                 move_path: None,

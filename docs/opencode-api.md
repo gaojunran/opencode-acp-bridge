@@ -306,6 +306,12 @@ Heterogeneous array, discriminated by `type`, **newest first**:
 - `{"type": "<execution outcome>", "id", "outcome", "time"}` — outcome records
 - `{"type": "<model switch>", "id", "model", "previous"?, "time"}`
 
+**Decode tolerance (Release 0.8.8)**: the bridge decodes records ONE BY ONE —
+a record it cannot map (dialect drift) is skipped with a warning carrying its
+`id`/`type` and the serde error, and the rest of the history still replays.
+Before this a single unmappable record aborted the whole response, so
+`session/load` failed outright with e.g. `missing field \`filePath\``.
+
 ### Parts (assistant `content[]`)
 
 - `{"type":"text", "text":…, "time":{…}}`
@@ -336,15 +342,21 @@ Heterogeneous array, discriminated by `type`, **newest first**:
 - `filediff.file` is an **absolute** path. `patch` is an SVN-style `Index:` header +
   unified diff (note: trailing `-\n` quirk observed for new files).
 - `title` is a display title for the tool call (use for ACP tool_call title).
-- apply_patch (core 2.0.21, live-verified): **no `filediff`**; emits
-  `metadata.diff` (combined `Index:`-format string) + `metadata.files[]`
-  (`{filePath, relativePath, type, patch, additions, deletions}` per file —
-  the dev-clone array shape DOES appear here, alongside the combined string).
-  `edit`/`write` emit `filediff` instead (edit live-verified, write verified
-  since Wave 0). The bridge's diff priority chain for apply_patch:
-  **`files[]` (structured — `filePath` authoritative) → combined `diff`
-  string fallback**; `files[]` present ⇒ authoritative, the string is never
-  consulted (per-entry failures skip only that entry).
+- apply_patch: **no `filediff`**; emits `metadata.diff` (combined `Index:`-format
+  string) + `metadata.files[]`, one entry per file. TWO entry dialects exist and
+  the bridge accepts both (Release 0.8.8):
+  - **aft hoist**: `{filePath (absolute), relativePath, type, patch,
+    additions, deletions}` — live-verified against an aft-active server.
+  - **core `FileDiff.Info`** (`packages/schema/src/file-diff.ts`, identical
+    2.0.21 → 2.0.27): `{file, patch, additions, deletions, status}` with
+    `status` ∈ added/deleted/modified — what core `edit`/`write`/`patch`
+    publish as `metadata: { files: [fileDiff(...)] }`. Core's `file` is
+    **location-relative**, so the bridge resolves it against the session
+    directory (official parity: `absolutePath(file.file, cwd)`).
+  The bridge's diff priority chain is **`files[]` (structured) → combined
+  `diff` string fallback**; `files[]` present ⇒ authoritative, the string is
+  never consulted (per-entry failures skip only that entry — an entry with
+  neither path nor patch is skipped too, never fatal).
 
 ## Turn flow for the bridge (prompt)
 

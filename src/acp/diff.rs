@@ -1,17 +1,20 @@
 //! #52636 diff-fix: `dto::ToolMetadata` → ACP `ToolCallContent::Diff` blocks.
 //!
 //! The 2.0.21 wire carries file changes in `session.tool.success` /
-//! persisted completed-tool metadata. Priority chain (dialect-neutral —
-//! core and the aft hoist share every shape):
+//! persisted completed-tool metadata. Priority chain:
 //!
 //! 1. `metadata.filediff` — `{file: <absolute path>, patch: <unified diff>, ...}`
-//! 2. `metadata.files[]` — one per file: `{filePath, relativePath, type,
-//!    patch, additions, deletions}`; `filePath` is authoritative (never
-//!    derived from the patch text) and each entry's `patch` is its own
-//!    `Index:` section. Present ⇒ authoritative: a failing entry is
-//!    skipped with a warning, there is NO fallback to the combined string.
+//! 2. `metadata.files[]` — one per file. TWO dialects: the aft hoist's
+//!    `{filePath (absolute), relativePath, type}` and core's `FileDiff.Info`
+//!    `{file (session-relative), status}`; both carry `patch`. Present ⇒
+//!    authoritative: a failing entry is skipped with a warning, there is NO
+//!    fallback to the combined string.
 //! 3. `metadata.diff` — the combined patch as a single string (fallback;
 //!    may contain several `Index:` sections for multi-file tools).
+//!
+//! Relative entry paths (the core dialect's `file` is location-relative)
+//! resolve against the session directory — official parity with
+//! `absolutePath(file.file, cwd)`.
 //!
 //! `patch` is an SVN-style unified diff with an `Index: <path>` header. Real
 //! fixture quirk: **new files end with a stray `-\n` line** (a phantom empty
@@ -46,33 +49,53 @@ impl From<ParsedDiff> for Diff {
 /// Priority chain (see module docs): `filediff` → `files[]` (authoritative
 /// when present) → combined `diff` string. Unparseable patches are skipped
 /// with a warning — never an error, never a whole-metadata fallback.
+///
+/// Relative entry paths are left as-is; use [`diff_blocks_at`] when the
+/// session directory is known (the core dialect needs it).
 pub fn diff_blocks(meta: &ToolMetadata) -> Vec<ToolCallContent> {
+    diff_blocks_at(meta, None)
+}
+
+/// [`diff_blocks`] with the session directory available: core-dialect entry
+/// paths (`file`, location-relative) resolve against `cwd`, matching the
+/// official adapter's `absolutePath(file.file, cwd)`.
+pub fn diff_blocks_at(meta: &ToolMetadata, cwd: Option<&str>) -> Vec<ToolCallContent> {
     let mut out = Vec::new();
 
-    match &meta.filediff {
-        // Primary: structured single-file diff. `file` is authoritative even
-        // if the embedded `Index:` header disagrees.
-        Some(fd) => match parse_patch(&fd.patch, Some(&fd.file)) {
+    // Level ①: structured single-file diff. `file` is authoritative even if
+    // the embedded `Index:` header disagrees. Release 0.8.8: an incomplete
+    // `filediff` (dialect drift) falls through to the newer levels instead
+    // of decoding away the whole record.
+    let single = meta
+        .filediff
+        .as_ref()
+        .and_then(|fd| match (&fd.file, &fd.patch) {
+            (Some(file), Some(patch)) => Some((file.as_str(), patch.as_str())),
+            _ => {
+                warn!("filediff entry is missing `file`/`patch` — falling through to files[]/diff");
+                None
+            }
+        });
+
+    if let Some((file, patch)) = single {
+        match parse_patch(patch, Some(file)) {
             Ok(diffs) => out.extend(diffs),
-            Err(e) => warn!(file = %fd.file, error = %e, "tool diff parse failed (filediff), skipping"),
-        },
-        None => {
-            // Level ②: structured `files[]` — authoritative when present;
-            // per-entry failure skips ONLY that entry (see module docs).
-            if let Some(files) = &meta.files
-                && !files.is_empty()
-            {
-                return diff_blocks_from_files(files);
+            Err(e) => {
+                warn!(file = %file, error = %e, "tool diff parse failed (filediff), skipping")
             }
-            // Level ③: fallback — parse the combined `diff` string section
-            // by section.
-            let Some(diff) = &meta.diff else {
-                return Vec::new();
-            };
-            match parse_patch(diff, None) {
-                Ok(diffs) => out.extend(diffs),
-                Err(e) => warn!(error = %e, "tool diff parse failed (fallback diff), skipping"),
-            }
+        }
+    } else if let Some(files) = &meta.files
+        && !files.is_empty()
+    {
+        // Level ②: structured `files[]` — authoritative when present;
+        // per-entry failure skips ONLY that entry (see module docs).
+        return diff_blocks_from_files(files, cwd);
+    } else if let Some(diff) = &meta.diff {
+        // Level ③: fallback — parse the combined `diff` string section
+        // by section.
+        match parse_patch(diff, None) {
+            Ok(diffs) => out.extend(diffs),
+            Err(e) => warn!(error = %e, "tool diff parse failed (fallback diff), skipping"),
         }
     }
 
@@ -81,19 +104,32 @@ pub fn diff_blocks(meta: &ToolMetadata) -> Vec<ToolCallContent> {
 
 /// Level ②: map `metadata.files[]` to diff blocks.
 ///
-/// `filePath` is the authoritative path — never derived from the patch
-/// text. Each entry's `patch` is its own `Index:` section (the header line
-/// is stripped, the body feeds the shared hunk parser). Entry semantics:
-/// `type = "add"` (wire-verified) drops the old side entirely;
-/// `type = "delete"` (modeled from the core source, not wire-verified)
-/// empties the new side; any other value uses the generic reconstruction
-/// from the patch body. `move_path` is deliberately ignored (not observed
-/// on the wire). Entry-level isolation: a failing entry is skipped with a
-/// warning; the remaining entries still map.
-fn diff_blocks_from_files(files: &[crate::dto::FileEntry]) -> Vec<ToolCallContent> {
+/// `filePath` (aft, absolute) is authoritative when present; otherwise the
+/// entry's `file` (core, session-relative) anchors the diff. Each entry's
+/// `patch` is its own `Index:` section (the header line is stripped, the
+/// body feeds the shared hunk parser). Entry semantics, both vocabularies:
+/// `add`/`added` drops the old side entirely; `delete`/`deleted` empties the
+/// new side; any other value uses the generic reconstruction from the patch
+/// body. `move_path` is deliberately ignored (not observed on the wire).
+/// Entry-level isolation: an entry without a path, without a patch, or with
+/// an unparseable patch is skipped with a warning; the remaining entries
+/// still map.
+fn diff_blocks_from_files(
+    files: &[crate::dto::FileEntry],
+    cwd: Option<&str>,
+) -> Vec<ToolCallContent> {
     let mut out = Vec::new();
     for entry in files {
-        let lines: Vec<&str> = entry.patch.lines().collect();
+        let Some(path) = entry.path() else {
+            warn!("files[] entry carries neither `filePath` (aft) nor `file` (core) — skipping");
+            continue;
+        };
+        let Some(patch) = entry.patch.as_deref() else {
+            warn!(file = %path, "files[] entry has no `patch` — skipping");
+            continue;
+        };
+        let resolved = resolve_entry_path(path, cwd);
+        let lines: Vec<&str> = patch.lines().collect();
         // The entry patch is a single `Index:` section: drop the header
         // line, feed the rest to the shared hunk parser. Lacking a header
         // (never seen on the wire), the whole patch is the body.
@@ -101,24 +137,37 @@ fn diff_blocks_from_files(files: &[crate::dto::FileEntry]) -> Vec<ToolCallConten
             Some(l) if l.starts_with("Index: ") => &lines[1..],
             _ => &lines,
         };
-        match parse_section(&entry.file_path, body) {
+        match parse_section(&resolved, body) {
             Ok(Some(mut d)) => {
-                match entry.r#type.as_deref() {
-                    Some("add") => d.old_text = None,
-                    Some("delete") => d.new_text = String::new(),
+                match entry.kind() {
+                    Some("add" | "added") => d.old_text = None,
+                    Some("delete" | "deleted") => d.new_text = String::new(),
                     _ => {}
                 }
                 out.push(ToolCallContent::Diff(d.into()));
             }
-            Ok(None) => warn!(file = %entry.file_path, "files[] entry has no hunks — skipping"),
+            Ok(None) => warn!(file = %resolved, "files[] entry has no hunks — skipping"),
             Err(e) => warn!(
-                file = %entry.file_path,
+                file = %resolved,
                 error = %e,
                 "files[] entry parse failed — skipping"
             ),
         }
     }
     out
+}
+
+/// The aft dialect's `filePath` is absolute; the core dialect's `file` is
+/// location-relative (absolute only for external paths). Anchor relative
+/// paths at the session directory — official parity, `absolutePath(file, cwd)`.
+fn resolve_entry_path(path: &str, cwd: Option<&str>) -> String {
+    let path = PathBuf::from(path);
+    match cwd {
+        Some(dir) if path.is_relative() => {
+            PathBuf::from(dir).join(path).to_string_lossy().into_owned()
+        }
+        _ => path.to_string_lossy().into_owned(),
+    }
 }
 
 /// A parsed per-file diff, ready to become an ACP `Diff` block.
@@ -349,8 +398,8 @@ mod tests {
         let meta = ToolMetadata {
             diff: Some(FIXTURE_PATCH.to_string()),
             filediff: Some(FileDiff {
-                file: "/tmp/opencode/hello-acp-test.txt".into(),
-                patch: FIXTURE_PATCH.to_string(),
+                file: Some("/tmp/opencode/hello-acp-test.txt".into()),
+                patch: Some(FIXTURE_PATCH.to_string()),
                 additions: Some(1),
                 deletions: Some(0),
             }),
@@ -688,19 +737,23 @@ mod tests {
     /// (tests/fixtures/aft-tool-turn.sse): `type: "add"`, single-file.
     fn fixture_entry() -> FileEntry {
         FileEntry {
-            file_path: "/tmp/opencode/aft-probe/added.txt".into(),
+            file_path: Some("/tmp/opencode/aft-probe/added.txt".into()),
+            file: None,
             relative_path: Some(".aft-probe/added.txt".into()),
             r#type: Some("add".into()),
-            patch: "Index: /tmp/opencode/aft-probe/added.txt\n\
+            status: None,
+            patch: Some(
+                "Index: /tmp/opencode/aft-probe/added.txt\n\
 				   ===================================================================\n\
 				   --- /tmp/opencode/aft-probe/added.txt\n\
 				   +++ /tmp/opencode/aft-probe/added.txt\n\
 				   @@ -0,0 +1 @@\n\
 				   +patched ok\n"
-                .lines()
-                .map(|l| l.trim_start())
-                .collect::<Vec<_>>()
-                .join("\n"),
+                    .lines()
+                    .map(|l| l.trim_start())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             additions: Some(1),
             deletions: Some(0),
             move_path: None,
@@ -776,7 +829,7 @@ mod tests {
             filediff: None,
             files: Some(vec![FileEntry {
                 // Garbage patch: a hunk header that is not a hunk header.
-                patch: "Index: /bad.txt\nnot a diff at all\n@@nope\n".into(),
+                patch: Some("Index: /bad.txt\nnot a diff at all\n@@nope\n".into()),
                 ..fixture_entry()
             }]),
             title: None,
@@ -794,8 +847,8 @@ mod tests {
     fn malformed_entry_skips_only_itself() {
         let good = fixture_entry();
         let bad = FileEntry {
-            file_path: "/tmp/bad.txt".into(),
-            patch: "Index: /tmp/bad.txt\nno hunks here\n".into(),
+            file_path: Some("/tmp/bad.txt".into()),
+            patch: Some("Index: /tmp/bad.txt\nno hunks here\n".into()),
             ..fixture_entry()
         };
         let meta = ToolMetadata {
@@ -813,5 +866,100 @@ mod tests {
             panic!("expected a Diff block");
         };
         assert_eq!(d.path, PathBuf::from("/tmp/opencode/aft-probe/added.txt"));
+    }
+
+    /// Release 0.8.8: the CORE dialect (`FileDiff.Info` — `file` + `status`,
+    /// NO `filePath`) decodes, and the session-relative `file` resolves
+    /// against the session directory (official parity:
+    /// `absolutePath(file.file, cwd)`). Before this, one such persisted entry
+    /// aborted the entire message-list decode — `session/load` died with
+    /// `missing field \`filePath\``.
+    #[test]
+    fn core_dialect_entry_decodes_and_resolves_against_cwd() {
+        let meta: ToolMetadata = serde_json::from_value(serde_json::json!({
+            "files": [{
+                "file": "src/added.txt",
+                "patch": "Index: /proj/src/added.txt\n===\n--- /proj/src/added.txt\n+++ /proj/src/added.txt\n@@ -0,0 +1 @@\n+core ok\n",
+                "additions": 1,
+                "deletions": 0,
+                "status": "added",
+            }],
+        }))
+        .expect("core-dialect metadata must decode");
+
+        let blocks = diff_blocks_at(&meta, Some("/proj"));
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/proj/src/added.txt"));
+        assert!(d.old_text.is_none(), "status=added drops the old side");
+        assert_eq!(d.new_text, "core ok\n");
+
+        // Without a session directory the relative path stays as the wire
+        // gave it (never guessed).
+        let blocks = diff_blocks(&meta);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("src/added.txt"));
+
+        // `status: "deleted"` empties the new side (both vocabularies).
+        let meta: ToolMetadata = serde_json::from_value(serde_json::json!({
+            "files": [{
+                "file": "/proj/gone.txt",
+                "patch": "Index: /proj/gone.txt\n===\n--- /proj/gone.txt\n+++ /proj/gone.txt\n@@ -1 +0,0 @@\n-bye\n",
+                "status": "deleted",
+            }],
+        }))
+        .expect("core-dialect delete entry must decode");
+        let blocks = diff_blocks(&meta);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.new_text, "", "status=deleted empties the new side");
+    }
+
+    /// Release 0.8.8: an entry the bridge cannot read at all (no path in
+    /// either dialect, or no patch) is skipped — never fatal, and the sibling
+    /// entry still maps.
+    #[test]
+    fn unreadable_entries_are_skipped_not_fatal() {
+        let meta: ToolMetadata = serde_json::from_value(serde_json::json!({
+            "files": [
+                {},
+                { "file": "/proj/no-patch.txt" },
+                { "filePath": "/proj/ok.txt", "type": "add",
+                  "patch": "Index: /proj/ok.txt\n===\n@@ -0,0 +1 @@\n+fine\n" },
+            ],
+        }))
+        .expect("unreadable entries must not fail the decode");
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1, "only the readable entry maps");
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/proj/ok.txt"));
+    }
+
+    /// Release 0.8.8: an incomplete `filediff` (dialect drift) falls through
+    /// to `files[]`/`diff` instead of decoding the record away.
+    #[test]
+    fn incomplete_filediff_falls_through_to_the_newer_levels() {
+        let meta: ToolMetadata = serde_json::from_value(serde_json::json!({
+            "filediff": { "file": "/proj/only-file.txt" },
+            "files": [{
+                "filePath": "/proj/from-files.txt",
+                "type": "add",
+                "patch": "Index: /proj/from-files.txt\n===\n@@ -0,0 +1 @@\n+level two\n",
+            }],
+        }))
+        .expect("incomplete filediff must not fail the decode");
+        let blocks = diff_blocks(&meta);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Diff(d) = &blocks[0] else {
+            panic!("expected a Diff block");
+        };
+        assert_eq!(d.path, PathBuf::from("/proj/from-files.txt"));
     }
 }
