@@ -707,8 +707,10 @@ pub struct ToolMetadata {
 ///   (`add`/`update`/`delete`) — live-verified from real captures.
 /// - **core** (`FileDiff.Info`, `packages/schema/src/file-diff.ts`): `file`
 ///   (location-relative, absolute only for external paths) + `status`
-///   (`added`/`deleted`/`modified`) — what every core `edit`/`write`/`patch`
-///   publishes as `metadata: { files: [fileDiff(...)] }`.
+///   (`added`/`deleted`/`modified`) — what core `edit`/`patch` publish as
+///   `metadata: { files: [fileDiff(...)] }` (core `write` publishes NO
+///   result metadata — its `fileDiff` exists only in the permission-preview
+///   metadata).
 ///
 /// Both carry `patch` (an `Index:`-style section) + `additions`/`deletions`;
 /// `movePath` exists in the dev-clone source but was NOT observed on the wire.

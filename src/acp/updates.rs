@@ -549,9 +549,10 @@ pub const SUBAGENT_META_KEY: &str = "subagent_session_info";
 
 /// Tool names that spawn child sessions on the wire: `task` (stock
 /// opencode 2.0.21) and `subagent` (the aliased name on the bridge's
-/// production server — wire-verified in both captures).
+/// production server — wire-verified in both captures). Case-insensitive
+/// like [`tool_kind`] / [`tool_locations`] / [`is_shell`] (Release 0.8.9).
 pub fn is_spawner_name(name: &str) -> bool {
-    matches!(name, "task" | "subagent")
+    matches!(name.to_ascii_lowercase().as_str(), "task" | "subagent")
 }
 
 /// Release 0.7.1: the display title for a subagent-SPAWNER tool call.
@@ -1752,7 +1753,7 @@ pub fn shell_terminal(state: &MappingState, id: &str, name: &str) -> Option<Term
 /// ?? input.cmd` for shell tools (the terminal header shows the command).
 /// `None` when the tool is not a shell or no command is on hand (the
 /// update then keeps the title the client already has).
-fn shell_command_title(name: &str, input: &serde_json::Value) -> Option<String> {
+pub(crate) fn shell_command_title(name: &str, input: &serde_json::Value) -> Option<String> {
     if !is_shell(name) {
         return None;
     }
@@ -1843,17 +1844,45 @@ pub fn tool_locations(name: &str, input: &serde_json::Value, cwd: &str) -> Vec<T
 /// skipped rather than guessed. `--no-aft` disables the whole mapping.
 fn image_content_block(part: &dto::ToolContent, no_aft: bool) -> Option<ToolCallContent> {
     if no_aft {
+        // `--no-aft` explicitly disables this mapping — stay silent.
         return None;
     }
     let dto::ToolContent::File { uri, mime } = part else {
         return None;
     };
-    let mime_type = mime.as_deref()?;
+    // Truncated prefix ONLY — the payload may be huge; never log the whole
+    // data URI. char-take avoids mid-UTF8 byte slices on exotic uris.
+    let uri_prefix: String = uri.chars().take(40).collect();
+    let Some(mime_type) = mime.as_deref() else {
+        tracing::warn!(
+            mime = ?mime,
+            uri_prefix,
+            "file content block skipped: missing mime"
+        );
+        return None;
+    };
     if !mime_type.starts_with("image/") {
+        tracing::warn!(
+            mime = mime_type,
+            uri_prefix,
+            "file content block skipped: non-image mime (only image/* maps)"
+        );
         return None;
     }
-    let (prefix, payload) = uri.split_once(";base64,")?;
+    let Some((prefix, payload)) = uri.split_once(";base64,") else {
+        tracing::warn!(
+            mime = mime_type,
+            uri_prefix,
+            "file content block skipped: uri is not a base64 data-URI"
+        );
+        return None;
+    };
     if !prefix.starts_with("data:") {
+        tracing::warn!(
+            mime = mime_type,
+            uri_prefix,
+            "file content block skipped: uri does not start with data:"
+        );
         return None;
     }
     Some(ToolCallContent::from(ContentBlock::Image(
@@ -1883,7 +1912,14 @@ pub fn tool_result_blocks(
                     blocks.push(block);
                 }
             }
-            ToolContent::Unknown => {}
+            ToolContent::Unknown => {
+                // Release 0.8.9: the `serde(other)` catch-all — never
+                // mapped (official adapter drops it too), but silence hid
+                // future dialects; log what we threw away.
+                tracing::warn!(
+                    "unrecognized tool result content block variant dropped (serde(other))"
+                );
+            }
         }
     }
     if let Some(meta) = metadata {
@@ -2098,6 +2134,164 @@ mod tests {
             })
             .collect();
         assert_eq!(usage_values, vec![(31_365, 168_000), (31_395, 168_000)]);
+    }
+
+    /// Release 0.8.9: the CORE 2.0.22 dialects — SYNTHESIZED FROM CORE
+    /// 2.0.22 SOURCE SHAPES (no core-only live capture yet; see
+    /// `tests/fixtures/README.md`): core `write` produces no result
+    /// metadata (text only), core `edit`/`patch` publish
+    /// `metadata.files[]` (FileDiff.Info; `file` resolves against the
+    /// session cwd), core `read` emits `{type:"file",uri,mime}` for
+    /// images AND PDFs (the latter is skipped — logged, never mapped),
+    /// unknown shell metadata keys decode fine, and `session.tool.failed`
+    /// maps like the live errorToolUpdate.
+    #[test]
+    fn core_v2_dialect_shapes_map_through_the_live_chain() {
+        let raw = include_str!("../../tests/fixtures/core-v2-tool-turn.sse");
+        let mut events = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") || line == "data: " {
+                continue;
+            }
+            let env: dto::EventEnvelope =
+                serde_json::from_str(&line[6..]).expect("envelope parses");
+            if let Some(ev) = dto::decode_event(&env.kind, &env.data) {
+                events.push(ev);
+            }
+        }
+        let mut state = MappingState::new().with_cwd("/home/dev/proj");
+        let updates: Vec<SessionUpdate> = events
+            .iter()
+            .flat_map(|e| to_updates(e, &mut state))
+            .collect();
+        let terminal = |call: &str| -> &ToolCallUpdate {
+            updates
+                .iter()
+                .rev()
+                .filter_map(|u| match u {
+                    SessionUpdate::ToolCallUpdate(t) => Some(t),
+                    _ => None,
+                })
+                .find(|t| t.tool_call_id.0.as_ref() == call)
+                .unwrap_or_else(|| panic!("no update for {call}"))
+        };
+        fn diff_of(t: &ToolCallUpdate) -> Vec<&acp::Diff> {
+            t.fields
+                .content
+                .as_ref()
+                .map(|bs| {
+                    bs.iter()
+                        .filter_map(|b| match b {
+                            ToolCallContent::Diff(d) => Some(d),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        // (a) write: NO metadata → text only, no diff, no locations.
+        let w = terminal("call_c1");
+        assert_eq!(w.fields.status, Some(acp::ToolCallStatus::Completed));
+        let diffs = diff_of(w);
+        assert!(
+            diffs.is_empty(),
+            "core write publishes no metadata ⇒ no diff"
+        );
+        assert!(w.fields.locations.is_none(), "no diff ⇒ no locations");
+        assert!(
+            w.fields.title.is_none(),
+            "completed carries no title (keeps the tool name)"
+        );
+
+        // (b) edit: files[] (relative `file`) → ONE diff, absolute path.
+        let e = terminal("call_c2");
+        let diffs = diff_of(e);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].path.to_string_lossy(),
+            "/home/dev/proj/src/foo.ts",
+            "relative FileDiff.Info.file resolves against the session cwd"
+        );
+        assert_eq!(diffs[0].old_text.as_deref(), Some("old\n"));
+        assert_eq!(diffs[0].new_text, "new\nextra\n");
+        let locs = e.fields.locations.as_ref().expect("one diff ⇒ locations");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path.to_string_lossy(), "/home/dev/proj/src/foo.ts");
+
+        // (c) patch: status:"added" → empty old side (new-file semantics).
+        let p = terminal("call_c3");
+        let diffs = diff_of(p);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].old_text, None,
+            "added ⇒ old_text is None (ACP contract)"
+        );
+        assert_eq!(diffs[0].new_text, "a\nb\n");
+
+        // (d) read text: no diff; a {type:"file"} image part maps to an
+        //     Image block, a PDF part does NOT (mapped to nothing, no
+        //     panic — only a log line).
+        let r = terminal("call_c4");
+        assert!(diff_of(r).is_empty());
+        let img = terminal("call_c5");
+        let blocks = img.fields.content.as_ref().expect("content");
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Content(c) = &blocks[0] else {
+            panic!("image read must map to an Image content block")
+        };
+        let ContentBlock::Image(image) = &c.content else {
+            panic!("image read must map to an Image content block")
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert!(
+            image
+                .uri
+                .as_ref()
+                .is_some_and(|u| u.starts_with("data:image/png;base64,"))
+        );
+        assert_eq!(
+            image.data,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        );
+        let pdf = terminal("call_c6");
+        let blocks = pdf.fields.content.as_ref().expect("content");
+        assert!(
+            blocks.iter().all(|b| {
+                !matches!(b, ToolCallContent::Content(c) if matches!(&c.content, ContentBlock::Image(_)))
+            }),
+            "PDF file part must NOT map to an Image block"
+        );
+        assert!(diff_of(pdf).is_empty());
+
+        // (e) shell: completed; unknown metadata keys (outputPath) decode
+        //     without failure; text block preserved.
+        let sh = terminal("call_c7");
+        assert_eq!(sh.fields.status, Some(acp::ToolCallStatus::Completed));
+        let blocks = sh.fields.content.as_ref().expect("content");
+        let ToolCallContent::Content(c) = &blocks[0] else {
+            panic!("shell output must map to a text block")
+        };
+        let ContentBlock::Text(text) = &c.content else {
+            panic!("shell output must map to a text block")
+        };
+        assert_eq!(text.text, "total 42");
+
+        // (f) tool.failed: kind + error text block + rawOutput.error.
+        let f = terminal("call_c8");
+        assert_eq!(f.fields.status, Some(acp::ToolCallStatus::Failed));
+        assert_eq!(f.fields.kind, Some(acp::ToolKind::Edit));
+        let blocks = f.fields.content.as_ref().expect("content");
+        let ToolCallContent::Content(c) = blocks.last().unwrap() else {
+            panic!("last block must be the error text")
+        };
+        let ContentBlock::Text(last) = &c.content else {
+            panic!("last block must be the error text")
+        };
+        assert_eq!(last.text, "The user declined this tool call");
+        let raw = f.fields.raw_output.as_ref().expect("rawOutput");
+        assert_eq!(raw["error"], "The user declined this tool call");
     }
 
     /// Direct ToolMetadata construction (no fixture): `files[]` with ONE
@@ -2983,6 +3177,41 @@ mod tests {
         // directly (their input.started arm emits nothing).
         assert_eq!(tool_kind("task"), acp::ToolKind::Think);
         assert_eq!(tool_kind("subagent"), acp::ToolKind::Think);
+    }
+
+    /// Release 0.8.9: the spawner check is case-insensitive like the other
+    /// tool-name lanes (`tool_kind` / `tool_locations` / `is_shell`) —
+    /// "TASK"/"SUBAGENT" keep the full spawner semantics (kind=Think;
+    /// the pairing/title chains all gate on this predicate).
+    #[test]
+    fn spawner_name_check_is_case_insensitive() {
+        for name in ["task", "TASK", "Task", "subagent", "SUBAGENT", "SuBaGeNt"] {
+            assert!(is_spawner_name(name), "{name} is a spawner");
+            assert_eq!(tool_kind(name), acp::ToolKind::Think, "kind for {name}");
+        }
+        for name in ["tasky", "subagentx", "read", "bash", ""] {
+            assert!(!is_spawner_name(name), "{name} is not a spawner");
+        }
+        // The full spawner path (kind on the input.ended declaration;
+        // input.started registers the title, emits nothing).
+        let mut state = MappingState::new();
+        let started = dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+            base: tool_ref("ses_x", "msg_x", "call_tsk"),
+            name: "TASK".into(),
+        });
+        assert!(
+            to_updates(&started, &mut state).is_empty(),
+            "spawner input.started emits nothing"
+        );
+        let ended = dto::SessionEvent::ToolInputEnded(dto::ToolInputEnded {
+            base: tool_ref("ses_x", "msg_x", "call_tsk"),
+            text: "{\"agent\":\"explorer\"}".into(),
+        });
+        let updates = to_updates(&ended, &mut state);
+        let SessionUpdate::ToolCall(c) = &updates[0] else {
+            panic!("upper-case task must declare at input.ended")
+        };
+        assert_eq!(c.kind, acp::ToolKind::Think, "declared with Think");
     }
 
     /// Release 0.8.4: the running update derives `locations` from the tool

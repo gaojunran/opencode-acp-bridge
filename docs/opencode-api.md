@@ -404,13 +404,21 @@ The cortexkit/aft plugin replaces the registered tool implementations
 stream is unchanged, but successful tool calls may carry aft-shaped payloads.
 Verified against a live aft-enabled server (fixtures:
 `tests/fixtures/aft-tool-turn.sse` — read/edit/apply_patch turn;
-`tests/fixtures/aft-image-read.sse` — image read):
+`tests/fixtures/aft-image-read.sse` — image read).
 
-| shape | aft | core (2.0.21) | bridge handling |
+**Provenance caveat**: the "core" column below is NOT backed by a core-only
+live capture. Every capture so far ran with the aft plugin active
+(`sse-tool-turn.sse` carries `rpc.aft.statusInvalidated` /
+`rpc.aft.indexProgress` frames — proof the plugin was live); the core-side
+facts are source-level only (core 2.0.22 `write.ts` / `edit.ts` / `patch.ts` /
+`read.ts`, `packages/schema/src/file-diff.ts`). See `tests/fixtures/README.md`.
+
+| shape | aft | core (2.0.22, source-verified) | bridge handling |
 |---|---|---|---|
-| `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit | present for edit/write (live-verified) | primary diff source (unchanged) |
-| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | **same — apply_patch has no `filediff` on core either** (live-verified; not an aft divergence) | level ③ fallback only — apply_patch maps from `metadata.files[]` (level ②, structured) when present |
-| `tool.success.content[]` file part `{"type":"file","uri":"data:…;base64,…","mime":"image/png"}` | image reads | absent | mapped to ACP `ImageContent` (`data` = payload after the data-URI prefix, `mime_type` = `mime`, `uri` preserved). Only `image/*` mimes are mapped — the only verified scenario; non-image / non-data-URI file parts are skipped, never guessed |
+| `tool.success.metadata.filediff` `{file, patch, additions, deletions}` | present for edit/write (`tools/hoisted.ts:623-640`) | **absent** — `filediff`/`diff` are NOT core products (aft dialect, or the v1 line); core `write` publishes NO result metadata at all (`write.ts:94` — its `fileDiff` exists only in the permission-preview metadata, `write.ts:77-82`) | primary diff source (unchanged) |
+| `tool.success.metadata.files[]` `FileDiff.Info{file, patch, additions, deletions, status}` | `apply_patch` only — `{filePath, relativePath, type, patch, additions, deletions, movePath?}` | **core `edit`/`patch` results** (`edit.ts:208-218`, `patch.ts:282-286`); `file` is a resource — project-relative, absolute for external paths | level ② structured source; the core `files[]` dialect is accepted (Release 0.8.8); relative `file` resolves against the session cwd |
+| `tool.success.metadata.diff` (Index:-style string) | present for apply_patch (no `filediff`) | **absent** (aft-only) | level ③ fallback |
+| `tool.success.content[]` file part `{"type":"file","uri":"data:…;base64,…","mime":"image/png"}` | image reads (hoisted read) | **core `read` emits it for images AND PDFs** (`read.ts:175-185`; mime `image/*` or `application/pdf`) | mapped to ACP `ImageContent` (`data` = payload after the data-URI prefix, `mime_type` = `mime`, `uri` preserved). Only `image/*` mimes are mapped — the only verified scenario; non-image / non-data-URI file parts are skipped (logged since Release 0.8.9), never guessed |
 | `tool.called.input` | model's raw args (canonicalization happens on a copy) | same | unchanged |
 
 The `mime` (not `mimeType`) field and the aft metadata fingerprint (`preview`,
@@ -431,7 +439,7 @@ are dialect-neutral and keep working under both.
 | `POST /mcp` | `PUT /api/experimental/mcp/{server}` |
 | `POST …/message` (sync prompt) | `POST …/prompt` (async inbox) |
 | events `message.part.updated/delta` | `session.text.*` / `session.tool.*` / `session.reasoning.*` |
-| `metadata.files[]` array | `metadata.filediff` object (+`diff` string) |
+| `metadata.files[]` (FileDiff.Info array — core `edit`/`patch` results) | `metadata.filediff`/`diff` (aft dialect, or the v1 line) |
 | `GET /doc` OpenAPI | `GET /openapi.json` |
 
 ## Scratch server recipe (for tests)

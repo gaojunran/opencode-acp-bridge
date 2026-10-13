@@ -237,21 +237,52 @@ fn tool_part(
             out.push(tool_update_meta(id, fields, child));
         }
 
-        ToolState::Error { error, content, metadata, .. } => {
-            // ACP's `failed` state carries display content: the tool's own
-            // output (if any) plus the error text.
+        ToolState::Error {
+            error,
+            content,
+            metadata,
+            input,
+            ..
+        } => {
+            // Release 0.8.9: live-path parity — official
+            // `errorToolUpdate`: the payload parts map like success content
+            // (diffs included), then the error message is ALWAYS appended
+            // as a text block; rawOutput is the completion metadata plus
+            // the error message (nulls dropped); kind/locations ride the
+            // failed update and the shell command becomes the title.
+            let message = error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Tool execution failed".to_string());
             let mut blocks: Vec<ToolCallContent> = Vec::new();
             if let Some(content) = content {
                 blocks = tool_result_blocks(content, metadata, no_aft, cwd);
             }
-            if let Some(msg) = &error.message {
-                blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
-                    msg.clone(),
-                ))));
+            blocks.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                message.clone(),
+            ))));
+            let mut raw_output = serde_json::Map::new();
+            if let Ok(serde_json::Value::Object(meta_obj)) = serde_json::to_value(metadata) {
+                for (key, value) in meta_obj {
+                    if !value.is_null() {
+                        raw_output.insert(key, value);
+                    }
+                }
             }
-            let fields = ToolCallUpdateFields::new()
+            raw_output.insert("error".into(), message.clone().into());
+            let mut fields = ToolCallUpdateFields::new()
                 .status(ToolCallStatus::Failed)
-                .content(Some(blocks));
+                .kind(super::updates::tool_kind(name))
+                .locations(super::updates::tool_locations(
+                    name,
+                    input,
+                    cwd.unwrap_or_default(),
+                ))
+                .content(Some(blocks))
+                .raw_output(serde_json::Value::Object(raw_output));
+            if let Some(title) = super::updates::shell_command_title(name, input) {
+                fields = fields.title(title);
+            }
             out.push(tool_update_meta(id, fields, child));
         }
     }
@@ -313,7 +344,9 @@ impl HasInput for ToolState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto;
     use crate::dto::{AttachmentSource, MessagesEnvelope, StructuredError};
+    use agent_client_protocol::schema::v1 as acp;
     use std::path::PathBuf;
 
     fn fixture_records() -> Vec<MessageRecord> {
@@ -428,27 +461,198 @@ mod tests {
         assert_eq!(u.fields.status, Some(ToolCallStatus::InProgress));
     }
 
+    /// Release 0.8.9: the replayed failure state matches the LIVE
+    /// `errorToolUpdate` for the same payload — kind/locations/rawOutput
+    /// ride the failed update, the error message is ALWAYS appended as a
+    /// text block (official fallback text when the wire carried none).
     #[test]
-    fn error_state_maps_to_failed_with_error_text() {
-        let records = [record_with_tool(ToolState::Error {
-            input: serde_json::json!({"x": 1}),
-            error: StructuredError {
-                kind: Some("tool.execution".into()),
-                message: Some("failed to write file".into()),
-            },
-            content: None,
-            metadata: None,
-        })];
-        let updates = replay_updates(&records, false, &[], false, None);
-        assert_eq!(updates.len(), 2);
-        let SessionUpdate::ToolCallUpdate(u) = &updates[1] else { panic!() };
-        assert_eq!(u.fields.status, Some(ToolCallStatus::Failed));
-        let blocks = u.fields.content.as_ref().expect("failed update carries error text");
-        let Some(ToolCallContent::Content(c)) = blocks.first() else {
-            panic!("error text block expected");
-        };
-        let ContentBlock::Text(t) = &c.content else { panic!("text block expected") };
-        assert_eq!(t.text, "failed to write file");
+    fn error_state_replays_like_the_live_error_tool_update() {
+        fn error_record(
+            name: &str,
+            input: serde_json::Value,
+            error: StructuredError,
+            content: Option<Vec<dto::ToolContent>>,
+            metadata: Option<dto::ToolMetadata>,
+        ) -> MessageRecord {
+            let mut r = record_with_tool(ToolState::Error {
+                input,
+                error,
+                content,
+                metadata,
+            });
+            if let Some(parts) = &mut r.content
+                && let Some(Part::Tool { name: n, .. }) = parts.first_mut()
+            {
+                *n = name.to_string();
+            }
+            r
+        }
+        // The same payload through BOTH paths — the terminal updates must
+        // agree on every failure-relevant field.
+        type Case = (
+            &'static str,
+            serde_json::Value,
+            StructuredError,
+            Option<Vec<dto::ToolContent>>,
+            Option<dto::ToolMetadata>,
+            Option<acp::ToolKind>,
+            Vec<String>,       // expected locations
+            Vec<String>,       // expected texts (replay blocks)
+            serde_json::Value, // expected rawOutput
+        );
+        let cases: Vec<Case> = vec![
+            // (a) bash, no message → fallback text; locations = the cwd.
+            (
+                "bash",
+                serde_json::json!({}),
+                StructuredError {
+                    kind: Some("tool.execution".into()),
+                    message: None,
+                },
+                None,
+                None,
+                Some(acp::ToolKind::Execute),
+                vec!["/home/dev/proj".to_string()],
+                vec!["Tool execution failed".to_string()],
+                serde_json::json!({"error": "Tool execution failed"}),
+            ),
+            // (b) edit with output + metadata → kind/locations/raw all live.
+            (
+                "edit",
+                serde_json::json!({"path": "src/foo.ts"}),
+                StructuredError {
+                    kind: Some("permission.rejected".into()),
+                    message: Some("boom".into()),
+                },
+                Some(vec![dto::ToolContent::Text {
+                    text: "partial".into(),
+                }]),
+                Some(dto::ToolMetadata {
+                    truncated: Some(false),
+                    ..Default::default()
+                }),
+                Some(acp::ToolKind::Edit),
+                vec!["src/foo.ts".to_string()],
+                vec!["partial".to_string(), "boom".to_string()],
+                serde_json::json!({"truncated": false, "error": "boom"}),
+            ),
+        ];
+        for (name, input, error, content, metadata, kind, locs, texts, raw) in cases {
+            // REPLAY path: declaration + failed update.
+            let rec = error_record(
+                name,
+                input.clone(),
+                error.clone(),
+                content.clone(),
+                metadata.clone(),
+            );
+            let updates = replay_updates(&[rec], false, &[], false, Some("/home/dev/proj"));
+            assert_eq!(updates.len(), 2, "declaration + failed update");
+            let SessionUpdate::ToolCallUpdate(u) = &updates[1] else {
+                panic!("failed update expected")
+            };
+            assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+            assert_eq!(u.fields.kind, kind);
+            let got_locs: Vec<String> = u
+                .fields
+                .locations
+                .as_ref()
+                .map(|ls| {
+                    ls.iter()
+                        .map(|l| l.path.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(got_locs, locs);
+            let got_texts: Vec<String> = u
+                .fields
+                .content
+                .as_ref()
+                .map(|bs| {
+                    bs.iter()
+                        .filter_map(|b| match b {
+                            ToolCallContent::Content(c) => match &c.content {
+                                ContentBlock::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(got_texts, texts);
+            assert_eq!(
+                serde_json::to_value(&u.fields.raw_output).unwrap_or_default(),
+                raw
+            );
+            // The LIVE path maps the same payload identically.
+            let mut lstate = crate::acp::updates::MappingState::new().with_cwd("/home/dev/proj");
+            let base = dto::ToolRef {
+                sessionID: "ses_x".into(),
+                assistantMessageID: "msg_x".into(),
+                id: "call_live".into(),
+            };
+            let evs = [
+                dto::SessionEvent::ToolInputStarted(dto::ToolInputStarted {
+                    base: base.clone(),
+                    name: name.into(),
+                }),
+                dto::SessionEvent::ToolCalled(dto::ToolCalled {
+                    base: base.clone(),
+                    input: input.clone(),
+                    executed: None,
+                }),
+                dto::SessionEvent::ToolFailed(dto::ToolRefError {
+                    base,
+                    error: error.clone(),
+                    content: content.clone(),
+                    metadata: metadata.clone(),
+                }),
+            ];
+            let mut live_blocks: Vec<ToolCallUpdate> = Vec::new();
+            for ev in evs {
+                for upd in crate::acp::updates::to_updates(&ev, &mut lstate) {
+                    if let SessionUpdate::ToolCallUpdate(u) = upd
+                        && u.tool_call_id.0.as_ref() == "call_live"
+                    {
+                        live_blocks.push(u);
+                    }
+                }
+            }
+            let live = live_blocks.last().expect("failed live update");
+            let live_locs: Vec<String> = live
+                .fields
+                .locations
+                .as_ref()
+                .map(|ls| {
+                    ls.iter()
+                        .map(|l| l.path.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let live_texts: Vec<String> = live
+                .fields
+                .content
+                .as_ref()
+                .map(|bs| {
+                    bs.iter()
+                        .filter_map(|b| match b {
+                            ToolCallContent::Content(c) => match &c.content {
+                                ContentBlock::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let live_raw = serde_json::to_value(&live.fields.raw_output).unwrap_or_default();
+            assert_eq!(
+                (live.fields.kind, live_locs, live_texts),
+                (kind, locs, texts)
+            );
+            assert_eq!(live_raw, raw);
+        }
     }
 
     #[test]
